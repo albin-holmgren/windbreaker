@@ -182,16 +182,18 @@ class ArbitrageEngine:
             # For other tokens, use a rough estimate
             input_amount = int(input_amount_usd * (10 ** decimals_a) / 10)
         
-        # Get quotes for each leg
+        # Get quotes for each leg (with delays to avoid rate limits)
         # A -> B
         quote_ab = await self.get_quote(mint_a, mint_b, input_amount)
         if not quote_ab or quote_ab.output_amount == 0:
             return None
+        await asyncio.sleep(5.0)  # 5 second delay for free Lite API
         
         # B -> C
         quote_bc = await self.get_quote(mint_b, mint_c, quote_ab.output_amount)
         if not quote_bc or quote_bc.output_amount == 0:
             return None
+        await asyncio.sleep(5.0)  # 5 second delay for free Lite API
         
         # C -> A
         quote_ca = await self.get_quote(mint_c, mint_a, quote_bc.output_amount)
@@ -279,21 +281,17 @@ class ArbitrageEngine:
             input_usd=input_amount_usd
         )
         
-        # Scan all triangles concurrently
-        tasks = [
-            self.simulate_triangle(path, input_amount_usd, sol_price_usd)
-            for path in valid_triangles
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter successful opportunities
+        # Scan triangles sequentially to avoid rate limits
         opportunities = []
-        for result in results:
-            if isinstance(result, TriangleOpportunity):
-                opportunities.append(result)
-            elif isinstance(result, Exception):
-                logger.warning("triangle_scan_error", error=str(result))
+        for path in valid_triangles:
+            try:
+                result = await self.simulate_triangle(path, input_amount_usd, sol_price_usd)
+                if result:
+                    opportunities.append(result)
+                # Longer delay between triangles for free API
+                await asyncio.sleep(3.0)
+            except Exception as e:
+                logger.warning("triangle_scan_error", error=str(e))
         
         # Sort by net profit descending
         opportunities.sort(key=lambda x: x.net_profit_pct, reverse=True)

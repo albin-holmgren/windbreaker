@@ -1,6 +1,6 @@
 # Solana SDK
-solana==0.32.0
-solders==0.21.0
+solana>=0.32.0
+solders>=0.20.0,<0.21.0
 
 # HTTP requests
 requests==2.31.0

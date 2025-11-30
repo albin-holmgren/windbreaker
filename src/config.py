@@ -151,19 +151,15 @@ TOKENS_DEVNET = {
 
 # Default triangular paths to scan
 # Each path is a tuple of 3 token symbols: (A, B, C) meaning A -> B -> C -> A
+# Single triangle for free Lite API testing
 DEFAULT_TRIANGLES = [
     ('SOL', 'USDC', 'USDT'),
-    ('SOL', 'USDC', 'ETH'),
-    ('SOL', 'USDC', 'RAY'),
-    ('SOL', 'USDT', 'ETH'),
-    ('USDC', 'ETH', 'SOL'),
-    ('USDC', 'BTC', 'SOL'),
 ]
 
 # Estimated transaction cost in SOL
 ESTIMATED_TX_COST_SOL = 0.01
 
-# Rate limiting
-MAX_REQUESTS_PER_SECOND = 10
+# Rate limiting - very conservative for free Jupiter API
+MAX_REQUESTS_PER_SECOND = 0.5  # 1 request per 2 seconds
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
