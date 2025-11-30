@@ -37,6 +37,15 @@ class Config:
     telegram_bot_token: Optional[str]
     telegram_chat_id: Optional[str]
     
+    # Copy Trading
+    copy_enabled: bool
+    copy_wallets: str  # Comma-separated wallet addresses
+    copy_balance_pct: float  # Percentage of balance to use per copy
+    copy_max_sol: float  # Maximum SOL per copy trade
+    copy_min_sol: float  # Minimum SOL to trigger copy
+    copy_poll_interval_ms: int  # How often to poll wallets
+    copy_sells: bool  # Whether to copy sells
+    
     # Ops
     log_level: str
     
@@ -98,6 +107,15 @@ def load_config() -> Config:
         # Alerts
         telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
         telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
+        
+        # Copy Trading
+        copy_enabled=os.getenv('COPY_ENABLED', 'false').lower() == 'true',
+        copy_wallets=os.getenv('COPY_WALLETS', ''),
+        copy_balance_pct=float(os.getenv('COPY_BALANCE_PCT', '50')),  # 50% of balance per copy
+        copy_max_sol=float(os.getenv('COPY_MAX_SOL', '0.5')),  # Max 0.5 SOL per trade
+        copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
+        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '3000')),  # Poll every 3 sec
+        copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         
         # Ops
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
