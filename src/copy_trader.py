@@ -339,13 +339,13 @@ class CopyTrader:
                     return CopyTradeResult(success=False, error=f"quote_failed: {error_text}")
                 quote = await resp.json()
             
-            # Get swap transaction
+            # Get swap transaction with HIGH priority fees for fast execution
             swap_data = {
                 "quoteResponse": quote,
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
+                "prioritizationFeeLamports": 100000  # High priority ~0.0001 SOL for fast confirmation
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:

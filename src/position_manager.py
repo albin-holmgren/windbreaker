@@ -191,10 +191,10 @@ class PositionManager:
         
         return position
     
-    async def trigger_sell(self, token_mint: str, reason: ExitReason = ExitReason.COPIED_SELL) -> SellResult:
+    async def trigger_sell(self, token_mint: str, reason: ExitReason = ExitReason.COPIED_SELL, max_retries: int = 5) -> SellResult:
         """
-        Trigger a sell for a specific token.
-        Called when the copied trader sells.
+        Trigger a sell for a specific token with aggressive retries.
+        Called when the copied trader sells - MUST succeed!
         """
         if token_mint not in self.positions:
             return SellResult(success=False, error="no_position_for_token")
@@ -202,10 +202,41 @@ class PositionManager:
         logger.info(
             "trader_sold_copying",
             token=token_mint[:8] + "...",
-            reason=reason.value
+            reason=reason.value,
+            message="URGENT: Copying trader's sell!"
         )
         
-        return await self._sell_position(token_mint, reason)
+        # Aggressive retry loop - we NEED to sell when they sell
+        for attempt in range(max_retries):
+            result = await self._sell_position(token_mint, reason)
+            
+            if result.success:
+                logger.info(
+                    "sell_success",
+                    token=token_mint[:8],
+                    attempt=attempt + 1,
+                    sol_received=f"{result.sol_received:.4f}"
+                )
+                return result
+            
+            # Failed - retry immediately
+            logger.warning(
+                "sell_retry",
+                token=token_mint[:8],
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                error=result.error
+            )
+            
+            # Very short delay before retry (100ms)
+            await asyncio.sleep(0.1)
+        
+        logger.error(
+            "sell_failed_all_retries",
+            token=token_mint[:8],
+            attempts=max_retries
+        )
+        return SellResult(success=False, error=f"failed_after_{max_retries}_retries", reason=reason)
     
     def get_position(self, token_mint: str) -> Optional[Position]:
         """Get a position by token mint."""
@@ -279,11 +310,15 @@ class PositionManager:
             logger.warning("price_update_failed", error=str(e))
     
     def _should_exit(self, position: Position) -> Optional[ExitReason]:
-        """Determine if we should exit a position."""
-        pnl = position.pnl_percent
-        
+        """
+        Determine if we should exit a position.
+        NOTE: We ONLY exit when:
+        1. Token is worthless (abandon) 
+        2. Trader sells (handled by trigger_sell)
+        NO automatic take profit - we follow the trader!
+        """
         # Check if token is worthless (abandon, don't sell)
-        if position.current_value_sol < self.rug_abandon_sol:
+        if position.current_value_sol > 0 and position.current_value_sol < self.rug_abandon_sol:
             logger.info(
                 "abandoning_rugged_token",
                 token=position.token_mint[:8],
@@ -293,16 +328,10 @@ class PositionManager:
             )
             return ExitReason.ABANDONED
         
-        # Take profit (safety limit, e.g., at 2x)
-        if self.take_profit_pct > 0 and pnl >= self.take_profit_pct:
-            logger.info(
-                "take_profit_triggered",
-                token=position.token_mint[:8],
-                pnl=f"{pnl:.1f}%"
-            )
-            return ExitReason.TAKE_PROFIT
+        # NO take profit - we only sell when trader sells!
+        # NO time limit - we follow the trader!
         
-        # Time limit (only if enabled, 0 = disabled)
+        # Time limit (only if enabled, 0 = disabled) - DISABLED BY DEFAULT
         if self.time_limit_minutes > 0 and position.age_minutes >= self.time_limit_minutes:
             logger.info(
                 "time_limit_triggered",
@@ -412,13 +441,13 @@ class PositionManager:
             if not quote:
                 return SellResult(success=False, error="no_quote")
             
-            # Get swap transaction
+            # Get swap transaction with HIGH priority fees for fast execution
             swap_data = {
                 "quoteResponse": quote,
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
+                "prioritizationFeeLamports": 100000  # High priority ~0.0001 SOL for fast confirmation
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:

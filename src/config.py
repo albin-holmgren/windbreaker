@@ -122,7 +122,7 @@ def load_config() -> Config:
         copy_balance_pct=float(os.getenv('COPY_BALANCE_PCT', '50')),  # 50% of balance per copy
         copy_max_sol=float(os.getenv('COPY_MAX_SOL', '0.5')),  # Max 0.5 SOL per trade
         copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
-        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '3000')),  # Poll every 3 sec
+        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '1000')),  # Poll every 1 sec (faster!)
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         
         # Position Management
