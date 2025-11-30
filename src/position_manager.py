@@ -25,6 +25,8 @@ class ExitReason(Enum):
     TIME_LIMIT = "time_limit"
     MANUAL = "manual"
     RUG_DETECTED = "rug_detected"
+    ABANDONED = "abandoned"  # Token too worthless to sell, just free the slot
+    COPIED_SELL = "copied_sell"  # Trader we copied sold
 
 
 @dataclass
@@ -69,14 +71,13 @@ class SellResult:
 
 class PositionManager:
     """
-    Manages open positions with auto-sell logic.
+    Manages open positions - follows trader strategy.
     
     Features:
-    - Take profit at configurable %
-    - Stop loss at configurable %
-    - Time-based exit (sell after X minutes)
-    - Trailing stop loss
-    - Rug detection (rapid price drop)
+    - Track positions from copied trades
+    - Abandon rugged tokens (don't sell, just free slot)
+    - Optional take profit (safety limit)
+    - Copy sells from trader
     - Max concurrent positions
     """
     
@@ -86,12 +87,12 @@ class PositionManager:
         wallet_keypair,
         rpc_client,
         max_positions: int = 3,
-        take_profit_pct: float = 50.0,      # Sell at +50%
-        stop_loss_pct: float = -30.0,       # Sell at -30%
-        time_limit_minutes: float = 60.0,   # Sell after 60 min
-        trailing_stop_pct: float = 20.0,    # Trailing stop 20% from high
-        rug_threshold_pct: float = -50.0,   # Rug if drops 50% in 5 min
-        check_interval_sec: float = 30.0,   # Check prices every 30s
+        take_profit_pct: float = 100.0,     # Safety: sell at 2x (optional)
+        stop_loss_pct: float = -95.0,       # Abandon at 95% loss
+        time_limit_minutes: float = 0,      # 0 = disabled (follow trader)
+        trailing_stop_pct: float = 0,       # 0 = disabled
+        rug_abandon_sol: float = 0.005,     # Abandon if worth < 0.005 SOL
+        check_interval_sec: float = 60.0,   # Check prices every 60s
     ):
         self.config = config
         self.wallet = wallet_keypair
@@ -103,16 +104,18 @@ class PositionManager:
         self.stop_loss_pct = stop_loss_pct
         self.time_limit_minutes = time_limit_minutes
         self.trailing_stop_pct = trailing_stop_pct
-        self.rug_threshold_pct = rug_threshold_pct
+        self.rug_abandon_sol = rug_abandon_sol  # Threshold to abandon (not sell)
         self.check_interval = check_interval_sec
         
         # State
         self.positions: Dict[str, Position] = {}  # token_mint -> Position
+        self.abandoned_tokens: Dict[str, float] = {}  # token_mint -> entry_sol (for stats)
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
         
         # Stats
         self.total_sells = 0
+        self.total_abandoned = 0
         self.total_profit_sol = 0.0
         self.total_loss_sol = 0.0
     
@@ -188,6 +191,26 @@ class PositionManager:
         
         return position
     
+    async def trigger_sell(self, token_mint: str, reason: ExitReason = ExitReason.COPIED_SELL) -> SellResult:
+        """
+        Trigger a sell for a specific token.
+        Called when the copied trader sells.
+        """
+        if token_mint not in self.positions:
+            return SellResult(success=False, error="no_position_for_token")
+        
+        logger.info(
+            "trader_sold_copying",
+            token=token_mint[:8] + "...",
+            reason=reason.value
+        )
+        
+        return await self._sell_position(token_mint, reason)
+    
+    def get_position(self, token_mint: str) -> Optional[Position]:
+        """Get a position by token mint."""
+        return self.positions.get(token_mint)
+    
     async def _monitor_loop(self) -> None:
         """Main loop to monitor positions and trigger sells."""
         while self.running:
@@ -259,8 +282,19 @@ class PositionManager:
         """Determine if we should exit a position."""
         pnl = position.pnl_percent
         
-        # Take profit
-        if pnl >= self.take_profit_pct:
+        # Check if token is worthless (abandon, don't sell)
+        if position.current_value_sol < self.rug_abandon_sol:
+            logger.info(
+                "abandoning_rugged_token",
+                token=position.token_mint[:8],
+                value=f"{position.current_value_sol:.6f}",
+                threshold=f"{self.rug_abandon_sol:.4f}",
+                message="Not worth selling, freeing position slot"
+            )
+            return ExitReason.ABANDONED
+        
+        # Take profit (safety limit, e.g., at 2x)
+        if self.take_profit_pct > 0 and pnl >= self.take_profit_pct:
             logger.info(
                 "take_profit_triggered",
                 token=position.token_mint[:8],
@@ -268,17 +302,8 @@ class PositionManager:
             )
             return ExitReason.TAKE_PROFIT
         
-        # Stop loss
-        if pnl <= self.stop_loss_pct:
-            logger.info(
-                "stop_loss_triggered",
-                token=position.token_mint[:8],
-                pnl=f"{pnl:.1f}%"
-            )
-            return ExitReason.STOP_LOSS
-        
-        # Time limit
-        if position.age_minutes >= self.time_limit_minutes:
+        # Time limit (only if enabled, 0 = disabled)
+        if self.time_limit_minutes > 0 and position.age_minutes >= self.time_limit_minutes:
             logger.info(
                 "time_limit_triggered",
                 token=position.token_mint[:8],
@@ -286,8 +311,8 @@ class PositionManager:
             )
             return ExitReason.TIME_LIMIT
         
-        # Trailing stop (only if we've been profitable)
-        if position.highest_value_sol > position.entry_sol:
+        # Trailing stop (only if enabled and we've been profitable)
+        if self.trailing_stop_pct > 0 and position.highest_value_sol > position.entry_sol:
             drop_from_high = ((position.current_value_sol - position.highest_value_sol) 
                              / position.highest_value_sol) * 100
             if drop_from_high <= -self.trailing_stop_pct:
@@ -298,15 +323,7 @@ class PositionManager:
                 )
                 return ExitReason.STOP_LOSS
         
-        # Rug detection (massive drop in short time)
-        if position.age_minutes < 5 and pnl <= self.rug_threshold_pct:
-            logger.warning(
-                "rug_detected",
-                token=position.token_mint[:8],
-                pnl=f"{pnl:.1f}%"
-            )
-            return ExitReason.RUG_DETECTED
-        
+        # No exit needed - follow the trader
         return None
     
     async def _sell_position(
@@ -314,10 +331,27 @@ class PositionManager:
         token_mint: str, 
         reason: ExitReason
     ) -> SellResult:
-        """Sell a position."""
+        """Sell or abandon a position."""
         position = self.positions.get(token_mint)
         if not position:
             return SellResult(success=False, error="position_not_found")
+        
+        # If abandoned, just remove from tracking (don't try to sell)
+        if reason == ExitReason.ABANDONED:
+            logger.info(
+                "position_abandoned",
+                token=token_mint[:8] + "...",
+                entry_sol=f"{position.entry_sol:.4f}",
+                current_value=f"{position.current_value_sol:.6f}",
+                message="Rugged token abandoned, slot freed for new trade"
+            )
+            # Track for stats
+            self.abandoned_tokens[token_mint] = position.entry_sol
+            self.total_abandoned += 1
+            self.total_loss_sol += position.entry_sol
+            # Remove from active positions
+            del self.positions[token_mint]
+            return SellResult(success=True, reason=ExitReason.ABANDONED, sol_received=0)
         
         logger.info(
             "selling_position",

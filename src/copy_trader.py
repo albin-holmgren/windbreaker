@@ -99,6 +99,7 @@ class CopyTrader:
             stop_loss_pct=self.config.stop_loss_pct,
             time_limit_minutes=self.config.time_limit_minutes,
             trailing_stop_pct=self.config.trailing_stop_pct,
+            rug_abandon_sol=self.config.rug_abandon_sol,
         )
         await self.position_manager.start()
         
@@ -159,7 +160,23 @@ class CopyTrader:
             dex=swap.dex
         )
         
-        # Decide whether to copy
+        # If trader sells a token we hold, copy the sell!
+        if swap.is_sell and self.position_manager and self.position_manager.has_position(swap.token_mint):
+            logger.info(
+                "copying_trader_sell",
+                token=swap.token_mint[:8] + "...",
+                message="Trader sold, we're selling too!"
+            )
+            from .position_manager import ExitReason
+            result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
+            if result.success:
+                self.stats.total_sol_received += result.sol_received
+                logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
+            else:
+                logger.warning("copied_sell_failed", error=result.error)
+            return
+        
+        # Decide whether to copy buy
         should_copy, reason = self._should_copy(swap)
         
         if not should_copy:
@@ -167,7 +184,7 @@ class CopyTrader:
             logger.info("skip_copy", reason=reason)
             return
         
-        # Execute the copy trade
+        # Execute the copy trade (buy)
         result = await self._execute_copy(swap)
         
         if result.success:
