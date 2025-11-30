@@ -71,7 +71,7 @@ class CopyTradingBot:
             sys.exit(1)
         
         # Create wallet
-        self.wallet = create_wallet(self.config.wallet_private_key)
+        self.wallet = create_wallet(self.config)
         logger.info(
             "wallet_loaded",
             address=self.wallet.address,
