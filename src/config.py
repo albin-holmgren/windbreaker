@@ -24,6 +24,8 @@ class Config:
     # Trading
     min_profit_pct: float
     trade_amount_usd: float
+    trade_balance_pct: float  # Percentage of balance to trade (0-100)
+    fee_reserve_sol: float  # SOL to reserve for tx fees
     slippage_bps: int
     poll_interval_ms: int
     
@@ -84,6 +86,8 @@ def load_config() -> Config:
         # Trading
         min_profit_pct=float(os.getenv('MIN_PROFIT_PCT', '0.5')),
         trade_amount_usd=float(os.getenv('TRADE_AMOUNT_USD', '10')),
+        trade_balance_pct=float(os.getenv('TRADE_BALANCE_PCT', '80')),  # 80% of balance
+        fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.05')),  # Reserve 0.05 SOL for fees
         slippage_bps=int(os.getenv('SLIPPAGE_BPS', '50')),
         poll_interval_ms=int(os.getenv('POLL_INTERVAL_MS', '500')),
         

@@ -123,9 +123,32 @@ class WindbreakerBot:
             # Get current SOL price (simplified)
             sol_price = await self.rpc.get_sol_price_usd()
             
-            # Find best opportunity
+            # Get wallet balance and calculate trade amount
+            balance_lamports = await self.rpc.get_balance(self.wallet.pubkey)
+            balance_sol = balance_lamports / 1e9
+            
+            # Reserve SOL for fees, trade percentage of the rest
+            available_sol = max(0, balance_sol - self.config.fee_reserve_sol)
+            trade_sol = available_sol * (self.config.trade_balance_pct / 100.0)
+            trade_amount_usd = trade_sol * sol_price
+            
+            logger.info(
+                "balance_check",
+                balance_sol=f"{balance_sol:.4f}",
+                available_sol=f"{available_sol:.4f}",
+                trade_sol=f"{trade_sol:.4f}",
+                trade_usd=f"{trade_amount_usd:.2f}"
+            )
+            
+            # Skip if trade amount too small (< $0.50)
+            if trade_amount_usd < 0.50:
+                logger.warning("trade_amount_too_small", trade_usd=f"{trade_amount_usd:.2f}")
+                return
+            
+            # Find best opportunity with dynamic trade amount
             opportunity = await self.engine.find_best_opportunity(
-                sol_price_usd=sol_price
+                sol_price_usd=sol_price,
+                input_amount_usd=trade_amount_usd
             )
             
             # Update monitor
