@@ -79,7 +79,7 @@ class CopyTradingBot:
         )
         
         # Create RPC client
-        self.rpc = RPCClient(self.config.rpc_url)
+        self.rpc = RPCClient(self.config)
         
         # Check balance
         balance = await self.rpc.get_balance(self.wallet.pubkey)
