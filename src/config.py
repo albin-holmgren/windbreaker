@@ -1,0 +1,169 @@
+"""
+Configuration loader for Windbreaker.
+Loads settings from environment variables with sensible defaults.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import Optional
+from dotenv import load_dotenv
+
+
+@dataclass
+class Config:
+    """Bot configuration loaded from environment variables."""
+    
+    # Network
+    rpc_url: str
+    network: str  # 'devnet' or 'mainnet-beta'
+    
+    # Wallet
+    wallet_private_key: str
+    wallet_address: Optional[str]
+    
+    # Trading
+    min_profit_pct: float
+    trade_amount_usd: float
+    slippage_bps: int
+    poll_interval_ms: int
+    
+    # Jupiter API
+    jupiter_quote_api: str
+    jupiter_swap_api: str
+    
+    # Alerts
+    telegram_bot_token: Optional[str]
+    telegram_chat_id: Optional[str]
+    
+    # Ops
+    log_level: str
+    
+    @property
+    def is_devnet(self) -> bool:
+        return self.network == 'devnet'
+    
+    @property
+    def is_mainnet(self) -> bool:
+        return self.network == 'mainnet-beta'
+    
+    @property
+    def poll_interval_seconds(self) -> float:
+        return self.poll_interval_ms / 1000.0
+    
+    @property
+    def slippage_percent(self) -> float:
+        return self.slippage_bps / 100.0
+    
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+
+def load_config() -> Config:
+    """Load configuration from environment variables."""
+    load_dotenv()
+    
+    # Validate required fields
+    rpc_url = os.getenv('RPC_URL')
+    if not rpc_url:
+        raise ValueError("RPC_URL environment variable is required")
+    
+    wallet_private_key = os.getenv('WALLET_PRIVATE_KEY_BASE58', '')
+    if not wallet_private_key:
+        raise ValueError("WALLET_PRIVATE_KEY_BASE58 environment variable is required")
+    
+    return Config(
+        # Network
+        rpc_url=rpc_url,
+        network=os.getenv('NETWORK', 'devnet'),
+        
+        # Wallet
+        wallet_private_key=wallet_private_key,
+        wallet_address=os.getenv('WALLET_ADDRESS'),
+        
+        # Trading
+        min_profit_pct=float(os.getenv('MIN_PROFIT_PCT', '0.5')),
+        trade_amount_usd=float(os.getenv('TRADE_AMOUNT_USD', '10')),
+        slippage_bps=int(os.getenv('SLIPPAGE_BPS', '50')),
+        poll_interval_ms=int(os.getenv('POLL_INTERVAL_MS', '500')),
+        
+        # Jupiter API
+        jupiter_quote_api=os.getenv('JUPITER_QUOTE_API', 'https://quote-api.jup.ag/v6/quote'),
+        jupiter_swap_api=os.getenv('JUPITER_SWAP_API', 'https://quote-api.jup.ag/v6/swap'),
+        
+        # Alerts
+        telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
+        telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
+        
+        # Ops
+        log_level=os.getenv('LOG_LEVEL', 'INFO'),
+    )
+
+
+# Token definitions for triangular arbitrage
+# Format: symbol -> (mint_address, decimals)
+TOKENS = {
+    'SOL': {
+        'mint': 'So11111111111111111111111111111111111111112',
+        'decimals': 9,
+        'symbol': 'SOL'
+    },
+    'USDC': {
+        'mint': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+        'decimals': 6,
+        'symbol': 'USDC'
+    },
+    'USDT': {
+        'mint': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+        'decimals': 6,
+        'symbol': 'USDT'
+    },
+    'ETH': {
+        'mint': '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',  # Wormhole ETH
+        'decimals': 8,
+        'symbol': 'ETH'
+    },
+    'BTC': {
+        'mint': '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh',  # Wormhole BTC
+        'decimals': 8,
+        'symbol': 'BTC'
+    },
+    'RAY': {
+        'mint': '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
+        'decimals': 6,
+        'symbol': 'RAY'
+    },
+}
+
+# Devnet tokens (different addresses)
+TOKENS_DEVNET = {
+    'SOL': {
+        'mint': 'So11111111111111111111111111111111111111112',
+        'decimals': 9,
+        'symbol': 'SOL'
+    },
+    'USDC': {
+        'mint': '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',  # Devnet USDC
+        'decimals': 6,
+        'symbol': 'USDC'
+    },
+}
+
+# Default triangular paths to scan
+# Each path is a tuple of 3 token symbols: (A, B, C) meaning A -> B -> C -> A
+DEFAULT_TRIANGLES = [
+    ('SOL', 'USDC', 'USDT'),
+    ('SOL', 'USDC', 'ETH'),
+    ('SOL', 'USDC', 'RAY'),
+    ('SOL', 'USDT', 'ETH'),
+    ('USDC', 'ETH', 'SOL'),
+    ('USDC', 'BTC', 'SOL'),
+]
+
+# Estimated transaction cost in SOL
+ESTIMATED_TX_COST_SOL = 0.01
+
+# Rate limiting
+MAX_REQUESTS_PER_SECOND = 10
+BACKOFF_BASE_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 60.0

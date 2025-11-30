@@ -1,0 +1,46 @@
+{
+  "name": "Windbreaker Arbitrage Bot",
+  "description": "Solana triangular arbitrage bot using Jupiter",
+  "dockerImage": "ubuntu:22.04",
+  "containerDiskInGB": 20,
+  "volumeInGB": 0,
+  "ports": "22/tcp",
+  "startScript": "#!/bin/bash\napt-get update && apt-get install -y git python3 python3-pip python3-venv nodejs npm openssh-server\nnpm install -g pm2\nservice ssh start",
+  "env": [
+    {
+      "key": "NETWORK",
+      "value": "devnet",
+      "description": "Network to use: devnet or mainnet-beta"
+    },
+    {
+      "key": "MIN_PROFIT_PCT",
+      "value": "0.5",
+      "description": "Minimum profit percentage to execute trades"
+    },
+    {
+      "key": "TRADE_AMOUNT_USD",
+      "value": "10",
+      "description": "Trade size in USD equivalent"
+    },
+    {
+      "key": "SLIPPAGE_BPS",
+      "value": "50",
+      "description": "Slippage tolerance in basis points"
+    },
+    {
+      "key": "POLL_INTERVAL_MS",
+      "value": "500",
+      "description": "Polling interval in milliseconds"
+    },
+    {
+      "key": "LOG_LEVEL",
+      "value": "INFO",
+      "description": "Logging level: DEBUG, INFO, WARNING, ERROR"
+    }
+  ],
+  "category": "crypto",
+  "minGpuCount": 0,
+  "maxGpuCount": 0,
+  "minVcpuCount": 2,
+  "minMemoryInGB": 4
+}
