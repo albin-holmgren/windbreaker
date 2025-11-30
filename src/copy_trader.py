@@ -13,6 +13,7 @@ import structlog
 from .wallet_monitor import WalletMonitor, WalletTransaction
 from .tx_parser import TransactionParser, ParsedSwap, SwapType
 from .config import Config
+from .position_manager import PositionManager
 
 logger = structlog.get_logger(__name__)
 
@@ -80,10 +81,26 @@ class CopyTrader:
         self.copy_sells = config.copy_sells
         self.fee_reserve = config.fee_reserve_sol
         
+        # Position manager for auto-sell
+        self.position_manager: Optional[PositionManager] = None
+        
     async def start(self) -> None:
         """Start the copy trader."""
         self.session = aiohttp.ClientSession()
         self.running = True
+        
+        # Create position manager
+        self.position_manager = PositionManager(
+            config=self.config,
+            wallet_keypair=self.wallet,
+            rpc_client=self.rpc,
+            max_positions=self.config.max_positions,
+            take_profit_pct=self.config.take_profit_pct,
+            stop_loss_pct=self.config.stop_loss_pct,
+            time_limit_minutes=self.config.time_limit_minutes,
+            trailing_stop_pct=self.config.trailing_stop_pct,
+        )
+        await self.position_manager.start()
         
         # Create wallet monitor
         self.monitor = WalletMonitor(
@@ -97,7 +114,10 @@ class CopyTrader:
             "copy_trader_started",
             wallets=len(self.target_wallets),
             copy_pct=f"{self.copy_percentage*100:.0f}%",
-            max_sol=self.max_sol_per_trade
+            max_sol=self.max_sol_per_trade,
+            max_positions=self.config.max_positions,
+            take_profit=f"{self.config.take_profit_pct}%",
+            stop_loss=f"{self.config.stop_loss_pct}%"
         )
         
         # Start monitoring
@@ -107,6 +127,8 @@ class CopyTrader:
         """Stop the copy trader."""
         self.running = False
         
+        if self.position_manager:
+            await self.position_manager.stop()
         if self.monitor:
             await self.monitor.stop()
         if self.session:
@@ -162,7 +184,17 @@ class CopyTrader:
     def _should_copy(self, swap: ParsedSwap) -> tuple[bool, str]:
         """Determine if we should copy this swap."""
         
-        # Only copy buys for now (sells are riskier)
+        # For buys, check position limits
+        if swap.is_buy:
+            # Check if we can open more positions
+            if self.position_manager and not self.position_manager.can_open_position():
+                return False, f"max_positions_reached ({self.config.max_positions})"
+            
+            # Check if we already have this token
+            if self.position_manager and self.position_manager.has_position(swap.token_mint):
+                return False, "already_holding_token"
+        
+        # For sells, only copy if we hold the token (handled by position manager)
         if swap.is_sell and not self.copy_sells:
             return False, "sell_disabled"
         
@@ -240,6 +272,20 @@ class CopyTrader:
                 
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
+                    
+                    # Register position for auto-sell management
+                    if self.position_manager:
+                        # Estimate tokens received from the swap
+                        # In reality, we'd parse this from the transaction result
+                        estimated_tokens = int(trade_lamports * 1000)  # Placeholder
+                        self.position_manager.add_position(
+                            token_mint=swap.token_mint,
+                            entry_sol=trade_sol,
+                            token_amount=estimated_tokens,
+                            entry_signature=result.signature or "",
+                            copied_from=swap.wallet,
+                            token_symbol=swap.token_symbol
+                        )
                 else:
                     self.stats.total_sol_received += trade_sol
             

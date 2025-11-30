@@ -46,6 +46,13 @@ class Config:
     copy_poll_interval_ms: int  # How often to poll wallets
     copy_sells: bool  # Whether to copy sells
     
+    # Position Management (Auto-Sell)
+    max_positions: int  # Maximum concurrent positions
+    take_profit_pct: float  # Sell when profit reaches this %
+    stop_loss_pct: float  # Sell when loss reaches this % (negative number)
+    time_limit_minutes: float  # Sell after this many minutes
+    trailing_stop_pct: float  # Trailing stop % from highest value
+    
     # Ops
     log_level: str
     
@@ -116,6 +123,13 @@ def load_config() -> Config:
         copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
         copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '3000')),  # Poll every 3 sec
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
+        
+        # Position Management (Auto-Sell)
+        max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
+        take_profit_pct=float(os.getenv('TAKE_PROFIT_PCT', '50')),  # Sell at +50%
+        stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', '-30')),  # Sell at -30%
+        time_limit_minutes=float(os.getenv('TIME_LIMIT_MINUTES', '60')),  # Sell after 60 min
+        trailing_stop_pct=float(os.getenv('TRAILING_STOP_PCT', '20')),  # 20% trailing stop
         
         # Ops
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
