@@ -14,6 +14,7 @@ from .wallet_monitor import WalletMonitor, WalletTransaction
 from .tx_parser import TransactionParser, ParsedSwap, SwapType
 from .config import Config
 from .position_manager import PositionManager
+from .trade_logger import trade_logger
 
 logger = structlog.get_logger(__name__)
 
@@ -303,6 +304,21 @@ class CopyTrader:
                             copied_from=swap.wallet,
                             token_symbol=swap.token_symbol
                         )
+                    
+                    # Log the trade for analysis
+                    trade_logger.log_buy(
+                        token_mint=swap.token_mint,
+                        token_symbol=swap.token_symbol,
+                        our_sol=trade_sol,
+                        our_tokens=estimated_tokens if self.position_manager else 0,
+                        our_signature=result.signature,
+                        copied_wallet=swap.wallet,
+                        their_sol=swap.sol_value,
+                        their_signature=swap.signature,
+                        their_timestamp=None,
+                        delay_seconds=(datetime.utcnow() - datetime.utcnow()).total_seconds(),  # TODO: track actual delay
+                        success=True
+                    )
                 else:
                     self.stats.total_sol_received += trade_sol
             
