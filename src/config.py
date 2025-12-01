@@ -48,6 +48,7 @@ class Config:
     copy_proportional: bool  # If true, match trader's % instead of fixed amount
     exit_fee_reserve: float  # SOL reserved per open position for exit fees
     min_market_cap_usd: float  # Minimum market cap in USD to buy (0 = disabled)
+    min_token_age_minutes: int  # Minimum token age in minutes (0 = disabled)
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -130,6 +131,7 @@ def load_config() -> Config:
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
         exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.001')),  # 0.001 SOL per position for exit fees
         min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
+        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Min 15 minutes old
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
