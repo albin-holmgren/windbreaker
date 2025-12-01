@@ -214,9 +214,13 @@ class CopyTrader:
             if self.position_manager and not self.position_manager.can_open_position():
                 return False, f"max_positions_reached ({self.config.max_positions})"
             
-            # Check if we already have this token
+            # Check if we already have this token (in position manager)
             if self.position_manager and self.position_manager.has_position(swap.token_mint):
                 return False, "already_holding_token"
+            
+            # Also check if we already bought this token recently (even if position manager lost track)
+            if swap.token_mint in self.recent_copies:
+                return False, "recently_bought"
         
         # For sells, only copy if we hold the token (handled by position manager)
         if swap.is_sell and not self.copy_sells:
@@ -301,6 +305,21 @@ class CopyTrader:
             )
             
             if swap.is_buy:
+                # Check if we already have this token (on-chain check)
+                existing_balance = await self._get_token_balance(swap.token_mint)
+                if existing_balance > 0:
+                    logger.info(
+                        "already_hold_token",
+                        token=swap.token_mint[:8],
+                        balance=existing_balance,
+                        message="Skipping buy - already holding this token"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error="already_holding_token_onchain",
+                        original_swap=swap
+                    )
+                
                 # Buy: SOL -> Token
                 result = await self._execute_swap(
                     input_mint=NATIVE_SOL,
@@ -325,10 +344,10 @@ class CopyTrader:
                 )
             
             if result.success:
-                # Track this token to avoid rapid re-copying
+                # Track this token to avoid re-buying
                 self.recent_copies.add(swap.token_mint)
-                # Remove from recent after 60 seconds
-                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 60))
+                # Keep in recent for 1 hour (3600 seconds) to prevent duplicate buys
+                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 3600))
                 
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
