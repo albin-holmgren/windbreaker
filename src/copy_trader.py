@@ -84,6 +84,10 @@ class CopyTrader:
         self.copy_proportional = config.copy_proportional
         self.exit_fee_reserve = config.exit_fee_reserve
         self.max_positions = config.max_positions
+        self.min_market_cap_usd = config.min_market_cap_usd
+        
+        # Cache for market caps (to avoid repeated API calls)
+        self.market_cap_cache: Dict[str, tuple[float, float]] = {}  # mint -> (market_cap, timestamp)
         
         # Track trader wallet balances for proportional sizing
         self.trader_balances: Dict[str, float] = {}
@@ -267,6 +271,24 @@ class CopyTrader:
                     )
                     
                 return result
+            
+            # BUYS: Check market cap filter first
+            if self.min_market_cap_usd > 0:
+                market_cap = await self._get_market_cap(swap.token_mint)
+                if market_cap > 0 and market_cap < self.min_market_cap_usd:
+                    logger.info(
+                        "skipping_low_mcap",
+                        token=swap.token_mint[:8],
+                        market_cap=f"${market_cap:,.0f}",
+                        min_required=f"${self.min_market_cap_usd:,.0f}"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error=f"market_cap_too_low (${market_cap:,.0f} < ${self.min_market_cap_usd:,.0f})",
+                        original_swap=swap
+                    )
+                elif market_cap > 0:
+                    logger.debug("market_cap_ok", token=swap.token_mint[:8], market_cap=f"${market_cap:,.0f}")
             
             # BUYS: Full calculation path
             balance = await self.rpc.get_balance(self.wallet.pubkey())
@@ -498,6 +520,38 @@ class CopyTrader:
             return 0
         except Exception as e:
             logger.debug("get_token_balance_error", mint=mint[:8], error=str(e))
+            return 0
+    
+    async def _get_market_cap(self, mint: str) -> float:
+        """Get market cap in USD using DexScreener API."""
+        import time
+        
+        # Check cache (valid for 60 seconds)
+        if mint in self.market_cap_cache:
+            cached_cap, cached_time = self.market_cap_cache[mint]
+            if time.time() - cached_time < 60:
+                return cached_cap
+        
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        # Get the highest liquidity pair's market cap
+                        market_cap = 0
+                        for pair in pairs:
+                            mc = pair.get("marketCap") or pair.get("fdv") or 0
+                            if mc > market_cap:
+                                market_cap = mc
+                        
+                        self.market_cap_cache[mint] = (market_cap, time.time())
+                        return market_cap
+            
+            return 0
+        except Exception as e:
+            logger.debug("market_cap_fetch_error", mint=mint[:8], error=str(e))
             return 0
     
     async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
