@@ -235,7 +235,41 @@ class CopyTrader:
     async def _execute_copy(self, swap: ParsedSwap) -> CopyTradeResult:
         """Execute a copy of the detected swap."""
         try:
-            # Get our wallet balance
+            # FAST PATH for sells - skip balance calculations
+            if not swap.is_buy:
+                token_balance = await self._get_token_balance(swap.token_mint)
+                if token_balance == 0:
+                    logger.debug("no_tokens_to_sell", token=swap.token_mint[:8])
+                    return CopyTradeResult(success=False, error="no_tokens_to_sell", original_swap=swap)
+                
+                logger.info(
+                    "fast_sell",
+                    token=swap.token_mint[:8],
+                    our_balance=token_balance,
+                    their_sol=f"{swap.sol_value:.4f}"
+                )
+                
+                result = await self._execute_swap(
+                    input_mint=swap.token_mint,
+                    output_mint=NATIVE_SOL,
+                    amount=token_balance
+                )
+                
+                if result.success:
+                    self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
+                    trade_logger.log_sell(
+                        token_mint=swap.token_mint,
+                        token_symbol=swap.token_symbol,
+                        sol_received=0,
+                        tokens_sold=token_balance,
+                        our_signature=result.signature or "",
+                        trigger="copied_sell",
+                        success=True
+                    )
+                    
+                return result
+            
+            # BUYS: Full calculation path
             balance = await self.rpc.get_balance(self.wallet.pubkey())
             balance_sol = balance / 1e9
             
@@ -305,35 +339,19 @@ class CopyTrader:
                 their_sol=f"{swap.sol_value:.4f}"
             )
             
-            if swap.is_buy:
-                # Buy: SOL -> Token
-                result = await self._execute_swap(
-                    input_mint=NATIVE_SOL,
-                    output_mint=swap.token_mint,
-                    amount=trade_lamports
-                )
-            else:
-                # Sell: Token -> SOL
-                # Get our token balance
-                token_balance = await self._get_token_balance(swap.token_mint)
-                if token_balance == 0:
-                    return CopyTradeResult(
-                        success=False,
-                        error="no_tokens_to_sell",
-                        original_swap=swap
-                    )
-                
-                result = await self._execute_swap(
-                    input_mint=swap.token_mint,
-                    output_mint=NATIVE_SOL,
-                    amount=token_balance
-                )
+            # Buy: SOL -> Token (sells are handled by fast path above)
+            result = await self._execute_swap(
+                input_mint=NATIVE_SOL,
+                output_mint=swap.token_mint,
+                amount=trade_lamports
+            )
             
             if result.success:
-                # Track this token to avoid rapid re-copying
-                self.recent_copies.add(swap.token_mint)
-                # Remove from recent after 60 seconds
-                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 60))
+                # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
+                # For SELLS: Don't track - allow multiple sell attempts
+                if swap.is_buy:
+                    self.recent_copies.add(swap.token_mint)
+                    asyncio.create_task(self._clear_recent_copy(swap.token_mint, 30))
                 
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
@@ -408,7 +426,7 @@ class CopyTrader:
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 100000  # High priority ~0.0001 SOL for fast confirmation
+                "prioritizationFeeLamports": 500000  # Very high priority ~0.0005 SOL for fastest execution
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
