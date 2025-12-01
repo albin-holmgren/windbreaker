@@ -275,7 +275,21 @@ class CopyTrader:
             # BUYS: Check market cap filter first
             if self.min_market_cap_usd > 0:
                 market_cap = await self._get_market_cap(swap.token_mint)
-                if market_cap > 0 and market_cap < self.min_market_cap_usd:
+                
+                # If market cap is 0 or unknown, skip (likely new/risky token)
+                if market_cap == 0:
+                    logger.info(
+                        "skipping_unknown_mcap",
+                        token=swap.token_mint[:8],
+                        reason="not_on_dexscreener"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error="market_cap_unknown (not on DexScreener yet)",
+                        original_swap=swap
+                    )
+                
+                if market_cap < self.min_market_cap_usd:
                     logger.info(
                         "skipping_low_mcap",
                         token=swap.token_mint[:8],
@@ -287,8 +301,8 @@ class CopyTrader:
                         error=f"market_cap_too_low (${market_cap:,.0f} < ${self.min_market_cap_usd:,.0f})",
                         original_swap=swap
                     )
-                elif market_cap > 0:
-                    logger.debug("market_cap_ok", token=swap.token_mint[:8], market_cap=f"${market_cap:,.0f}")
+                
+                logger.info("market_cap_ok", token=swap.token_mint[:8], market_cap=f"${market_cap:,.0f}")
             
             # BUYS: Full calculation path
             balance = await self.rpc.get_balance(self.wallet.pubkey())
