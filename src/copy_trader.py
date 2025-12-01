@@ -214,13 +214,9 @@ class CopyTrader:
             if self.position_manager and not self.position_manager.can_open_position():
                 return False, f"max_positions_reached ({self.config.max_positions})"
             
-            # Check if we already have this token (in position manager)
+            # Check if we already have this token
             if self.position_manager and self.position_manager.has_position(swap.token_mint):
                 return False, "already_holding_token"
-            
-            # Also check if we already bought this token recently (even if position manager lost track)
-            if swap.token_mint in self.recent_copies:
-                return False, "recently_bought"
         
         # For sells, only copy if we hold the token (handled by position manager)
         if swap.is_sell and not self.copy_sells:
@@ -266,15 +262,20 @@ class CopyTrader:
                 their_percentage = swap.sol_value / trader_total if trader_total > 0 else 0.1
                 
                 # Apply their percentage to our available balance
+                # BUT ensure minimum floor (at least enough to meet min_sol or 15% of available)
+                min_percentage = max(self.min_sol_per_trade / available_sol, 0.15) if available_sol > 0 else 0.15
+                effective_percentage = max(their_percentage, min_percentage)
+                
                 trade_sol = min(
-                    available_sol * their_percentage,  # Match their %
-                    available_sol * 0.5,               # Never more than 50% on one trade
-                    self.max_sol_per_trade             # Hard cap
+                    available_sol * effective_percentage,  # Match their % (with floor)
+                    available_sol * 0.5,                   # Never more than 50% on one trade
+                    self.max_sol_per_trade                 # Hard cap
                 )
                 
                 logger.info(
                     "proportional_sizing",
                     their_pct=f"{their_percentage*100:.1f}%",
+                    effective_pct=f"{effective_percentage*100:.1f}%",
                     their_sol=f"{swap.sol_value:.4f}",
                     our_sol=f"{trade_sol:.4f}",
                     our_available=f"{available_sol:.4f}"
@@ -305,21 +306,6 @@ class CopyTrader:
             )
             
             if swap.is_buy:
-                # Check if we already have this token (on-chain check)
-                existing_balance = await self._get_token_balance(swap.token_mint)
-                if existing_balance > 0:
-                    logger.info(
-                        "already_hold_token",
-                        token=swap.token_mint[:8],
-                        balance=existing_balance,
-                        message="Skipping buy - already holding this token"
-                    )
-                    return CopyTradeResult(
-                        success=False,
-                        error="already_holding_token_onchain",
-                        original_swap=swap
-                    )
-                
                 # Buy: SOL -> Token
                 result = await self._execute_swap(
                     input_mint=NATIVE_SOL,
@@ -344,10 +330,10 @@ class CopyTrader:
                 )
             
             if result.success:
-                # Track this token to avoid re-buying
+                # Track this token to avoid rapid re-copying
                 self.recent_copies.add(swap.token_mint)
-                # Keep in recent for 1 hour (3600 seconds) to prevent duplicate buys
-                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 3600))
+                # Remove from recent after 60 seconds
+                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 60))
                 
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
