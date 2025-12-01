@@ -208,15 +208,14 @@ class CopyTrader:
     def _should_copy(self, swap: ParsedSwap) -> tuple[bool, str]:
         """Determine if we should copy this swap."""
         
-        # For buys, check position limits
+        # For buys, check position limits (but allow stacking same token)
         if swap.is_buy:
-            # Check if we can open more positions
-            if self.position_manager and not self.position_manager.can_open_position():
-                return False, f"max_positions_reached ({self.config.max_positions})"
-            
-            # Check if we already have this token
-            if self.position_manager and self.position_manager.has_position(swap.token_mint):
-                return False, "already_holding_token"
+            # Check if we can open more positions (only for NEW tokens)
+            if self.position_manager:
+                has_token = self.position_manager.has_position(swap.token_mint)
+                if not has_token and not self.position_manager.can_open_position():
+                    return False, f"max_positions_reached ({self.config.max_positions})"
+            # Allow stacking - can buy more of same token (removed already_holding_token check)
         
         # For sells, only copy if we hold the token (handled by position manager)
         if swap.is_sell and not self.copy_sells:
@@ -226,8 +225,8 @@ class CopyTrader:
         if swap.sol_value < self.min_sol_per_trade:
             return False, f"below_min_sol ({swap.sol_value:.4f} < {self.min_sol_per_trade})"
         
-        # Don't copy the same token too frequently
-        if swap.token_mint in self.recent_copies:
+        # Don't RE-BUY the same token too frequently (but always allow sells)
+        if swap.is_buy and swap.token_mint in self.recent_copies:
             return False, "recently_copied"
         
         return True, "ok"
