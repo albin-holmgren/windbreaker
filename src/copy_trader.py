@@ -81,6 +81,12 @@ class CopyTrader:
         self.min_sol_per_trade = config.copy_min_sol
         self.copy_sells = config.copy_sells
         self.fee_reserve = config.fee_reserve_sol
+        self.copy_proportional = config.copy_proportional
+        self.exit_fee_reserve = config.exit_fee_reserve
+        self.max_positions = config.max_positions
+        
+        # Track trader wallet balances for proportional sizing
+        self.trader_balances: Dict[str, float] = {}
         
         # Position manager for auto-sell
         self.position_manager: Optional[PositionManager] = None
@@ -233,13 +239,49 @@ class CopyTrader:
             balance = await self.rpc.get_balance(self.wallet.pubkey())
             balance_sol = balance / 1e9
             
-            # Calculate how much to trade
-            available_sol = max(0, balance_sol - self.fee_reserve)
-            trade_sol = min(
-                available_sol * self.copy_percentage,
-                self.max_sol_per_trade,
-                swap.sol_value * 2  # Don't trade more than 2x what they did
-            )
+            # Calculate fee reserve needed for existing + new positions
+            current_positions = len(self.position_manager.positions) if self.position_manager else 0
+            total_fee_reserve = self.fee_reserve + (self.exit_fee_reserve * (current_positions + 1))
+            
+            # Available balance after fee reserve
+            available_sol = max(0, balance_sol - total_fee_reserve)
+            
+            # Calculate trade size
+            if self.copy_proportional:
+                # Proportional: match their percentage
+                # Get trader's balance (cache it to avoid too many RPC calls)
+                if swap.wallet not in self.trader_balances:
+                    try:
+                        from solders.pubkey import Pubkey
+                        trader_balance = await self.rpc.get_balance(Pubkey.from_string(swap.wallet))
+                        self.trader_balances[swap.wallet] = trader_balance / 1e9
+                    except:
+                        self.trader_balances[swap.wallet] = 10.0  # Default assumption
+                
+                trader_total = self.trader_balances[swap.wallet]
+                their_percentage = swap.sol_value / trader_total if trader_total > 0 else 0.1
+                
+                # Apply their percentage to our available balance
+                trade_sol = min(
+                    available_sol * their_percentage,  # Match their %
+                    available_sol * 0.5,               # Never more than 50% on one trade
+                    self.max_sol_per_trade             # Hard cap
+                )
+                
+                logger.info(
+                    "proportional_sizing",
+                    their_pct=f"{their_percentage*100:.1f}%",
+                    their_sol=f"{swap.sol_value:.4f}",
+                    our_sol=f"{trade_sol:.4f}",
+                    our_available=f"{available_sol:.4f}"
+                )
+            else:
+                # Fixed: use configured percentage
+                trade_sol = min(
+                    available_sol * self.copy_percentage,
+                    self.max_sol_per_trade,
+                    swap.sol_value * 2
+                )
             
             if trade_sol < self.min_sol_per_trade:
                 return CopyTradeResult(

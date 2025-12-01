@@ -45,6 +45,8 @@ class Config:
     copy_min_sol: float  # Minimum SOL to trigger copy
     copy_poll_interval_ms: int  # How often to poll wallets
     copy_sells: bool  # Whether to copy sells
+    copy_proportional: bool  # If true, match trader's % instead of fixed amount
+    exit_fee_reserve: float  # SOL reserved per open position for exit fees
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -124,6 +126,8 @@ def load_config() -> Config:
         copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
         copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '1000')),  # Poll every 1 sec (faster!)
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
+        copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
+        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.001')),  # 0.001 SOL per position for exit fees
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
