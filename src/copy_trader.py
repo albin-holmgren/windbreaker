@@ -441,12 +441,46 @@ class CopyTrader:
             return CopyTradeResult(success=False, error=str(e))
     
     async def _get_token_balance(self, mint: str) -> int:
-        """Get token balance for our wallet."""
+        """Get token balance for our wallet by finding the associated token account."""
         try:
-            # This would need proper implementation with token accounts
-            # For now, return 0 (would need to query token accounts)
+            from solders.pubkey import Pubkey
+            
+            # SPL Token Program ID
+            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            
+            # Get all token accounts for our wallet
+            wallet_pubkey = self.wallet.pubkey()
+            
+            # Use getTokenAccountsByOwner RPC call
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(wallet_pubkey),
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if result and "value" in result:
+                accounts = result["value"]
+                if accounts and len(accounts) > 0:
+                    # Get the token amount from the first account
+                    account_data = accounts[0].get("account", {}).get("data", {})
+                    parsed = account_data.get("parsed", {}).get("info", {})
+                    token_amount = parsed.get("tokenAmount", {})
+                    amount = int(token_amount.get("amount", 0))
+                    
+                    if amount > 0:
+                        logger.info(
+                            "token_balance_found",
+                            token=mint[:8],
+                            amount=amount
+                        )
+                    return amount
+            
             return 0
-        except Exception:
+        except Exception as e:
+            logger.debug("get_token_balance_error", mint=mint[:8], error=str(e))
             return 0
     
     async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
