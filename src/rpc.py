@@ -231,6 +231,26 @@ class RPCClient:
         )
         
         return result.get("value", {})
+    
+    async def get_signatures_for_address(self, pubkey: Pubkey, limit: int = 20) -> List[Dict]:
+        """Get recent transaction signatures for an address."""
+        result = await self._request(
+            "getSignaturesForAddress",
+            [str(pubkey), {"limit": limit}]
+        )
+        return result if isinstance(result, list) else []
+    
+    async def get_transaction(self, signature: str) -> Optional[Dict]:
+        """Get a transaction by signature."""
+        try:
+            result = await self._request(
+                "getTransaction",
+                [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            )
+            return result
+        except Exception as e:
+            logger.debug("get_transaction_error", signature=signature[:16], error=str(e))
+            return None
 
 
 def create_rpc_client(config: Config) -> RPCClient:

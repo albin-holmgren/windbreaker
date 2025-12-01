@@ -31,14 +31,22 @@ async def fetch_wallet_trades(rpc: RPCClient, wallet: str, limit: int = 50) -> L
         trades = []
         
         for sig_info in signatures[:30]:  # Analyze last 30 txs
-            sig = sig_info.signature if hasattr(sig_info, 'signature') else str(sig_info)
+            # Handle both dict and object formats
+            if isinstance(sig_info, dict):
+                sig = sig_info.get("signature", "")
+            else:
+                sig = sig_info.signature if hasattr(sig_info, 'signature') else str(sig_info)
+            
+            if not sig:
+                continue
+                
             try:
                 tx = await rpc.get_transaction(sig)
                 if tx:
                     swap = parser.parse_swap(tx, wallet)
                     if swap:
                         trades.append({
-                            "timestamp": datetime.utcnow().isoformat(),  # Approximate
+                            "timestamp": datetime.utcnow().isoformat(),
                             "signature": str(sig)[:16],
                             "type": "buy" if swap.is_buy else "sell",
                             "token": swap.token_mint[:8],
