@@ -72,6 +72,7 @@ class SniperConfig:
     
     # Scan settings
     scan_interval_seconds: float = 5
+    sustained_filter_minutes: float = 5  # Token must pass filters for this long
 
 
 class PulseSniper:
@@ -94,9 +95,15 @@ class PulseSniper:
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
         
-        # Track tokens we've already bought or evaluated
+        # Track tokens we've already bought
         self.bought_tokens: Set[str] = set()
-        self.evaluated_tokens: dict[str, float] = {}  # mint -> last_eval_time
+        
+        # Track when tokens first passed filters (for sustained filter check)
+        # mint -> first_pass_time
+        self.filter_pass_times: dict[str, float] = {}
+        
+        # Track consecutive passes (reset if token fails)
+        self.last_check_passed: dict[str, bool] = {}
         
         # Cache for token info
         self.token_cache: dict[str, tuple[TokenMetrics, float]] = {}  # mint -> (metrics, timestamp)
@@ -113,6 +120,7 @@ class PulseSniper:
             min_holders=self.config.min_holders_count,
             max_top10=f"{self.config.max_top10_holders_pct}%",
             max_dev=f"{self.config.max_dev_holdings_pct}%",
+            sustained_minutes=self.config.sustained_filter_minutes,
             buy_amount=f"{self.config.buy_amount_sol} SOL"
         )
         
@@ -132,54 +140,107 @@ class PulseSniper:
     
     async def _scan_loop(self):
         """Main scanning loop - fetch trending tokens and evaluate."""
+        sustained_seconds = self.config.sustained_filter_minutes * 60
+        
         while self.running:
             try:
                 # Get trending/new pump.fun tokens from DexScreener
                 tokens = await self._fetch_pumpfun_tokens()
+                current_time = time.time()
+                
+                # Track which tokens we saw this scan (to detect tokens that dropped off)
+                seen_this_scan = set()
                 
                 for token in tokens:
+                    seen_this_scan.add(token.mint)
+                    
                     if token.mint in self.bought_tokens:
                         continue
-                    
-                    # Check if we recently evaluated this token
-                    last_eval = self.evaluated_tokens.get(token.mint, 0)
-                    if time.time() - last_eval < 60:  # Re-evaluate every 60 seconds
-                        continue
-                    
-                    self.evaluated_tokens[token.mint] = time.time()
                     
                     # Check if token passes all filters
                     passed, reason = self._check_filters(token)
                     
                     if passed:
-                        logger.info(
-                            "token_passed_filters",
-                            token=token.symbol,
-                            mint=token.mint[:8],
-                            market_cap=f"${token.market_cap_usd:,.0f}",
-                            volume=f"${token.volume_24h_usd:,.0f}",
-                            holders=token.holders_count,
-                            top10=f"{token.top10_holders_pct:.1f}%",
-                            dev=f"{token.dev_holdings_pct:.1f}%",
-                            age=f"{token.age_minutes:.1f}m"
-                        )
+                        # Token passes filters - track it
+                        if token.mint not in self.filter_pass_times:
+                            # First time passing - start the timer
+                            self.filter_pass_times[token.mint] = current_time
+                            logger.info(
+                                "token_started_passing",
+                                token=token.symbol,
+                                mint=token.mint[:8],
+                                market_cap=f"${token.market_cap_usd:,.0f}",
+                                volume=f"${token.volume_24h_usd:,.0f}",
+                                holders=token.holders_count,
+                                message=f"Will buy if passes for {self.config.sustained_filter_minutes}m"
+                            )
                         
-                        # Check if we can open more positions
-                        current_positions = len(self.position_manager.positions) if self.position_manager else 0
-                        if current_positions >= self.config.max_positions:
-                            logger.info("max_positions_reached", current=current_positions, max=self.config.max_positions)
-                            continue
+                        # Check how long it's been passing
+                        first_pass_time = self.filter_pass_times[token.mint]
+                        time_passing = current_time - first_pass_time
+                        time_remaining = sustained_seconds - time_passing
                         
-                        # Execute buy
-                        success = await self._execute_buy(token)
-                        if success:
-                            self.bought_tokens.add(token.mint)
+                        if time_passing >= sustained_seconds:
+                            # Token has been passing for long enough - BUY!
+                            logger.info(
+                                "token_sustained_filter_passed",
+                                token=token.symbol,
+                                mint=token.mint[:8],
+                                market_cap=f"${token.market_cap_usd:,.0f}",
+                                volume=f"${token.volume_24h_usd:,.0f}",
+                                holders=token.holders_count,
+                                top10=f"{token.top10_holders_pct:.1f}%",
+                                dev=f"{token.dev_holdings_pct:.1f}%",
+                                age=f"{token.age_minutes:.1f}m",
+                                sustained_for=f"{time_passing/60:.1f}m"
+                            )
+                            
+                            # Check if we can open more positions
+                            current_positions = len(self.position_manager.positions) if self.position_manager else 0
+                            if current_positions >= self.config.max_positions:
+                                logger.info("max_positions_reached", current=current_positions, max=self.config.max_positions)
+                                continue
+                            
+                            # Execute buy
+                            success = await self._execute_buy(token)
+                            if success:
+                                self.bought_tokens.add(token.mint)
+                                # Clean up tracking
+                                self.filter_pass_times.pop(token.mint, None)
+                        else:
+                            # Still waiting for sustained period
+                            logger.debug(
+                                "token_waiting_sustained",
+                                token=token.symbol[:8] if token.symbol else token.mint[:8],
+                                time_remaining=f"{time_remaining/60:.1f}m"
+                            )
+                        
+                        self.last_check_passed[token.mint] = True
                     else:
-                        logger.debug(
-                            "token_filtered",
-                            token=token.symbol[:8] if token.symbol else token.mint[:8],
-                            reason=reason
-                        )
+                        # Token failed filters
+                        if self.last_check_passed.get(token.mint, False):
+                            # Was passing before, now failed - reset timer
+                            if token.mint in self.filter_pass_times:
+                                logger.info(
+                                    "token_filter_reset",
+                                    token=token.symbol[:8] if token.symbol else token.mint[:8],
+                                    reason=reason
+                                )
+                                del self.filter_pass_times[token.mint]
+                        
+                        self.last_check_passed[token.mint] = False
+                
+                # Clean up tokens that weren't seen (no longer in top results)
+                for mint in list(self.filter_pass_times.keys()):
+                    if mint not in seen_this_scan and mint not in self.bought_tokens:
+                        logger.debug("token_dropped_from_results", mint=mint[:8])
+                        del self.filter_pass_times[mint]
+                        self.last_check_passed.pop(mint, None)
+                
+                # Log status
+                tracking_count = len(self.filter_pass_times)
+                if tracking_count > 0:
+                    logger.info("tracking_tokens", count=tracking_count)
                 
                 await asyncio.sleep(self.config.scan_interval_seconds)
                 
@@ -420,7 +481,8 @@ async def main():
         take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "50")),
         stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "-35")),
         trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "25")),
-        scan_interval_seconds=float(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
+        scan_interval_seconds=float(os.getenv("SCAN_INTERVAL_SECONDS", "5")),
+        sustained_filter_minutes=float(os.getenv("SUSTAINED_FILTER_MINUTES", "5"))
     )
     
     # Import position manager
