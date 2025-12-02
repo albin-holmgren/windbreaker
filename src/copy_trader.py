@@ -88,10 +88,12 @@ class CopyTrader:
         self.min_token_age_minutes = config.min_token_age_minutes
         self.min_liquidity_usd = config.min_liquidity_usd
         self.min_volume_24h_usd = config.min_volume_24h_usd
+        self.max_price_change_1h_pct = config.max_price_change_1h_pct
+        self.min_txns_1h = config.min_txns_1h
         
         # Cache for token info (to avoid repeated API calls)
-        # mint -> (market_cap, age_minutes, liquidity, volume_24h, cache_time)
-        self.token_info_cache: Dict[str, tuple[float, float, float, float, float]] = {}
+        # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
+        self.token_info_cache: Dict[str, tuple[float, float, float, float, float, int, float]] = {}
         
         # Track trader wallet balances for proportional sizing
         self.trader_balances: Dict[str, float] = {}
@@ -300,8 +302,8 @@ class CopyTrader:
                 
                 return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
             
-            # BUYS: Check all token filters (market cap, age, liquidity, volume)
-            market_cap, age_minutes, liquidity, volume_24h = await self._get_token_info(swap.token_mint)
+            # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
+            market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
             
             # If not on DexScreener, skip (likely very new/risky token)
             if market_cap == 0 and age_minutes == 0:
@@ -372,12 +374,42 @@ class CopyTrader:
                     original_swap=swap
                 )
             
+            # Check if token already pumped too much - avoid buying tops!
+            if self.max_price_change_1h_pct > 0 and price_change_1h > self.max_price_change_1h_pct:
+                logger.info(
+                    "skipping_already_pumped",
+                    token=swap.token_mint[:8],
+                    price_change_1h=f"+{price_change_1h:.0f}%",
+                    max_allowed=f"+{self.max_price_change_1h_pct:.0f}%"
+                )
+                return CopyTradeResult(
+                    success=False,
+                    error=f"already_pumped (+{price_change_1h:.0f}% > +{self.max_price_change_1h_pct:.0f}%)",
+                    original_swap=swap
+                )
+            
+            # Check minimum transactions - ensure active trading
+            if self.min_txns_1h > 0 and txns_1h < self.min_txns_1h:
+                logger.info(
+                    "skipping_low_activity",
+                    token=swap.token_mint[:8],
+                    txns_1h=txns_1h,
+                    min_required=self.min_txns_1h
+                )
+                return CopyTradeResult(
+                    success=False,
+                    error=f"low_activity ({txns_1h} txns < {self.min_txns_1h} min)",
+                    original_swap=swap
+                )
+            
             logger.info(
                 "token_filters_passed",
                 token=swap.token_mint[:8],
                 market_cap=f"${market_cap:,.0f}",
                 liquidity=f"${liquidity:,.0f}",
                 volume_24h=f"${volume_24h:,.0f}",
+                price_change_1h=f"{price_change_1h:+.0f}%",
+                txns_1h=txns_1h,
                 age=f"{age_minutes:.1f}m"
             )
             
@@ -613,21 +645,21 @@ class CopyTrader:
             logger.debug("get_token_balance_error", mint=mint[:8], error=str(e))
             return 0
     
-    async def _get_token_info(self, mint: str) -> tuple[float, float, float, float]:
-        """Get market cap, token age, liquidity and volume using DexScreener API.
+    async def _get_token_info(self, mint: str) -> tuple[float, float, float, float, float, int]:
+        """Get market cap, token age, liquidity, volume, price change and txn count using DexScreener API.
         
         Returns:
-            tuple: (market_cap_usd, age_minutes, liquidity_usd, volume_24h_usd)
+            tuple: (market_cap_usd, age_minutes, liquidity_usd, volume_24h_usd, price_change_1h_pct, txns_1h)
         """
         import time
         
         # Check cache (valid for 60 seconds)
         if mint in self.token_info_cache:
-            cached_cap, cached_age, cached_liq, cached_vol, cached_time = self.token_info_cache[mint]
+            cached_cap, cached_age, cached_liq, cached_vol, cached_price_chg, cached_txns, cached_time = self.token_info_cache[mint]
             if time.time() - cached_time < 60:
                 # Adjust age for time passed since cache
                 adjusted_age = cached_age + (time.time() - cached_time) / 60
-                return cached_cap, adjusted_age, cached_liq, cached_vol
+                return cached_cap, adjusted_age, cached_liq, cached_vol, cached_price_chg, cached_txns
         
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -641,11 +673,15 @@ class CopyTrader:
                         oldest_age = 0
                         total_liquidity = 0
                         total_volume_24h = 0
+                        price_change_1h = 0
+                        total_txns_1h = 0
+                        best_pair = None
                         
                         for pair in pairs:
                             mc = pair.get("marketCap") or pair.get("fdv") or 0
                             if mc > market_cap:
                                 market_cap = mc
+                                best_pair = pair  # Track the main pair
                             
                             # Sum up liquidity across all pairs
                             liq = pair.get("liquidity", {}).get("usd", 0) or 0
@@ -655,6 +691,12 @@ class CopyTrader:
                             vol = pair.get("volume", {}).get("h24", 0) or 0
                             total_volume_24h += vol
                             
+                            # Sum up 1h transactions (buys + sells)
+                            txns = pair.get("txns", {}).get("h1", {})
+                            buys_1h = txns.get("buys", 0) or 0
+                            sells_1h = txns.get("sells", 0) or 0
+                            total_txns_1h += buys_1h + sells_1h
+                            
                             # Get pair creation time
                             created_at = pair.get("pairCreatedAt")
                             if created_at:
@@ -663,13 +705,17 @@ class CopyTrader:
                                 if age_minutes > oldest_age:
                                     oldest_age = age_minutes
                         
-                        self.token_info_cache[mint] = (market_cap, oldest_age, total_liquidity, total_volume_24h, time.time())
-                        return market_cap, oldest_age, total_liquidity, total_volume_24h
+                        # Get 1h price change from best pair
+                        if best_pair:
+                            price_change_1h = best_pair.get("priceChange", {}).get("h1", 0) or 0
+                        
+                        self.token_info_cache[mint] = (market_cap, oldest_age, total_liquidity, total_volume_24h, price_change_1h, total_txns_1h, time.time())
+                        return market_cap, oldest_age, total_liquidity, total_volume_24h, price_change_1h, total_txns_1h
             
-            return 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0
         except Exception as e:
             logger.debug("token_info_fetch_error", mint=mint[:8], error=str(e))
-            return 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0
     
     async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
         """Remove token from recent copies after delay."""
