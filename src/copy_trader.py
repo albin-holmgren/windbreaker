@@ -22,6 +22,9 @@ logger = structlog.get_logger(__name__)
 JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
 
+# Pump.fun API for bonding curve trades
+PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
+
 # Native SOL
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
 
@@ -267,15 +270,29 @@ class CopyTrader:
                     their_sol=f"{swap.sol_value:.4f}"
                 )
                 
+                # Detect if this is a pump.fun token
+                is_pumpfun_sell = swap.dex == "pump.fun"
+                
                 # AGGRESSIVE RETRY LOOP with exponential backoff
                 max_retries = 5
                 result = None
                 for attempt in range(max_retries):
-                    result = await self._execute_swap(
-                        input_mint=swap.token_mint,
-                        output_mint=NATIVE_SOL,
-                        amount=token_balance
-                    )
+                    if is_pumpfun_sell:
+                        # Use Pump.fun API for bonding curve sells
+                        # Estimate SOL value from token balance (rough estimate)
+                        estimated_sol = token_balance / 1e9 * 0.00001  # Very rough, will be adjusted by API
+                        result = await self._execute_pumpfun_swap(
+                            token_mint=swap.token_mint,
+                            sol_amount=estimated_sol,
+                            is_buy=False
+                        )
+                    else:
+                        # Use Jupiter for Raydium/other DEXes
+                        result = await self._execute_swap(
+                            input_mint=swap.token_mint,
+                            output_mint=NATIVE_SOL,
+                            amount=token_balance
+                        )
                     
                     if result.success:
                         self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
@@ -594,15 +611,25 @@ class CopyTrader:
                 type=swap.swap_type.value,
                 token=swap.token_mint[:8] + "...",
                 our_sol=f"{trade_sol:.4f}",
-                their_sol=f"{swap.sol_value:.4f}"
+                their_sol=f"{swap.sol_value:.4f}",
+                dex=swap.dex
             )
             
-            # Buy: SOL -> Token (sells are handled by fast path above)
-            result = await self._execute_swap(
-                input_mint=NATIVE_SOL,
-                output_mint=swap.token_mint,
-                amount=trade_lamports
-            )
+            # Buy: Use appropriate API based on DEX
+            if is_pumpfun:
+                # Use Pump.fun API for bonding curve tokens
+                result = await self._execute_pumpfun_swap(
+                    token_mint=swap.token_mint,
+                    sol_amount=trade_sol,
+                    is_buy=True
+                )
+            else:
+                # Use Jupiter for Raydium/other DEXes
+                result = await self._execute_swap(
+                    input_mint=NATIVE_SOL,
+                    output_mint=swap.token_mint,
+                    amount=trade_lamports
+                )
             
             if result.success:
                 # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
@@ -625,7 +652,8 @@ class CopyTrader:
                             token_amount=estimated_tokens,
                             entry_signature=result.signature or "",
                             copied_from=swap.wallet,
-                            token_symbol=swap.token_symbol
+                            token_symbol=swap.token_symbol,
+                            dex="pump.fun" if is_pumpfun else swap.dex
                         )
                     
                     # Log the trade for analysis
@@ -715,6 +743,80 @@ class CopyTrader:
             
         except Exception as e:
             return CopyTradeResult(success=False, error=str(e))
+    
+    async def _execute_pumpfun_swap(
+        self,
+        token_mint: str,
+        sol_amount: float,
+        is_buy: bool,
+        sell_percentage: int = 100  # For sells: percentage of holdings to sell (100 = all)
+    ) -> CopyTradeResult:
+        """Execute a swap on Pump.fun's bonding curve."""
+        try:
+            import base64
+            from solders.transaction import VersionedTransaction
+            
+            action = "buy" if is_buy else "sell"
+            
+            # Request transaction from PumpPortal
+            if is_buy:
+                payload = {
+                    "publicKey": str(self.wallet.pubkey()),
+                    "action": action,
+                    "mint": token_mint,
+                    "denominatedInSol": "true",
+                    "amount": sol_amount,
+                    "slippage": self.config.slippage_bps / 100,  # Convert bps to percentage
+                    "priorityFee": 0.0005,  # 0.0005 SOL priority fee
+                    "pool": "pump"  # Use pump.fun bonding curve
+                }
+            else:
+                # For sells, use percentage of holdings
+                payload = {
+                    "publicKey": str(self.wallet.pubkey()),
+                    "action": action,
+                    "mint": token_mint,
+                    "denominatedInSol": "false",
+                    "amount": f"{sell_percentage}%",  # Sell percentage of holdings
+                    "slippage": self.config.slippage_bps / 100,
+                    "priorityFee": 0.0005,
+                    "pool": "pump"
+                }
+            
+            logger.info(
+                "pumpfun_swap_request",
+                action=action,
+                token=token_mint[:8],
+                sol=f"{sol_amount:.4f}"
+            )
+            
+            async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {error_text}")
+                
+                # Response is the raw transaction bytes
+                tx_bytes = await resp.read()
+            
+            # Deserialize and sign the transaction
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signed_tx = VersionedTransaction(tx.message, [self.wallet])
+            
+            # Send the transaction
+            signature = await self.rpc.send_transaction(signed_tx)
+            
+            logger.info(
+                "pumpfun_swap_success",
+                action=action,
+                token=token_mint[:8],
+                signature=str(signature)[:16] if signature else None
+            )
+            
+            return CopyTradeResult(success=True, signature=signature)
+            
+        except Exception as e:
+            logger.error("pumpfun_swap_error", error=str(e))
+            return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
     
     async def _get_token_balance(self, mint: str) -> int:
         """Get token balance for our wallet by finding the associated token account."""

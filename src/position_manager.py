@@ -16,6 +16,10 @@ logger = structlog.get_logger(__name__)
 # Jupiter API - using lite-api (public, no auth required)
 JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
+
+# Pump.fun API for bonding curve trades
+PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
+
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
 
 
@@ -40,6 +44,7 @@ class Position:
     entry_time: datetime
     entry_signature: str
     copied_from: str          # Wallet we copied
+    dex: str = "jupiter"      # DEX used for buy (pump.fun, raydium, jupiter)
     
     # Tracking
     current_value_sol: float = 0.0
@@ -174,7 +179,8 @@ class PositionManager:
         token_amount: int,
         entry_signature: str,
         copied_from: str,
-        token_symbol: Optional[str] = None
+        token_symbol: Optional[str] = None,
+        dex: str = "jupiter"
     ) -> Position:
         """Add a new position."""
         position = Position(
@@ -185,6 +191,7 @@ class PositionManager:
             entry_time=datetime.utcnow(),
             entry_signature=entry_signature,
             copied_from=copied_from,
+            dex=dex,
             current_value_sol=entry_sol,
             highest_value_sol=entry_sol
         )
@@ -604,6 +611,14 @@ class PositionManager:
     async def _execute_sell(self, position: Position) -> SellResult:
         """Execute a sell transaction."""
         try:
+            import base64
+            from solders.transaction import VersionedTransaction
+            
+            # Use Pump.fun API for pump.fun tokens
+            if position.dex == "pump.fun":
+                return await self._execute_pumpfun_sell(position)
+            
+            # Use Jupiter for other DEXes
             # Get quote
             quote = await self._get_quote(
                 input_mint=position.token_mint,
@@ -629,10 +644,6 @@ class PositionManager:
                     return SellResult(success=False, error=f"swap_api: {error}")
                 swap_response = await resp.json()
             
-            # Sign and send
-            import base64
-            from solders.transaction import VersionedTransaction
-            
             swap_tx = swap_response.get("swapTransaction")
             if not swap_tx:
                 return SellResult(success=False, error="no_swap_tx")
@@ -653,6 +664,57 @@ class PositionManager:
             
         except Exception as e:
             return SellResult(success=False, error=str(e))
+    
+    async def _execute_pumpfun_sell(self, position: Position) -> SellResult:
+        """Execute a sell on Pump.fun's bonding curve."""
+        try:
+            import base64
+            from solders.transaction import VersionedTransaction
+            
+            # Request transaction from PumpPortal - sell 100% of holdings
+            payload = {
+                "publicKey": str(self.wallet.pubkey()),
+                "action": "sell",
+                "mint": position.token_mint,
+                "denominatedInSol": "false",
+                "amount": "100%",  # Sell all tokens
+                "slippage": self.config.slippage_bps / 100,
+                "priorityFee": 0.0005,
+                "pool": "pump"
+            }
+            
+            logger.info(
+                "pumpfun_sell_request",
+                token=position.token_mint[:8]
+            )
+            
+            async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    return SellResult(success=False, error=f"pumpfun_api: {error_text}")
+                
+                tx_bytes = await resp.read()
+            
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signed_tx = VersionedTransaction(tx.message, [self.wallet])
+            
+            signature = await self.rpc.send_transaction(signed_tx)
+            
+            logger.info(
+                "pumpfun_sell_success",
+                token=position.token_mint[:8],
+                signature=str(signature)[:16] if signature else None
+            )
+            
+            return SellResult(
+                success=True,
+                signature=signature,
+                sol_received=position.current_value_sol  # Estimate
+            )
+            
+        except Exception as e:
+            logger.error("pumpfun_sell_error", error=str(e))
+            return SellResult(success=False, error=f"pumpfun_error: {str(e)}")
     
     async def _get_quote(
         self, 
