@@ -347,22 +347,28 @@ class CopyTrader:
                 price_change_1h = 0
                 txns_1h = 0
             elif is_pumpfun:
-                # Use Pump.fun API for token info (with filters)
+                # Try Pump.fun API first, then DexScreener as fallback
                 market_cap, age_minutes = await self._get_pumpfun_token_info(swap.token_mint)
                 liquidity = market_cap * 0.1  # Pump.fun uses bonding curve, estimate ~10% as liquidity
-                volume_24h = 0  # Not easily available from pump.fun
+                volume_24h = 0
                 price_change_1h = 0
                 txns_1h = 100  # Assume active if trader is buying
                 
+                # If Pump.fun API failed, try DexScreener as fallback
                 if market_cap == 0:
+                    logger.debug("pumpfun_api_failed_trying_dexscreener", token=swap.token_mint[:8])
+                    market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
+                
+                # If still no data, skip
+                if market_cap == 0 and age_minutes == 0:
                     logger.info(
                         "skipping_unknown_token",
                         token=swap.token_mint[:8],
-                        reason="not_on_pumpfun"
+                        reason="no_data_available"
                     )
                     return CopyTradeResult(
                         success=False,
-                        error="token_unknown (not found on pump.fun)",
+                        error="token_unknown (not found on pump.fun or DexScreener)",
                         original_swap=swap
                     )
                 
@@ -370,6 +376,7 @@ class CopyTrader:
                     "pumpfun_token_info",
                     token=swap.token_mint[:8],
                     market_cap=f"${market_cap:,.0f}",
+                    liquidity=f"${liquidity:,.0f}",
                     age=f"{age_minutes:.1f}m"
                 )
             else:
@@ -976,7 +983,10 @@ class CopyTrader:
                     
                     # Cache it
                     self.token_info_cache[cache_key] = (market_cap, age_minutes, time.time())
+                    logger.debug("pumpfun_api_success", mint=mint[:8], market_cap=market_cap, age=age_minutes)
                     return market_cap, age_minutes
+                else:
+                    logger.debug("pumpfun_api_error", mint=mint[:8], status=resp.status)
             
             return 0, 0
         except Exception as e:
