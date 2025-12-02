@@ -50,6 +50,8 @@ class Config:
     min_market_cap_usd: float  # Minimum market cap in USD to buy (0 = disabled)
     min_token_age_minutes: int  # Minimum token age in minutes (0 = disabled)
     mcap_stop_loss_usd: float  # Sell if market cap drops below this (0 = disabled)
+    min_liquidity_usd: float  # Minimum liquidity in USD (0 = disabled)
+    min_volume_24h_usd: float  # Minimum 24h volume in USD (0 = disabled)
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -134,6 +136,8 @@ def load_config() -> Config:
         min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
         min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Min 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
+        min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
+        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '5000')),  # Min 5k USD 24h volume
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
