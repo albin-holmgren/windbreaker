@@ -27,6 +27,7 @@ class ExitReason(Enum):
     RUG_DETECTED = "rug_detected"
     ABANDONED = "abandoned"  # Token too worthless to sell, just free the slot
     COPIED_SELL = "copied_sell"  # Trader we copied sold
+    MCAP_STOP_LOSS = "mcap_stop_loss"  # Market cap dropped below threshold
 
 
 @dataclass
@@ -93,10 +94,15 @@ class PositionManager:
         trailing_stop_pct: float = 0,       # 0 = disabled
         rug_abandon_sol: float = 0.005,     # Abandon if worth < 0.005 SOL
         check_interval_sec: float = 60.0,   # Check prices every 60s
+        mcap_stop_loss_usd: float = 0,      # 0 = disabled, sell if mcap drops below
     ):
         self.config = config
         self.wallet = wallet_keypair
         self.rpc = rpc_client
+        self.mcap_stop_loss_usd = mcap_stop_loss_usd
+        
+        # Cache for market caps
+        self.mcap_cache: Dict[str, tuple[float, float]] = {}  # mint -> (mcap, timestamp)
         
         # Settings
         self.max_positions = max_positions
@@ -264,8 +270,12 @@ class PositionManager:
                 # Update price
                 await self._update_position_value(position)
                 
-                # Check exit conditions
+                # Check exit conditions (price-based)
                 exit_reason = self._should_exit(position)
+                
+                # Check market cap stop loss (if enabled)
+                if not exit_reason:
+                    exit_reason = await self._check_mcap_stop_loss(position)
                 
                 if exit_reason:
                     positions_to_sell.append((token_mint, exit_reason))
@@ -353,6 +363,54 @@ class PositionManager:
                 return ExitReason.STOP_LOSS
         
         # No exit needed - follow the trader
+        return None
+    
+    async def _get_market_cap(self, mint: str) -> float:
+        """Get market cap in USD using DexScreener API."""
+        import time
+        
+        # Check cache (valid for 30 seconds)
+        if mint in self.mcap_cache:
+            cached_cap, cached_time = self.mcap_cache[mint]
+            if time.time() - cached_time < 30:
+                return cached_cap
+        
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        market_cap = 0
+                        for pair in pairs:
+                            mc = pair.get("marketCap") or pair.get("fdv") or 0
+                            if mc > market_cap:
+                                market_cap = mc
+                        
+                        self.mcap_cache[mint] = (market_cap, time.time())
+                        return market_cap
+            
+            return 0
+        except Exception as e:
+            logger.debug("mcap_fetch_error", mint=mint[:8], error=str(e))
+            return 0
+    
+    async def _check_mcap_stop_loss(self, position: Position) -> Optional[ExitReason]:
+        """Check if market cap dropped below stop loss threshold."""
+        if self.mcap_stop_loss_usd <= 0:
+            return None
+        
+        mcap = await self._get_market_cap(position.token_mint)
+        if mcap > 0 and mcap < self.mcap_stop_loss_usd:
+            logger.warning(
+                "mcap_stop_loss_triggered",
+                token=position.token_mint[:8],
+                market_cap=f"${mcap:,.0f}",
+                threshold=f"${self.mcap_stop_loss_usd:,.0f}"
+            )
+            return ExitReason.MCAP_STOP_LOSS
+        
         return None
     
     async def _sell_position(

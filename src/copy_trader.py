@@ -112,6 +112,7 @@ class CopyTrader:
             time_limit_minutes=self.config.time_limit_minutes,
             trailing_stop_pct=self.config.trailing_stop_pct,
             rug_abandon_sol=self.config.rug_abandon_sol,
+            mcap_stop_loss_usd=self.config.mcap_stop_loss_usd,
         )
         await self.position_manager.start()
         
