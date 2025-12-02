@@ -18,9 +18,9 @@ from .trade_logger import trade_logger
 
 logger = structlog.get_logger(__name__)
 
-# Jupiter API for swaps - using full API (better rate limits than lite-api)
-JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
-JUPITER_SWAP_API = "https://api.jup.ag/swap/v1/swap"
+# Jupiter API for swaps - using lite-api (public, no auth required)
+JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
+JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
 
 # Native SOL
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
