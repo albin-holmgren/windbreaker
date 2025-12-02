@@ -54,6 +54,9 @@ class Config:
     min_volume_24h_usd: float  # Minimum 24h volume in USD (0 = disabled)
     max_price_change_1h_pct: float  # Skip if price already pumped more than this in 1h (0 = disabled)
     min_txns_1h: int  # Minimum transactions in last hour (0 = disabled)
+    max_top10_holders_pct: float  # Skip if top 10 holders own more than this % (0 = disabled)
+    max_dev_holdings_pct: float  # Skip if dev owns more than this % (0 = disabled)
+    min_holders_count: int  # Minimum number of holders (0 = disabled)
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -139,9 +142,12 @@ def load_config() -> Config:
         min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Min 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
         min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
-        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '5000')),  # Min 5k USD 24h volume
+        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '30000')),  # Min 30k USD 24h volume
         max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '300')),  # Don't buy if pumped 300%+ in 1h
         min_txns_1h=int(os.getenv('MIN_TXNS_1H', '20')),  # At least 20 transactions in last hour
+        max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
+        max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
+        min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once

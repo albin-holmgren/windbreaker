@@ -90,10 +90,17 @@ class CopyTrader:
         self.min_volume_24h_usd = config.min_volume_24h_usd
         self.max_price_change_1h_pct = config.max_price_change_1h_pct
         self.min_txns_1h = config.min_txns_1h
+        self.max_top10_holders_pct = config.max_top10_holders_pct
+        self.max_dev_holdings_pct = config.max_dev_holdings_pct
+        self.min_holders_count = config.min_holders_count
         
         # Cache for token info (to avoid repeated API calls)
         # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
         self.token_info_cache: Dict[str, tuple[float, float, float, float, float, int, float]] = {}
+        
+        # Cache for holder info from RugCheck (to avoid repeated API calls)
+        # mint -> (top10_pct, dev_pct, holders_count, cache_time)
+        self.holder_info_cache: Dict[str, tuple[float, float, int, float]] = {}
         
         # Track trader wallet balances for proportional sizing
         self.trader_balances: Dict[str, float] = {}
@@ -413,6 +420,62 @@ class CopyTrader:
                 age=f"{age_minutes:.1f}m"
             )
             
+            # BUYS: Check holder distribution filters (using RugCheck API)
+            if self.max_top10_holders_pct > 0 or self.max_dev_holdings_pct > 0 or self.min_holders_count > 0:
+                top10_pct, dev_pct, holders_count = await self._get_holder_info(swap.token_mint)
+                
+                # Only apply filters if we got data (0 means API failed/no data)
+                if top10_pct > 0 or holders_count > 0:
+                    # Check top 10 holders concentration
+                    if self.max_top10_holders_pct > 0 and top10_pct > self.max_top10_holders_pct:
+                        logger.info(
+                            "skipping_concentrated_holdings",
+                            token=swap.token_mint[:8],
+                            top10_pct=f"{top10_pct:.1f}%",
+                            max_allowed=f"{self.max_top10_holders_pct:.0f}%"
+                        )
+                        return CopyTradeResult(
+                            success=False,
+                            error=f"top10_holders_too_high ({top10_pct:.1f}% > {self.max_top10_holders_pct:.0f}%)",
+                            original_swap=swap
+                        )
+                    
+                    # Check dev holdings
+                    if self.max_dev_holdings_pct > 0 and dev_pct > self.max_dev_holdings_pct:
+                        logger.info(
+                            "skipping_high_dev_holdings",
+                            token=swap.token_mint[:8],
+                            dev_pct=f"{dev_pct:.1f}%",
+                            max_allowed=f"{self.max_dev_holdings_pct:.0f}%"
+                        )
+                        return CopyTradeResult(
+                            success=False,
+                            error=f"dev_holdings_too_high ({dev_pct:.1f}% > {self.max_dev_holdings_pct:.0f}%)",
+                            original_swap=swap
+                        )
+                    
+                    # Check minimum holders count
+                    if self.min_holders_count > 0 and holders_count < self.min_holders_count:
+                        logger.info(
+                            "skipping_low_holders",
+                            token=swap.token_mint[:8],
+                            holders=holders_count,
+                            min_required=self.min_holders_count
+                        )
+                        return CopyTradeResult(
+                            success=False,
+                            error=f"too_few_holders ({holders_count} < {self.min_holders_count})",
+                            original_swap=swap
+                        )
+                    
+                    logger.info(
+                        "holder_filters_passed",
+                        token=swap.token_mint[:8],
+                        top10_pct=f"{top10_pct:.1f}%",
+                        dev_pct=f"{dev_pct:.1f}%",
+                        holders=holders_count
+                    )
+            
             # BUYS: Full calculation path
             balance = await self.rpc.get_balance(self.wallet.pubkey())
             balance_sol = balance / 1e9
@@ -716,6 +779,57 @@ class CopyTrader:
         except Exception as e:
             logger.debug("token_info_fetch_error", mint=mint[:8], error=str(e))
             return 0, 0, 0, 0, 0, 0
+    
+    async def _get_holder_info(self, mint: str) -> tuple[float, float, int]:
+        """Get holder distribution info using RugCheck API.
+        
+        Returns:
+            tuple: (top10_holders_pct, dev_holdings_pct, holders_count)
+        """
+        import time
+        
+        # Check cache (valid for 5 minutes - holder data doesn't change fast)
+        if mint in self.holder_info_cache:
+            cached_top10, cached_dev, cached_holders, cached_time = self.holder_info_cache[mint]
+            if time.time() - cached_time < 300:  # 5 minutes
+                return cached_top10, cached_dev, cached_holders
+        
+        try:
+            # RugCheck API
+            url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    # Get top holders percentage
+                    top_holders = data.get("topHolders", [])
+                    top10_pct = 0
+                    for i, holder in enumerate(top_holders[:10]):
+                        top10_pct += holder.get("pct", 0)
+                    
+                    # Get creator/dev holdings
+                    creator_pct = 0
+                    creator = data.get("creator")
+                    if creator:
+                        creator_pct = creator.get("pct", 0) or 0
+                    
+                    # Also check for "insider" or high-risk holders
+                    risks = data.get("risks", [])
+                    for risk in risks:
+                        if "creator" in risk.get("name", "").lower():
+                            # Try to extract percentage from risk description
+                            pass
+                    
+                    # Get total holders count
+                    holders_count = data.get("holderCount", 0) or len(top_holders)
+                    
+                    self.holder_info_cache[mint] = (top10_pct, creator_pct, holders_count, time.time())
+                    return top10_pct, creator_pct, holders_count
+            
+            return 0, 0, 0
+        except Exception as e:
+            logger.debug("holder_info_fetch_error", mint=mint[:8], error=str(e))
+            return 0, 0, 0
     
     async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
         """Remove token from recent copies after delay."""
