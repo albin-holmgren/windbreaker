@@ -597,12 +597,19 @@ class CopyTrader:
                     swap.sol_value * 2
                 )
             
+            # Round to avoid floating point precision issues (0.04999 -> 0.05)
+            trade_sol = round(trade_sol, 4)
+            
+            # Ensure minimum trade size if we have enough balance
             if trade_sol < self.min_sol_per_trade:
-                return CopyTradeResult(
-                    success=False,
-                    error=f"insufficient_balance ({trade_sol:.4f} SOL)",
-                    original_swap=swap
-                )
+                if available_sol >= self.min_sol_per_trade:
+                    trade_sol = self.min_sol_per_trade  # Bump up to minimum
+                else:
+                    return CopyTradeResult(
+                        success=False,
+                        error=f"insufficient_balance ({available_sol:.4f} SOL < {self.min_sol_per_trade} min)",
+                        original_swap=swap
+                    )
             
             trade_lamports = int(trade_sol * 1e9)
             
