@@ -93,6 +93,7 @@ class CopyTrader:
         self.max_top10_holders_pct = config.max_top10_holders_pct
         self.max_dev_holdings_pct = config.max_dev_holdings_pct
         self.min_holders_count = config.min_holders_count
+        self.trust_trader_pumpfun = config.trust_trader_pumpfun
         
         # Cache for token info (to avoid repeated API calls)
         # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
@@ -313,8 +314,23 @@ class CopyTrader:
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
             is_pumpfun = swap.dex == "pump.fun"
             
-            if is_pumpfun:
-                # Use Pump.fun API for token info
+            # TRUST TRADER MODE: Skip all filters for pump.fun tokens
+            if is_pumpfun and self.trust_trader_pumpfun:
+                logger.info(
+                    "trust_trader_pumpfun",
+                    token=swap.token_mint[:8],
+                    sol=f"{swap.sol_value:.4f}",
+                    message="Skipping filters - trusting trader for pump.fun token"
+                )
+                # Skip directly to trade execution (no filters)
+                market_cap = 0
+                age_minutes = 0
+                liquidity = 0
+                volume_24h = 0
+                price_change_1h = 0
+                txns_1h = 0
+            elif is_pumpfun:
+                # Use Pump.fun API for token info (with filters)
                 market_cap, age_minutes = await self._get_pumpfun_token_info(swap.token_mint)
                 liquidity = market_cap * 0.1  # Pump.fun uses bonding curve, estimate ~10% as liquidity
                 volume_24h = 0  # Not easily available from pump.fun
@@ -356,8 +372,11 @@ class CopyTrader:
                         original_swap=swap
                     )
             
+            # Skip all filters in trust trader mode for pump.fun
+            skip_filters = is_pumpfun and self.trust_trader_pumpfun
+            
             # Check token age
-            if self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
+            if not skip_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
                 logger.info(
                     "skipping_new_token",
                     token=swap.token_mint[:8],
@@ -371,7 +390,7 @@ class CopyTrader:
                 )
             
             # Check market cap
-            if self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
+            if not skip_filters and self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
                 logger.info(
                     "skipping_low_mcap",
                     token=swap.token_mint[:8],
@@ -385,7 +404,7 @@ class CopyTrader:
                 )
             
             # Check liquidity - CRITICAL for being able to sell!
-            if self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
+            if not skip_filters and self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
                 logger.info(
                     "skipping_low_liquidity",
                     token=swap.token_mint[:8],
@@ -399,7 +418,7 @@ class CopyTrader:
                 )
             
             # Check 24h volume - indicates trading activity
-            if self.min_volume_24h_usd > 0 and volume_24h < self.min_volume_24h_usd:
+            if not skip_filters and self.min_volume_24h_usd > 0 and volume_24h < self.min_volume_24h_usd:
                 logger.info(
                     "skipping_low_volume",
                     token=swap.token_mint[:8],
@@ -413,7 +432,7 @@ class CopyTrader:
                 )
             
             # Check if token already pumped too much - avoid buying tops!
-            if self.max_price_change_1h_pct > 0 and price_change_1h > self.max_price_change_1h_pct:
+            if not skip_filters and self.max_price_change_1h_pct > 0 and price_change_1h > self.max_price_change_1h_pct:
                 logger.info(
                     "skipping_already_pumped",
                     token=swap.token_mint[:8],
@@ -427,7 +446,7 @@ class CopyTrader:
                 )
             
             # Check minimum transactions - ensure active trading
-            if self.min_txns_1h > 0 and txns_1h < self.min_txns_1h:
+            if not skip_filters and self.min_txns_1h > 0 and txns_1h < self.min_txns_1h:
                 logger.info(
                     "skipping_low_activity",
                     token=swap.token_mint[:8],

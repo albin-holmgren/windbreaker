@@ -57,6 +57,7 @@ class Config:
     max_top10_holders_pct: float  # Skip if top 10 holders own more than this % (0 = disabled)
     max_dev_holdings_pct: float  # Skip if dev owns more than this % (0 = disabled)
     min_holders_count: int  # Minimum number of holders (0 = disabled)
+    trust_trader_pumpfun: bool  # If true, skip all filters for pump.fun tokens and trust trader
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -148,6 +149,7 @@ def load_config() -> Config:
         max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
         min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
+        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust trader for pump.fun
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
