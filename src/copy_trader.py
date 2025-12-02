@@ -18,9 +18,9 @@ from .trade_logger import trade_logger
 
 logger = structlog.get_logger(__name__)
 
-# Jupiter API for swaps
-JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
-JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
+# Jupiter API for swaps - using full API (better rate limits than lite-api)
+JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_API = "https://api.jup.ag/swap/v1/swap"
 
 # Native SOL
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
@@ -254,7 +254,7 @@ class CopyTrader:
                     their_sol=f"{swap.sol_value:.4f}"
                 )
                 
-                # RETRY LOOP with exponential backoff to avoid rate limits
+                # AGGRESSIVE RETRY LOOP with exponential backoff
                 max_retries = 5
                 result = None
                 for attempt in range(max_retries):
@@ -278,16 +278,16 @@ class CopyTrader:
                         logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
                         return result
                     
-                    # Failed - log and retry with exponential backoff
+                    # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
+                    delay = 0.5 * (2 ** attempt)
                     logger.warning(
                         "sell_retry",
                         token=swap.token_mint[:8],
                         attempt=attempt + 1,
                         max_retries=max_retries,
+                        next_retry_sec=delay,
                         error=result.error if result else "unknown"
                     )
-                    # Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                    delay = min(2 ** attempt, 16)
                     await asyncio.sleep(delay)
                 
                 # All retries failed - add to retry queue for background retries
