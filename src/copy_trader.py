@@ -226,8 +226,8 @@ class CopyTrader:
         if swap.is_sell and not self.copy_sells:
             return False, "sell_disabled"
         
-        # Check minimum SOL value
-        if swap.sol_value < self.min_sol_per_trade:
+        # Check minimum SOL value (only for BUYS - always allow sells)
+        if swap.is_buy and swap.sol_value < self.min_sol_per_trade:
             return False, f"below_min_sol ({swap.sol_value:.4f} < {self.min_sol_per_trade})"
         
         # Don't RE-BUY the same token too frequently (but always allow sells)
