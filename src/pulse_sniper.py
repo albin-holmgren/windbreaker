@@ -485,16 +485,21 @@ async def main():
         sustained_filter_minutes=float(os.getenv("SUSTAINED_FILTER_MINUTES", "5"))
     )
     
-    # Import position manager
+    # Import position manager and config
     from src.position_manager import PositionManager
+    from src.config import load_config
+    
+    app_config = load_config()
     
     position_manager = PositionManager(
-        rpc=rpc,
-        wallet=wallet,
+        config=app_config,
+        wallet_keypair=wallet,
+        rpc_client=rpc,
+        max_positions=config.max_positions,
         take_profit_pct=config.take_profit_pct,
         stop_loss_pct=config.stop_loss_pct,
         trailing_stop_pct=config.trailing_stop_pct,
-        check_interval=10
+        check_interval_sec=10
     )
     
     # Create and start sniper
