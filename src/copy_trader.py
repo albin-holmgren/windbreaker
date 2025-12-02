@@ -240,7 +240,7 @@ class CopyTrader:
     async def _execute_copy(self, swap: ParsedSwap) -> CopyTradeResult:
         """Execute a copy of the detected swap."""
         try:
-            # FAST PATH for sells - skip balance calculations
+            # FAST PATH for sells - skip balance calculations, AGGRESSIVE RETRIES
             if not swap.is_buy:
                 token_balance = await self._get_token_balance(swap.token_mint)
                 if token_balance == 0:
@@ -254,25 +254,46 @@ class CopyTrader:
                     their_sol=f"{swap.sol_value:.4f}"
                 )
                 
-                result = await self._execute_swap(
-                    input_mint=swap.token_mint,
-                    output_mint=NATIVE_SOL,
-                    amount=token_balance
-                )
-                
-                if result.success:
-                    self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
-                    trade_logger.log_sell(
-                        token_mint=swap.token_mint,
-                        token_symbol=swap.token_symbol,
-                        sol_received=0,
-                        tokens_sold=token_balance,
-                        our_signature=result.signature or "",
-                        trigger="copied_sell",
-                        success=True
+                # AGGRESSIVE RETRY LOOP - sells MUST succeed
+                max_retries = 5
+                result = None
+                for attempt in range(max_retries):
+                    result = await self._execute_swap(
+                        input_mint=swap.token_mint,
+                        output_mint=NATIVE_SOL,
+                        amount=token_balance
                     )
                     
-                return result
+                    if result.success:
+                        self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
+                        trade_logger.log_sell(
+                            token_mint=swap.token_mint,
+                            token_symbol=swap.token_symbol,
+                            sol_received=0,
+                            tokens_sold=token_balance,
+                            our_signature=result.signature or "",
+                            trigger="copied_sell",
+                            success=True
+                        )
+                        logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
+                        return result
+                    
+                    # Failed - log and retry immediately
+                    logger.warning(
+                        "sell_retry",
+                        token=swap.token_mint[:8],
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        error=result.error if result else "unknown"
+                    )
+                    await asyncio.sleep(0.15)  # 150ms between retries
+                
+                # All retries failed - add to retry queue for background retries
+                logger.error("sell_failed_queuing_retry", token=swap.token_mint[:8])
+                if self.position_manager:
+                    self.position_manager.queue_failed_sell(swap.token_mint, token_balance)
+                
+                return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
             
             # BUYS: Check market cap and token age filters
             if self.min_market_cap_usd > 0 or self.min_token_age_minutes > 0:

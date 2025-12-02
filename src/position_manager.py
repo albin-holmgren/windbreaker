@@ -116,6 +116,7 @@ class PositionManager:
         # State
         self.positions: Dict[str, Position] = {}  # token_mint -> Position
         self.abandoned_tokens: Dict[str, float] = {}  # token_mint -> entry_sol (for stats)
+        self.failed_sells: Dict[str, int] = {}  # token_mint -> token_amount (queued for retry)
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
         
@@ -140,6 +141,9 @@ class PositionManager:
         
         # Start monitoring loop
         asyncio.create_task(self._monitor_loop())
+        
+        # Start failed sells retry loop
+        asyncio.create_task(self._retry_failed_sells_loop())
     
     async def stop(self) -> None:
         """Stop the position manager."""
@@ -247,6 +251,117 @@ class PositionManager:
     def get_position(self, token_mint: str) -> Optional[Position]:
         """Get a position by token mint."""
         return self.positions.get(token_mint)
+    
+    def queue_failed_sell(self, token_mint: str, token_amount: int) -> None:
+        """Queue a failed sell for background retry."""
+        self.failed_sells[token_mint] = token_amount
+        logger.info(
+            "sell_queued_for_retry",
+            token=token_mint[:8],
+            amount=token_amount,
+            queue_size=len(self.failed_sells)
+        )
+    
+    async def _retry_failed_sells_loop(self) -> None:
+        """Background loop to retry failed sells every 10 seconds."""
+        while self.running:
+            try:
+                await asyncio.sleep(10)  # Check every 10 seconds
+                
+                if not self.failed_sells:
+                    continue
+                
+                # Process failed sells
+                for token_mint, token_amount in list(self.failed_sells.items()):
+                    logger.info(
+                        "retrying_failed_sell",
+                        token=token_mint[:8],
+                        amount=token_amount
+                    )
+                    
+                    # Try to sell
+                    try:
+                        result = await self._execute_direct_sell(token_mint, token_amount)
+                        
+                        if result.success:
+                            logger.info(
+                                "retry_sell_success",
+                                token=token_mint[:8],
+                                sol_received=f"{result.sol_received:.4f}"
+                            )
+                            # Remove from queue
+                            del self.failed_sells[token_mint]
+                            # Also remove from positions if tracked
+                            if token_mint in self.positions:
+                                del self.positions[token_mint]
+                        else:
+                            logger.warning(
+                                "retry_sell_failed",
+                                token=token_mint[:8],
+                                error=result.error
+                            )
+                    except Exception as e:
+                        logger.warning("retry_sell_error", token=token_mint[:8], error=str(e))
+                    
+                    # Small delay between retries
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error("retry_loop_error", error=str(e))
+    
+    async def _execute_direct_sell(self, token_mint: str, token_amount: int) -> SellResult:
+        """Execute a direct sell without position tracking."""
+        try:
+            # Get quote for selling
+            quote = await self._get_quote(
+                input_mint=token_mint,
+                output_mint=NATIVE_SOL,
+                amount=token_amount
+            )
+            
+            if not quote:
+                return SellResult(success=False, error="no_quote")
+            
+            # Get swap transaction with HIGH priority fees
+            swap_data = {
+                "quoteResponse": quote,
+                "userPublicKey": str(self.wallet.pubkey()),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": 500000  # Very high priority for retries
+            }
+            
+            async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    return SellResult(success=False, error=f"swap_api: {error}")
+                swap_response = await resp.json()
+            
+            # Sign and send
+            import base64
+            from solders.transaction import VersionedTransaction
+            
+            swap_tx = swap_response.get("swapTransaction")
+            if not swap_tx:
+                return SellResult(success=False, error="no_swap_tx")
+            
+            tx_bytes = base64.b64decode(swap_tx)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signed_tx = VersionedTransaction(tx.message, [self.wallet])
+            
+            signature = await self.rpc.send_transaction(signed_tx)
+            
+            sol_received = int(quote.get("outAmount", 0)) / 1e9
+            
+            return SellResult(
+                success=True,
+                signature=signature,
+                sol_received=sol_received,
+                reason=ExitReason.COPIED_SELL
+            )
+            
+        except Exception as e:
+            return SellResult(success=False, error=str(e))
     
     async def _monitor_loop(self) -> None:
         """Main loop to monitor positions and trigger sells."""
