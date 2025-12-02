@@ -129,7 +129,7 @@ class PulseSniper:
         
         # Start position monitoring if we have a position manager
         if self.position_manager:
-            asyncio.create_task(self.position_manager.start_monitoring())
+            asyncio.create_task(self.position_manager.start())
     
     async def stop(self):
         """Stop the pulse sniper."""
