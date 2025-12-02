@@ -209,6 +209,8 @@ class PositionManager:
         if token_mint not in self.positions:
             return SellResult(success=False, error="no_position_for_token")
         
+        position = self.positions[token_mint]
+        
         logger.info(
             "trader_sold_copying",
             token=token_mint[:8] + "...",
@@ -216,7 +218,7 @@ class PositionManager:
             message="URGENT: Copying trader's sell!"
         )
         
-        # Aggressive retry loop - we NEED to sell when they sell
+        # Retry loop with exponential backoff to avoid rate limits
         for attempt in range(max_retries):
             result = await self._sell_position(token_mint, reason)
             
@@ -229,7 +231,7 @@ class PositionManager:
                 )
                 return result
             
-            # Failed - retry immediately
+            # Failed - log and retry with increasing delay
             logger.warning(
                 "sell_retry",
                 token=token_mint[:8],
@@ -238,14 +240,20 @@ class PositionManager:
                 error=result.error
             )
             
-            # Very short delay before retry (100ms)
-            await asyncio.sleep(0.1)
+            # Exponential backoff: 1s, 2s, 4s, 8s, 16s to avoid rate limits
+            delay = min(2 ** attempt, 16)
+            await asyncio.sleep(delay)
         
+        # All retries failed - queue for background retry
         logger.error(
-            "sell_failed_all_retries",
+            "sell_failed_queuing_background",
             token=token_mint[:8],
             attempts=max_retries
         )
+        
+        # Queue for background retry with token amount
+        self.queue_failed_sell(token_mint, position.token_amount)
+        
         return SellResult(success=False, error=f"failed_after_{max_retries}_retries", reason=reason)
     
     def get_position(self, token_mint: str) -> Optional[Position]:
@@ -263,13 +271,15 @@ class PositionManager:
         )
     
     async def _retry_failed_sells_loop(self) -> None:
-        """Background loop to retry failed sells every 10 seconds."""
+        """Background loop to retry failed sells every 30 seconds."""
         while self.running:
             try:
-                await asyncio.sleep(10)  # Check every 10 seconds
+                await asyncio.sleep(30)  # Check every 30 seconds to avoid rate limits
                 
                 if not self.failed_sells:
                     continue
+                
+                logger.info("processing_failed_sells_queue", queue_size=len(self.failed_sells))
                 
                 # Process failed sells
                 for token_mint, token_amount in list(self.failed_sells.items()):
@@ -303,8 +313,8 @@ class PositionManager:
                     except Exception as e:
                         logger.warning("retry_sell_error", token=token_mint[:8], error=str(e))
                     
-                    # Small delay between retries
-                    await asyncio.sleep(0.5)
+                    # 5 second delay between each token to avoid rate limits
+                    await asyncio.sleep(5)
                     
             except Exception as e:
                 logger.error("retry_loop_error", error=str(e))

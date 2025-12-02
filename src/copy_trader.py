@@ -254,7 +254,7 @@ class CopyTrader:
                     their_sol=f"{swap.sol_value:.4f}"
                 )
                 
-                # AGGRESSIVE RETRY LOOP - sells MUST succeed
+                # RETRY LOOP with exponential backoff to avoid rate limits
                 max_retries = 5
                 result = None
                 for attempt in range(max_retries):
@@ -278,7 +278,7 @@ class CopyTrader:
                         logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
                         return result
                     
-                    # Failed - log and retry immediately
+                    # Failed - log and retry with exponential backoff
                     logger.warning(
                         "sell_retry",
                         token=swap.token_mint[:8],
@@ -286,7 +286,9 @@ class CopyTrader:
                         max_retries=max_retries,
                         error=result.error if result else "unknown"
                     )
-                    await asyncio.sleep(0.15)  # 150ms between retries
+                    # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    delay = min(2 ** attempt, 16)
+                    await asyncio.sleep(delay)
                 
                 # All retries failed - add to retry queue for background retries
                 logger.error("sell_failed_queuing_retry", token=swap.token_mint[:8])
