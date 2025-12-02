@@ -310,20 +310,51 @@ class CopyTrader:
                 return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
             
             # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
-            market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
+            # For pump.fun tokens, use Pump.fun API instead of DexScreener
+            is_pumpfun = swap.dex == "pump.fun"
             
-            # If not on DexScreener, skip (likely very new/risky token)
-            if market_cap == 0 and age_minutes == 0:
+            if is_pumpfun:
+                # Use Pump.fun API for token info
+                market_cap, age_minutes = await self._get_pumpfun_token_info(swap.token_mint)
+                liquidity = market_cap * 0.1  # Pump.fun uses bonding curve, estimate ~10% as liquidity
+                volume_24h = 0  # Not easily available from pump.fun
+                price_change_1h = 0
+                txns_1h = 100  # Assume active if trader is buying
+                
+                if market_cap == 0:
+                    logger.info(
+                        "skipping_unknown_token",
+                        token=swap.token_mint[:8],
+                        reason="not_on_pumpfun"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error="token_unknown (not found on pump.fun)",
+                        original_swap=swap
+                    )
+                
                 logger.info(
-                    "skipping_unknown_token",
+                    "pumpfun_token_info",
                     token=swap.token_mint[:8],
-                    reason="not_on_dexscreener"
+                    market_cap=f"${market_cap:,.0f}",
+                    age=f"{age_minutes:.1f}m"
                 )
-                return CopyTradeResult(
-                    success=False,
-                    error="token_unknown (not on DexScreener yet)",
-                    original_swap=swap
-                )
+            else:
+                # Use DexScreener for other DEXes
+                market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
+                
+                # If not on DexScreener, skip
+                if market_cap == 0 and age_minutes == 0:
+                    logger.info(
+                        "skipping_unknown_token",
+                        token=swap.token_mint[:8],
+                        reason="not_on_dexscreener"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error="token_unknown (not on DexScreener yet)",
+                        original_swap=swap
+                    )
             
             # Check token age
             if self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
@@ -421,7 +452,8 @@ class CopyTrader:
             )
             
             # BUYS: Check holder distribution filters (using RugCheck API)
-            if self.max_top10_holders_pct > 0 or self.max_dev_holdings_pct > 0 or self.min_holders_count > 0:
+            # Skip for pump.fun tokens - they're too new for RugCheck data
+            if not is_pumpfun and (self.max_top10_holders_pct > 0 or self.max_dev_holdings_pct > 0 or self.min_holders_count > 0):
                 top10_pct, dev_pct, holders_count = await self._get_holder_info(swap.token_mint)
                 
                 # Only apply filters if we got data (0 means API failed/no data)
@@ -779,6 +811,46 @@ class CopyTrader:
         except Exception as e:
             logger.debug("token_info_fetch_error", mint=mint[:8], error=str(e))
             return 0, 0, 0, 0, 0, 0
+    
+    async def _get_pumpfun_token_info(self, mint: str) -> tuple[float, float]:
+        """Get token info from Pump.fun API.
+        
+        Returns:
+            tuple: (market_cap_usd, age_minutes)
+        """
+        import time
+        
+        # Check cache (valid for 30 seconds for pump.fun - things move fast)
+        cache_key = f"pumpfun_{mint}"
+        if cache_key in self.token_info_cache:
+            cached = self.token_info_cache[cache_key]
+            if len(cached) >= 3 and time.time() - cached[2] < 30:
+                return cached[0], cached[1]
+        
+        try:
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    # Get market cap in USD
+                    market_cap = data.get("usd_market_cap", 0) or 0
+                    
+                    # Get token age from created_timestamp (in milliseconds)
+                    created_ts = data.get("created_timestamp")
+                    age_minutes = 0
+                    if created_ts:
+                        age_ms = time.time() * 1000 - created_ts
+                        age_minutes = age_ms / 60000
+                    
+                    # Cache it
+                    self.token_info_cache[cache_key] = (market_cap, age_minutes, time.time())
+                    return market_cap, age_minutes
+            
+            return 0, 0
+        except Exception as e:
+            logger.debug("pumpfun_info_fetch_error", mint=mint[:8], error=str(e))
+            return 0, 0
     
     async def _get_holder_info(self, mint: str) -> tuple[float, float, int]:
         """Get holder distribution info using RugCheck API.
