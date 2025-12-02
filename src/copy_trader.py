@@ -759,6 +759,9 @@ class CopyTrader:
             action = "buy" if is_buy else "sell"
             
             # Request transaction from PumpPortal
+            # Use high slippage for pump.fun (tokens move fast) - minimum 15%
+            pumpfun_slippage = max(self.config.slippage_bps / 100, 15)
+            
             if is_buy:
                 payload = {
                     "publicKey": str(self.wallet.pubkey()),
@@ -766,9 +769,9 @@ class CopyTrader:
                     "mint": token_mint,
                     "denominatedInSol": "true",
                     "amount": sol_amount,
-                    "slippage": self.config.slippage_bps / 100,  # Convert bps to percentage
-                    "priorityFee": 0.0005,  # 0.0005 SOL priority fee
-                    "pool": "pump"  # Use pump.fun bonding curve
+                    "slippage": pumpfun_slippage,
+                    "priorityFee": 0.001,  # Higher priority for faster execution
+                    "pool": "pump"
                 }
             else:
                 # For sells, use percentage of holdings
@@ -777,9 +780,9 @@ class CopyTrader:
                     "action": action,
                     "mint": token_mint,
                     "denominatedInSol": "false",
-                    "amount": f"{sell_percentage}%",  # Sell percentage of holdings
-                    "slippage": self.config.slippage_bps / 100,
-                    "priorityFee": 0.0005,
+                    "amount": f"{sell_percentage}%",
+                    "slippage": pumpfun_slippage,
+                    "priorityFee": 0.001,
                     "pool": "pump"
                 }
             

@@ -672,14 +672,17 @@ class PositionManager:
             from solders.transaction import VersionedTransaction
             
             # Request transaction from PumpPortal - sell 100% of holdings
+            # Use high slippage for pump.fun (tokens move fast) - minimum 15%
+            pumpfun_slippage = max(self.config.slippage_bps / 100, 15)
+            
             payload = {
                 "publicKey": str(self.wallet.pubkey()),
                 "action": "sell",
                 "mint": position.token_mint,
                 "denominatedInSol": "false",
                 "amount": "100%",  # Sell all tokens
-                "slippage": self.config.slippage_bps / 100,
-                "priorityFee": 0.0005,
+                "slippage": pumpfun_slippage,
+                "priorityFee": 0.001,  # Higher priority for faster execution
                 "pool": "pump"
             }
             
