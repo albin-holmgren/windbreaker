@@ -1,17 +1,17 @@
 # Windbreaker 🌊
 
-**Solana Triangular Arbitrage Bot**
+**Solana Copy Trading Bot**
 
-A Python-based bot that scans Solana DEX routes via Jupiter, detects triangular price mismatches (A → B → C → A), and executes atomic multi-swap transactions when profitable.
+Automatically copy trades from successful meme coin traders. Follow top traders from Fomo app or any Solana wallet and execute their trades in real-time.
 
 ## Features
 
-- 🔍 **Triangular Arbitrage Detection** - Scans multiple token paths for price inefficiencies
-- ⚡ **Jupiter Integration** - Uses Jupiter aggregator for optimal routing and execution
-- 🔐 **Wallet-Funded Trades** - No flash loans, uses only available wallet balance
-- 📊 **Real-time Monitoring** - Telegram alerts and CSV metrics tracking
-- 🛡️ **Safety First** - Simulation before execution, configurable thresholds
-- 🚀 **RunPod Ready** - Deployment scripts for low-latency cloud hosting
+- 👥 **Copy Trading** - Follow any Solana wallet and auto-copy their trades
+- ⚡ **Fast Execution** - Detects and copies trades within seconds
+- 🎯 **Pump.fun Support** - Native support for pump.fun token trades
+- 📊 **Position Management** - Automatic stop loss, take profit, trailing stop
+- 🛡️ **Safety Filters** - Market cap, liquidity, holder distribution filters
+- 🚀 **RunPod Ready** - Deploy for 24/7 low-latency trading
 
 ## Quick Start
 
@@ -19,127 +19,113 @@ A Python-based bot that scans Solana DEX routes via Jupiter, detects triangular 
 
 - Python 3.10+
 - Solana wallet with SOL balance
-- RPC endpoint (Helius/QuickNode recommended)
+- RPC endpoint (Helius recommended)
+- Wallet addresses to copy (from Fomo app or other sources)
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/windbreaker.git
+git clone https://github.com/albin-holmgren/windbreaker.git
 cd windbreaker
-
-# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ### Configuration
 
 ```bash
-# Copy example environment file
 cp .env.example .env
-
-# Edit with your settings
 nano .env
 ```
 
-Required settings:
-- `RPC_URL` - Your Solana RPC endpoint
-- `WALLET_PRIVATE_KEY_BASE58` - Your wallet's private key (base58 encoded)
-- `NETWORK` - `devnet` for testing, `mainnet-beta` for production
+Key settings:
+```bash
+# Your wallet
+WALLET_PRIVATE_KEY_BASE58=your_private_key
+RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+
+# Wallets to copy (comma-separated)
+COPY_WALLETS=wallet1,wallet2,wallet3
+
+# Trade settings
+COPY_MAX_SOL=0.1          # Max SOL per trade
+COPY_MIN_SOL=0.05         # Min SOL per trade
+SLIPPAGE_BPS=1500         # 15% slippage for meme coins
+
+# Position management
+TAKE_PROFIT_PCT=50        # Sell at 50% profit
+STOP_LOSS_PCT=-35         # Sell at 35% loss
+TRAILING_STOP_PCT=25      # 25% trailing stop
+```
 
 ### Running
 
 ```bash
-# Development/testing (devnet)
 python -m src.main
-
-# Production with PM2
-./scripts/start-prod.sh
-```
-
-## Architecture
-
-```
-windbreaker/
-├── src/
-│   ├── main.py          # Entry point and main loop
-│   ├── config.py        # Configuration and constants
-│   ├── wallet.py        # Wallet abstraction
-│   ├── rpc.py           # RPC client with rate limiting
-│   ├── arb_engine.py    # Arbitrage detection engine
-│   ├── executor.py      # Transaction execution
-│   └── monitor.py       # Alerts and metrics
-├── tests/
-│   ├── test_simulation.py
-│   └── test_devnet_integration.sh
-├── scripts/
-│   ├── runpod-deploy.sh
-│   └── start-prod.sh
-└── docs/
-    ├── ARCHITECTURE.md
-    └── RUNPOD.md
 ```
 
 ## How It Works
 
-1. **Poll**: Fetch price quotes from Jupiter for configured token paths
-2. **Simulate**: Calculate expected profit after fees and slippage
-3. **Decide**: Execute only if net profit exceeds threshold (default 0.5%)
-4. **Execute**: Send atomic multi-swap transaction
-5. **Report**: Log result and send Telegram alert
+1. **Monitor** - Watches configured wallet addresses for new transactions
+2. **Detect** - Identifies buy/sell swaps on Jupiter, Raydium, Pump.fun
+3. **Filter** - Applies safety filters (market cap, liquidity, etc.)
+4. **Execute** - Copies the trade with configured size
+5. **Manage** - Tracks position with stop loss / take profit
+
+## Finding Wallets to Copy
+
+### From Fomo App
+1. Download [Fomo app](https://apps.apple.com/us/app/fomo-never-miss-out/id6741115427)
+2. Find top traders on leaderboard
+3. Get their Solana wallet address
+4. Add to `COPY_WALLETS` in .env
+
+### From Other Sources
+- Cielo Finance - wallet PnL tracker
+- Birdeye - top traders leaderboard
+- Solscan - analyze successful wallets
 
 ## Configuration Options
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIN_PROFIT_PCT` | 0.5 | Minimum net profit to execute (%) |
-| `TRADE_AMOUNT_USD` | 10 | Trade size in USD equivalent |
-| `SLIPPAGE_BPS` | 50 | Slippage tolerance (0.5%) |
-| `POLL_INTERVAL_MS` | 500 | Time between scans (ms) |
+| `COPY_WALLETS` | - | Comma-separated wallet addresses to copy |
+| `COPY_MAX_SOL` | 0.1 | Maximum SOL per copy trade |
+| `COPY_MIN_SOL` | 0.05 | Minimum SOL per copy trade |
+| `SLIPPAGE_BPS` | 1500 | Slippage tolerance (15%) |
+| `TAKE_PROFIT_PCT` | 50 | Take profit percentage |
+| `STOP_LOSS_PCT` | -35 | Stop loss percentage |
+| `TRAILING_STOP_PCT` | 25 | Trailing stop percentage |
+| `COPY_SELLS` | true | Copy sell transactions too |
+| `MAX_POSITIONS` | 3 | Maximum concurrent positions |
 
-## Testing
+## Deployment (RunPod)
 
 ```bash
-# Run unit tests
-pytest tests/test_simulation.py -v
+# On RunPod
+git clone https://github.com/albin-holmgren/windbreaker.git
+cd windbreaker
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-# Run devnet integration test
-chmod +x tests/test_devnet_integration.sh
-./tests/test_devnet_integration.sh
-```
+# Configure
+nano .env
 
-## Deployment
-
-See [docs/RUNPOD.md](docs/RUNPOD.md) for detailed deployment instructions.
-
-Quick deploy to RunPod:
-```bash
-./scripts/runpod-deploy.sh user@pod-xyz.runpod.net ~/.env.windbreaker
+# Run in screen
+screen -S copybot
+python -m src.main
+# Ctrl+A, D to detach
 ```
 
 ## Security
 
-⚠️ **Important Security Notes:**
-
-- **Never commit private keys** to version control
-- Use environment variables or secure secret managers
-- Start with small amounts ($10-100) for testing
-- Keep hot wallet funds minimal
-- Consider hardware wallet integration for production
-
-## Monitoring
-
-The bot sends Telegram alerts for:
-- ✅ Successful trades (with tx signature and profit)
-- ❌ Failed trades (with error details)
-- 🚨 Critical errors (RPC issues, repeated failures)
-
-Metrics are saved to `metrics/trades.csv`:
-- Timestamp, path, amounts, profit, signature
+⚠️ **Important:**
+- Never commit private keys
+- Start with small amounts ($10-50)
+- Test with one wallet first
+- Monitor initial trades closely
 
 ## License
 
@@ -148,4 +134,3 @@ MIT License - see [LICENSE](LICENSE)
 ## Disclaimer
 
 This software is for educational purposes. Cryptocurrency trading carries significant risk. Use at your own risk and never trade with funds you cannot afford to lose.
-# windbreaker
