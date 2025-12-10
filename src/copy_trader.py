@@ -286,7 +286,7 @@ class CopyTrader:
                 is_pumpfun_sell = swap.dex == "pump.fun"
                 
                 if self.mock_trading:
-                    return self._simulate_mock_sell(swap)
+                    return self._simulate_mock_sell(swap, token_balance)
 
                 # AGGRESSIVE RETRY LOOP with exponential backoff
                 max_retries = 5
