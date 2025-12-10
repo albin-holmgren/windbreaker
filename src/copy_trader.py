@@ -37,6 +37,7 @@ class CopyTradeResult:
     error: Optional[str] = None
     original_swap: Optional[ParsedSwap] = None
     our_sol_amount: int = 0
+    mock: bool = False
     
 
 @dataclass
@@ -857,6 +858,67 @@ class CopyTrader:
         except Exception as e:
             logger.error("pumpfun_swap_error", error=str(e))
             return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
+    
+    def _simulate_mock_buy(self, swap: 'ParsedSwap', trade_sol: float) -> 'CopyTradeResult':
+        """Simulate a buy trade without executing on-chain."""
+        # Estimate token amount received (use swap data as reference)
+        if swap.sol_value > 0 and swap.token_amount > 0:
+            # Extrapolate based on trader's swap ratio
+            estimated_tokens = int((trade_sol / swap.sol_value) * swap.token_amount)
+        else:
+            # Fallback: assume 1M tokens per SOL (rough estimate)
+            estimated_tokens = int(trade_sol * 1_000_000)
+        
+        # Deduct SOL from mock balance
+        self.mock_balance -= trade_sol
+        
+        # Add tokens to mock positions
+        current_tokens = self.mock_token_positions.get(swap.token_mint, 0)
+        self.mock_token_positions[swap.token_mint] = current_tokens + estimated_tokens
+        
+        logger.info(
+            "mock_buy",
+            token=swap.token_mint[:8],
+            sol_spent=f"{trade_sol:.4f}",
+            tokens_received=estimated_tokens,
+            new_balance=f"{self.mock_balance:.4f}",
+            total_tokens=self.mock_token_positions[swap.token_mint]
+        )
+        
+        return CopyTradeResult(
+            success=True,
+            signature=f"MOCK_BUY_{swap.signature[:8]}",
+            mock=True
+        )
+    
+    def _simulate_mock_sell(self, swap: 'ParsedSwap', token_balance: int) -> 'CopyTradeResult':
+        """Simulate a sell trade without executing on-chain."""
+        # Estimate SOL received based on trader's swap ratio
+        if swap.token_amount > 0:
+            sol_received = (token_balance / swap.token_amount) * swap.sol_value
+        else:
+            # Fallback: assume same ratio as buy
+            sol_received = token_balance / 1_000_000
+        
+        # Add SOL to mock balance
+        self.mock_balance += sol_received
+        
+        # Remove tokens from mock positions
+        self.mock_token_positions[swap.token_mint] = 0
+        
+        logger.info(
+            "mock_sell",
+            token=swap.token_mint[:8],
+            tokens_sold=token_balance,
+            sol_received=f"{sol_received:.4f}",
+            new_balance=f"{self.mock_balance:.4f}"
+        )
+        
+        return CopyTradeResult(
+            success=True,
+            signature=f"MOCK_SELL_{swap.signature[:8]}",
+            mock=True
+        )
     
     async def _get_token_balance(self, mint: str) -> int:
         """Get token balance for our wallet by finding the associated token account."""
