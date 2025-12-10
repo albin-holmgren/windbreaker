@@ -398,21 +398,35 @@ class CopyTrader:
                 # Use DexScreener for other DEXes
                 market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
                 
-                # If not on DexScreener, skip
+                # If not on DexScreener, skip (unless trusting trader)
                 if market_cap == 0 and age_minutes == 0:
-                    logger.info(
-                        "skipping_unknown_token",
-                        token=swap.token_mint[:8],
-                        reason="not_on_dexscreener"
-                    )
-                    return CopyTradeResult(
-                        success=False,
-                        error="token_unknown (not on DexScreener yet)",
-                        original_swap=swap
-                    )
+                    if self.trust_trader_pumpfun:  # Trust trader mode applies to all
+                        logger.info(
+                            "trust_trader_unknown_token",
+                            token=swap.token_mint[:8],
+                            message="Token not on DexScreener but trusting trader"
+                        )
+                        # Set defaults for unknown token
+                        market_cap = 100000
+                        age_minutes = 1
+                        liquidity = 10000
+                        volume_24h = 1000
+                        price_change_1h = 0
+                        txns_1h = 100
+                    else:
+                        logger.info(
+                            "skipping_unknown_token",
+                            token=swap.token_mint[:8],
+                            reason="not_on_dexscreener"
+                        )
+                        return CopyTradeResult(
+                            success=False,
+                            error="token_unknown (not on DexScreener yet)",
+                            original_swap=swap
+                        )
             
-            # Skip all filters in trust trader mode for pump.fun
-            skip_filters = is_pumpfun and self.trust_trader_pumpfun
+            # Skip all filters in trust trader mode
+            skip_filters = self.trust_trader_pumpfun
             
             # Check token age
             if not skip_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
