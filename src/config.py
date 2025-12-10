@@ -58,6 +58,8 @@ class Config:
     max_dev_holdings_pct: float  # Skip if dev owns more than this % (0 = disabled)
     min_holders_count: int  # Minimum number of holders (0 = disabled)
     trust_trader_pumpfun: bool  # If true, skip all filters for pump.fun tokens and trust trader
+    mock_trading: bool  # If true, simulate trades without sending transactions
+    mock_balance_sol: float  # Starting SOL balance for mock trading
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -150,6 +152,8 @@ def load_config() -> Config:
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
         min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
         trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust trader for pump.fun
+        mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
+        mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once

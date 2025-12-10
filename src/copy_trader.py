@@ -112,25 +112,36 @@ class CopyTrader:
         # Position manager for auto-sell
         self.position_manager: Optional[PositionManager] = None
         
+        # Mock trading support
+        self.mock_trading = self.config.mock_trading
+        self.mock_balance = self.config.mock_balance_sol
+        self.mock_token_positions: Dict[str, int] = {}  # mint -> token amount (base units)
+        if self.mock_trading:
+            logger.info(
+                "mock_trading_enabled",
+                starting_balance=f"{self.mock_balance:.4f} SOL"
+            )
+        
     async def start(self) -> None:
         """Start the copy trader."""
         self.session = aiohttp.ClientSession()
         self.running = True
         
-        # Create position manager
-        self.position_manager = PositionManager(
-            config=self.config,
-            wallet_keypair=self.wallet,
-            rpc_client=self.rpc,
-            max_positions=self.config.max_positions,
-            take_profit_pct=self.config.take_profit_pct,
-            stop_loss_pct=self.config.stop_loss_pct,
-            time_limit_minutes=self.config.time_limit_minutes,
-            trailing_stop_pct=self.config.trailing_stop_pct,
-            rug_abandon_sol=self.config.rug_abandon_sol,
-            mcap_stop_loss_usd=self.config.mcap_stop_loss_usd,
-        )
-        await self.position_manager.start()
+        # Create position manager unless we're in mock mode
+        if not self.mock_trading:
+            self.position_manager = PositionManager(
+                config=self.config,
+                wallet_keypair=self.wallet,
+                rpc_client=self.rpc,
+                max_positions=self.config.max_positions,
+                take_profit_pct=self.config.take_profit_pct,
+                stop_loss_pct=self.config.stop_loss_pct,
+                time_limit_minutes=self.config.time_limit_minutes,
+                trailing_stop_pct=self.config.trailing_stop_pct,
+                rug_abandon_sol=self.config.rug_abandon_sol,
+                mcap_stop_loss_usd=self.config.mcap_stop_loss_usd,
+            )
+            await self.position_manager.start()
         
         # Create wallet monitor
         self.monitor = WalletMonitor(
@@ -273,6 +284,9 @@ class CopyTrader:
                 # Detect if this is a pump.fun token
                 is_pumpfun_sell = swap.dex == "pump.fun"
                 
+                if self.mock_trading:
+                    return self._simulate_mock_sell(swap)
+
                 # AGGRESSIVE RETRY LOOP with exponential backoff
                 max_retries = 5
                 result = None
@@ -552,8 +566,11 @@ class CopyTrader:
                     )
             
             # BUYS: Full calculation path
-            balance = await self.rpc.get_balance(self.wallet.pubkey())
-            balance_sol = balance / 1e9
+            if self.mock_trading:
+                balance_sol = self.mock_balance
+            else:
+                balance = await self.rpc.get_balance(self.wallet.pubkey())
+                balance_sol = balance / 1e9
             
             # Calculate fee reserve needed for existing + new positions
             current_positions = len(self.position_manager.positions) if self.position_manager else 0
@@ -632,18 +649,24 @@ class CopyTrader:
             # Buy: Use appropriate API based on DEX
             if is_pumpfun:
                 # Use Pump.fun API for bonding curve tokens
-                result = await self._execute_pumpfun_swap(
-                    token_mint=swap.token_mint,
-                    sol_amount=trade_sol,
-                    is_buy=True
-                )
+                if self.mock_trading:
+                    result = self._simulate_mock_buy(swap, trade_sol)
+                else:
+                    result = await self._execute_pumpfun_swap(
+                        token_mint=swap.token_mint,
+                        sol_amount=trade_sol,
+                        is_buy=True
+                    )
             else:
-                # Use Jupiter for Raydium/other DEXes
-                result = await self._execute_swap(
-                    input_mint=NATIVE_SOL,
-                    output_mint=swap.token_mint,
-                    amount=trade_lamports
-                )
+                if self.mock_trading:
+                    result = self._simulate_mock_buy(swap, trade_sol)
+                else:
+                    # Use Jupiter for Raydium/other DEXes
+                    result = await self._execute_swap(
+                        input_mint=NATIVE_SOL,
+                        output_mint=swap.token_mint,
+                        amount=trade_lamports
+                    )
             
             if result.success:
                 # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
@@ -662,11 +685,11 @@ class CopyTrader:
                         estimated_tokens = int(trade_lamports * 1000)  # Placeholder
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
-                            entry_sol=trade_sol,
-                            token_amount=estimated_tokens,
-                            entry_signature=result.signature or "",
-                            copied_from=swap.wallet,
                             token_symbol=swap.token_symbol,
+                            our_sol=trade_sol,
+                            our_tokens=estimated_tokens,
+                            our_signature=result.signature,
+                            copied_from=swap.wallet,
                             dex="pump.fun" if is_pumpfun else swap.dex
                         )
                     
@@ -675,7 +698,7 @@ class CopyTrader:
                         token_mint=swap.token_mint,
                         token_symbol=swap.token_symbol,
                         our_sol=trade_sol,
-                        our_tokens=estimated_tokens if self.position_manager else 0,
+                        our_tokens=estimated_tokens,
                         our_signature=result.signature,
                         copied_wallet=swap.wallet,
                         their_sol=swap.sol_value,
@@ -837,6 +860,9 @@ class CopyTrader:
     
     async def _get_token_balance(self, mint: str) -> int:
         """Get token balance for our wallet by finding the associated token account."""
+        if self.mock_trading:
+            return self.mock_token_positions.get(mint, 0)
+        
         try:
             from solders.pubkey import Pubkey
             
@@ -858,20 +884,21 @@ class CopyTrader:
             
             if result and "value" in result:
                 accounts = result["value"]
-                if accounts and len(accounts) > 0:
-                    # Get the token amount from the first account
-                    account_data = accounts[0].get("account", {}).get("data", {})
-                    parsed = account_data.get("parsed", {}).get("info", {})
-                    token_amount = parsed.get("tokenAmount", {})
-                    amount = int(token_amount.get("amount", 0))
-                    
-                    if amount > 0:
-                        logger.info(
-                            "token_balance_found",
-                            token=mint[:8],
-                            amount=amount
-                        )
-                    return amount
+                if not accounts:
+                    return 0
+                # Get the token amount from the first account
+                account_data = accounts[0].get("account", {}).get("data", {})
+                parsed = account_data.get("parsed", {}).get("info", {})
+                token_amount = parsed.get("tokenAmount", {})
+                amount = int(token_amount.get("amount", 0))
+                
+                if amount > 0:
+                    logger.info(
+                        "token_balance_found",
+                        token=mint[:8],
+                        amount=amount
+                    )
+                return amount
             
             return 0
         except Exception as e:
