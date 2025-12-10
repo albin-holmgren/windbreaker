@@ -588,11 +588,31 @@ class CopyTrader:
                 balance_sol = balance / 1e9
             
             # Calculate fee reserve needed for existing + new positions
-            current_positions = len(self.position_manager.positions) if self.position_manager else 0
+            if self.mock_trading:
+                current_positions = len([p for p in self.mock_token_positions.values() if p > 0])
+            else:
+                current_positions = len(self.position_manager.positions) if self.position_manager else 0
+            
+            # Check max positions limit
+            if current_positions >= self.max_positions:
+                return CopyTradeResult(
+                    success=False,
+                    error=f"max_positions_reached ({current_positions}/{self.max_positions})",
+                    original_swap=swap
+                )
+            
             total_fee_reserve = self.fee_reserve + (self.exit_fee_reserve * (current_positions + 1))
             
             # Available balance after fee reserve
             available_sol = max(0, balance_sol - total_fee_reserve)
+            
+            logger.debug(
+                "balance_calculation",
+                balance=f"{balance_sol:.4f}",
+                positions=current_positions,
+                fee_reserve=f"{total_fee_reserve:.4f}",
+                available=f"{available_sol:.4f}"
+            )
             
             # Calculate trade size
             if self.copy_proportional:
