@@ -85,6 +85,7 @@ class TransactionParser:
             # Check if transaction was successful
             meta = tx_data.get("meta", {})
             if meta.get("err") is not None:
+                logger.debug("tx_failed", wallet=wallet[:8])
                 return None
             
             # Get transaction message
@@ -93,6 +94,10 @@ class TransactionParser:
             
             # Get account keys
             account_keys = self._get_account_keys(message, meta)
+            
+            # Log programs involved
+            programs_involved = [k for k in account_keys if k in [PUMP_FUN_PROGRAM, JUPITER_V6_PROGRAM, RAYDIUM_AMM_PROGRAM, RAYDIUM_CLMM_PROGRAM]]
+            logger.debug("tx_programs", wallet=wallet[:8], programs=len(programs_involved), has_pump=PUMP_FUN_PROGRAM in account_keys)
             
             # Get instructions
             instructions = message.get("instructions", [])
@@ -155,8 +160,10 @@ class TransactionParser:
         """Parse Pump.fun swap."""
         # Check if Pump.fun program is involved
         if PUMP_FUN_PROGRAM not in account_keys:
+            logger.debug("pump_fun_not_in_keys", wallet=wallet[:8])
             return None
         
+        logger.debug("pump_fun_program_found", wallet=wallet[:8])
         meta = tx_data.get("meta", {})
         
         # Get pre and post token balances
@@ -189,6 +196,14 @@ class TransactionParser:
         token_change = 0
         
         all_mints = set(pre_balances.keys()) | set(post_balances.keys())
+        logger.debug("pump_fun_balances", 
+            wallet=wallet[:8],
+            sol_change=sol_change,
+            pre_mints=len(pre_balances),
+            post_mints=len(post_balances),
+            all_mints=len(all_mints)
+        )
+        
         for mint in all_mints:
             if mint in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
                 continue
@@ -200,9 +215,11 @@ class TransactionParser:
             if change != 0:
                 token_mint = mint
                 token_change = change
+                logger.debug("pump_fun_token_change", token=mint[:8], change=change)
                 break
         
         if not token_mint:
+            logger.debug("pump_fun_no_token_change", wallet=wallet[:8])
             return None
         
         # Determine if buy or sell
