@@ -166,24 +166,20 @@ class TransactionParser:
         logger.debug("pump_fun_program_found", wallet=wallet[:8])
         meta = tx_data.get("meta", {})
         
-        # Get pre and post token balances
-        pre_balances = {
-            b.get("mint"): b 
-            for b in meta.get("preTokenBalances", [])
-            if b.get("owner") == wallet
-        }
-        post_balances = {
-            b.get("mint"): b 
-            for b in meta.get("postTokenBalances", [])
-            if b.get("owner") == wallet
-        }
-        
-        # Get SOL balance change
+        # Get SOL balance change for the wallet (first signer)
         account_keys_list = self._get_account_keys(
             tx_data.get("transaction", {}).get("message", {}), 
             meta
         )
-        wallet_index = account_keys_list.index(wallet) if wallet in account_keys_list else -1
+        
+        # For pump.fun, the fee payer (index 0) is usually the trader
+        # Try to find wallet in account keys, fallback to index 0
+        wallet_index = -1
+        if wallet in account_keys_list:
+            wallet_index = account_keys_list.index(wallet)
+        elif len(account_keys_list) > 0:
+            # Wallet might be interacting via different account, use first signer
+            wallet_index = 0
         
         sol_change = 0
         if wallet_index >= 0:
@@ -191,25 +187,37 @@ class TransactionParser:
             post_sol = meta.get("postBalances", [])[wallet_index] if wallet_index < len(meta.get("postBalances", [])) else 0
             sol_change = post_sol - pre_sol
         
+        # For pump.fun, look at ALL token balance changes (not just wallet-owned)
+        # Since this is a pump.fun tx initiated by the wallet, token changes are theirs
+        pre_balances_all = {}
+        post_balances_all = {}
+        
+        for b in meta.get("preTokenBalances", []):
+            mint = b.get("mint")
+            if mint and mint not in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
+                pre_balances_all[mint] = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+        
+        for b in meta.get("postTokenBalances", []):
+            mint = b.get("mint")
+            if mint and mint not in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
+                post_balances_all[mint] = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+        
         # Find token that changed
         token_mint = None
         token_change = 0
         
-        all_mints = set(pre_balances.keys()) | set(post_balances.keys())
+        all_mints = set(pre_balances_all.keys()) | set(post_balances_all.keys())
         logger.debug("pump_fun_balances", 
             wallet=wallet[:8],
             sol_change=sol_change,
-            pre_mints=len(pre_balances),
-            post_mints=len(post_balances),
+            pre_mints=len(pre_balances_all),
+            post_mints=len(post_balances_all),
             all_mints=len(all_mints)
         )
         
         for mint in all_mints:
-            if mint in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
-                continue
-            
-            pre_amount = int(pre_balances.get(mint, {}).get("uiTokenAmount", {}).get("amount", "0"))
-            post_amount = int(post_balances.get(mint, {}).get("uiTokenAmount", {}).get("amount", "0"))
+            pre_amount = pre_balances_all.get(mint, 0)
+            post_amount = post_balances_all.get(mint, 0)
             change = post_amount - pre_amount
             
             if change != 0:
