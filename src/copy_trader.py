@@ -5,6 +5,7 @@ Monitors wallets, detects trades, and executes copies.
 
 import asyncio
 import aiohttp
+import time
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -117,6 +118,9 @@ class CopyTrader:
         self.mock_trading = self.config.mock_trading
         self.mock_balance = self.config.mock_balance_sol
         self.mock_token_positions: Dict[str, int] = {}  # mint -> token amount (base units)
+        self.mock_position_entry_time: Dict[str, float] = {}  # mint -> entry timestamp
+        self.mock_position_entry_sol: Dict[str, float] = {}  # mint -> SOL spent
+        self.mock_position_max_age_minutes = 30  # Auto-abandon positions older than this
         if self.mock_trading:
             logger.info(
                 "mock_trading_enabled",
@@ -164,6 +168,45 @@ class CopyTrader:
         
         # Start monitoring
         await self.monitor.start()
+        
+        # Start mock position cleanup task if in mock mode
+        if self.mock_trading:
+            asyncio.create_task(self._mock_position_cleanup_loop())
+    
+    async def _mock_position_cleanup_loop(self) -> None:
+        """Periodically clean up stale mock positions to free slots for new trades."""
+        while self.running:
+            await asyncio.sleep(60)  # Check every minute
+            await self._cleanup_stale_mock_positions()
+    
+    async def _cleanup_stale_mock_positions(self) -> None:
+        """Abandon mock positions that are too old (simulating rugged coins)."""
+        now = time.time()
+        max_age_seconds = self.mock_position_max_age_minutes * 60
+        
+        positions_to_abandon = []
+        for mint, entry_time in list(self.mock_position_entry_time.items()):
+            age_seconds = now - entry_time
+            tokens = self.mock_token_positions.get(mint, 0)
+            
+            if tokens > 0 and age_seconds > max_age_seconds:
+                positions_to_abandon.append((mint, age_seconds / 60))
+        
+        for mint, age_minutes in positions_to_abandon:
+            entry_sol = self.mock_position_entry_sol.get(mint, 0)
+            
+            logger.warning(
+                "mock_position_abandoned",
+                token=mint[:8],
+                age_minutes=f"{age_minutes:.1f}",
+                entry_sol=f"{entry_sol:.4f}",
+                reason="position_too_old_assumed_rugged"
+            )
+            
+            # Clear the position (assume 100% loss)
+            self.mock_token_positions[mint] = 0
+            self.mock_position_entry_time.pop(mint, None)
+            self.mock_position_entry_sol.pop(mint, None)
     
     async def stop(self) -> None:
         """Stop the copy trader."""
@@ -910,6 +953,14 @@ class CopyTrader:
         current_tokens = self.mock_token_positions.get(swap.token_mint, 0)
         self.mock_token_positions[swap.token_mint] = current_tokens + estimated_tokens
         
+        # Track entry time and SOL for new positions
+        if swap.token_mint not in self.mock_position_entry_time:
+            self.mock_position_entry_time[swap.token_mint] = time.time()
+            self.mock_position_entry_sol[swap.token_mint] = trade_sol
+        else:
+            # Averaging in - add to entry SOL
+            self.mock_position_entry_sol[swap.token_mint] = self.mock_position_entry_sol.get(swap.token_mint, 0) + trade_sol
+        
         logger.info(
             "mock_buy",
             token=swap.token_mint[:8],
@@ -937,8 +988,10 @@ class CopyTrader:
         # Add SOL to mock balance
         self.mock_balance += sol_received
         
-        # Remove tokens from mock positions
+        # Remove tokens from mock positions and tracking
         self.mock_token_positions[swap.token_mint] = 0
+        self.mock_position_entry_time.pop(swap.token_mint, None)
+        self.mock_position_entry_sol.pop(swap.token_mint, None)
         
         logger.info(
             "mock_sell",
