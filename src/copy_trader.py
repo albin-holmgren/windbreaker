@@ -166,12 +166,12 @@ class CopyTrader:
             stop_loss=f"{self.config.stop_loss_pct}%"
         )
         
-        # Start monitoring
-        await self.monitor.start()
-        
-        # Start mock position cleanup task if in mock mode
+        # Start mock position cleanup task if in mock mode (BEFORE monitor blocks)
         if self.mock_trading:
             asyncio.create_task(self._mock_position_cleanup_loop())
+        
+        # Start monitoring (this blocks forever)
+        await self.monitor.start()
     
     async def _mock_position_cleanup_loop(self) -> None:
         """Periodically clean up stale mock positions to free slots for new trades."""
