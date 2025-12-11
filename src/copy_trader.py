@@ -175,14 +175,28 @@ class CopyTrader:
     
     async def _mock_position_cleanup_loop(self) -> None:
         """Periodically clean up stale mock positions to free slots for new trades."""
+        logger.info("mock_cleanup_loop_started")
         while self.running:
-            await asyncio.sleep(60)  # Check every minute
-            await self._cleanup_stale_mock_positions()
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                await self._cleanup_stale_mock_positions()
+            except Exception as e:
+                logger.error("mock_cleanup_error", error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
         """Abandon mock positions that are too old (simulating rugged coins)."""
         now = time.time()
         max_age_seconds = self.mock_position_max_age_minutes * 60
+        
+        # Count active positions
+        active_positions = len([p for p in self.mock_token_positions.values() if p > 0])
+        if active_positions > 0:
+            logger.debug(
+                "mock_cleanup_check",
+                active_positions=active_positions,
+                tracked_entries=len(self.mock_position_entry_time),
+                max_age_minutes=self.mock_position_max_age_minutes
+            )
         
         positions_to_abandon = []
         for mint, entry_time in list(self.mock_position_entry_time.items()):
