@@ -188,6 +188,10 @@ class CopyTrader:
     
     async def _cleanup_stale_mock_positions(self) -> None:
         """Abandon mock positions that are too old (simulating rugged coins)."""
+        # Skip cleanup if disabled (0 = no timeout)
+        if self.mock_position_max_age_minutes <= 0:
+            return
+            
         now = time.time()
         max_age_seconds = self.mock_position_max_age_minutes * 60
         
