@@ -5,6 +5,7 @@ Monitors wallets, detects trades, and executes copies.
 
 import asyncio
 import aiohttp
+import os
 import time
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
@@ -120,11 +121,13 @@ class CopyTrader:
         self.mock_token_positions: Dict[str, int] = {}  # mint -> token amount (base units)
         self.mock_position_entry_time: Dict[str, float] = {}  # mint -> entry timestamp
         self.mock_position_entry_sol: Dict[str, float] = {}  # mint -> SOL spent
-        self.mock_position_max_age_minutes = 30  # Auto-abandon positions older than this
+        # Max age before abandoning - pump.fun tokens rug fast, use short timeout
+        self.mock_position_max_age_minutes = int(os.getenv('MOCK_MAX_POSITION_AGE_MINUTES', '10'))
         if self.mock_trading:
             logger.info(
                 "mock_trading_enabled",
-                starting_balance=f"{self.mock_balance:.4f} SOL"
+                starting_balance=f"{self.mock_balance:.4f} SOL",
+                max_position_age_minutes=self.mock_position_max_age_minutes
             )
         
     async def start(self) -> None:
