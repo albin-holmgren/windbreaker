@@ -127,7 +127,7 @@ class CopyTrader:
             logger.info(
                 "mock_trading_enabled",
                 starting_balance=f"{self.mock_balance:.4f} SOL",
-                max_position_age_minutes=self.mock_position_max_age_minutes
+                rug_detection="liquidity/mcap based"
             )
         
     async def start(self) -> None:
@@ -187,47 +187,58 @@ class CopyTrader:
                 logger.error("mock_cleanup_error", error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
-        """Abandon mock positions that are too old (simulating rugged coins)."""
-        # Skip cleanup if disabled (0 = no timeout)
-        if self.mock_position_max_age_minutes <= 0:
+        """Abandon mock positions based on token health (liquidity, market cap)."""
+        # Thresholds for considering a token rugged
+        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '1000'))  # Abandon if liquidity < $1000
+        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '5000'))  # Abandon if mcap < $5000
+        
+        # Get active positions
+        active_mints = [mint for mint, tokens in self.mock_token_positions.items() if tokens > 0]
+        
+        if not active_mints:
             return
-            
-        now = time.time()
-        max_age_seconds = self.mock_position_max_age_minutes * 60
         
-        # Count active positions
-        active_positions = len([p for p in self.mock_token_positions.values() if p > 0])
-        if active_positions > 0:
-            logger.debug(
-                "mock_cleanup_check",
-                active_positions=active_positions,
-                tracked_entries=len(self.mock_position_entry_time),
-                max_age_minutes=self.mock_position_max_age_minutes
-            )
+        logger.debug(
+            "mock_health_check",
+            active_positions=len(active_mints),
+            min_liquidity=f"${MIN_LIQUIDITY_USD:,.0f}",
+            min_mcap=f"${MIN_MARKET_CAP_USD:,.0f}"
+        )
         
-        positions_to_abandon = []
-        for mint, entry_time in list(self.mock_position_entry_time.items()):
-            age_seconds = now - entry_time
-            tokens = self.mock_token_positions.get(mint, 0)
-            
-            if tokens > 0 and age_seconds > max_age_seconds:
-                positions_to_abandon.append((mint, age_seconds / 60))
-        
-        for mint, age_minutes in positions_to_abandon:
-            entry_sol = self.mock_position_entry_sol.get(mint, 0)
-            
-            logger.warning(
-                "mock_position_abandoned",
-                token=mint[:8],
-                age_minutes=f"{age_minutes:.1f}",
-                entry_sol=f"{entry_sol:.4f}",
-                reason="position_too_old_assumed_rugged"
-            )
-            
-            # Clear the position (assume 100% loss)
-            self.mock_token_positions[mint] = 0
-            self.mock_position_entry_time.pop(mint, None)
-            self.mock_position_entry_sol.pop(mint, None)
+        for mint in active_mints:
+            try:
+                # Get current token health from DexScreener
+                market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(mint)
+                
+                entry_sol = self.mock_position_entry_sol.get(mint, 0)
+                reason = None
+                
+                # Check if rugged (liquidity pulled or market cap crashed)
+                if liquidity < MIN_LIQUIDITY_USD and liquidity > 0:
+                    reason = f"liquidity_too_low (${liquidity:,.0f})"
+                elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0:
+                    reason = f"mcap_too_low (${market_cap:,.0f})"
+                elif market_cap == 0 and liquidity == 0 and age_minutes > 5:
+                    # Token not found on DexScreener after 5 min = likely rugged
+                    reason = "not_on_dexscreener_anymore"
+                
+                if reason:
+                    logger.warning(
+                        "mock_position_abandoned",
+                        token=mint[:8],
+                        entry_sol=f"{entry_sol:.4f}",
+                        market_cap=f"${market_cap:,.0f}",
+                        liquidity=f"${liquidity:,.0f}",
+                        reason=reason
+                    )
+                    
+                    # Clear the position (assume 100% loss)
+                    self.mock_token_positions[mint] = 0
+                    self.mock_position_entry_time.pop(mint, None)
+                    self.mock_position_entry_sol.pop(mint, None)
+                    
+            except Exception as e:
+                logger.debug("health_check_error", token=mint[:8], error=str(e))
     
     async def stop(self) -> None:
         """Stop the copy trader."""
