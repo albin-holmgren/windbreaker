@@ -5,11 +5,13 @@ Monitors wallets, detects trades, and executes copies.
 
 import asyncio
 import aiohttp
+import json
 import os
 import time
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 import structlog
 
 from .wallet_monitor import WalletMonitor, WalletTransaction
@@ -123,12 +125,20 @@ class CopyTrader:
         self.mock_position_entry_sol: Dict[str, float] = {}  # mint -> SOL spent
         self.trader_sold_cooldown: Dict[str, float] = {}  # mint -> timestamp when trader sold (but we had no position)
         self.sell_cooldown_seconds = 60  # Don't buy tokens the trader just sold (prevents out-of-sync positions)
+        self.mock_state_file = Path(os.getenv('MOCK_STATE_FILE', '/windbreaker/mock_state.json'))
+        self.mock_trades_history: List[Dict] = []  # Track all trades for dashboard
+        self.mock_starting_balance = self.config.mock_balance_sol  # Remember starting balance
         # Max age before abandoning - pump.fun tokens rug fast, use short timeout
         self.mock_position_max_age_minutes = int(os.getenv('MOCK_MAX_POSITION_AGE_MINUTES', '10'))
+        
+        # Load persisted state if exists
         if self.mock_trading:
+            self._load_mock_state()
             logger.info(
                 "mock_trading_enabled",
-                starting_balance=f"{self.mock_balance:.4f} SOL",
+                starting_balance=f"{self.mock_starting_balance:.4f} SOL",
+                current_balance=f"{self.mock_balance:.4f} SOL",
+                open_positions=len([p for p in self.mock_token_positions.values() if p > 0]),
                 rug_detection="liquidity/mcap based"
             )
         
@@ -246,6 +256,10 @@ class CopyTrader:
         """Stop the copy trader."""
         self.running = False
         
+        # Save state before stopping
+        if self.mock_trading:
+            self._save_mock_state()
+        
         if self.position_manager:
             await self.position_manager.stop()
         if self.monitor:
@@ -257,6 +271,75 @@ class CopyTrader:
             "copy_trader_stopped",
             stats=self._format_stats()
         )
+    
+    def _load_mock_state(self) -> None:
+        """Load persisted mock trading state from file."""
+        try:
+            if self.mock_state_file.exists():
+                with open(self.mock_state_file, 'r') as f:
+                    state = json.load(f)
+                
+                self.mock_balance = state.get('balance', self.mock_balance)
+                self.mock_starting_balance = state.get('starting_balance', self.mock_starting_balance)
+                self.mock_token_positions = state.get('positions', {})
+                self.mock_position_entry_time = {k: float(v) for k, v in state.get('entry_times', {}).items()}
+                self.mock_position_entry_sol = {k: float(v) for k, v in state.get('entry_sol', {}).items()}
+                self.mock_trades_history = state.get('trades_history', [])
+                
+                logger.info("mock_state_loaded", 
+                    balance=f"{self.mock_balance:.4f}",
+                    positions=len([p for p in self.mock_token_positions.values() if p > 0])
+                )
+        except Exception as e:
+            logger.warning("mock_state_load_error", error=str(e))
+    
+    def _save_mock_state(self) -> None:
+        """Save mock trading state to file for persistence."""
+        try:
+            state = {
+                'balance': self.mock_balance,
+                'starting_balance': self.mock_starting_balance,
+                'positions': self.mock_token_positions,
+                'entry_times': self.mock_position_entry_time,
+                'entry_sol': self.mock_position_entry_sol,
+                'trades_history': self.mock_trades_history[-100:],  # Keep last 100 trades
+                'last_updated': datetime.now().isoformat(),
+                'pnl': self.mock_balance - self.mock_starting_balance
+            }
+            
+            with open(self.mock_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+                
+        except Exception as e:
+            logger.warning("mock_state_save_error", error=str(e))
+    
+    def get_dashboard_state(self) -> Dict:
+        """Get current state for dashboard display."""
+        active_positions = []
+        for mint, tokens in self.mock_token_positions.items():
+            if tokens > 0:
+                entry_sol = self.mock_position_entry_sol.get(mint, 0)
+                entry_time = self.mock_position_entry_time.get(mint, 0)
+                age_minutes = (time.time() - entry_time) / 60 if entry_time else 0
+                active_positions.append({
+                    'token': mint[:8] + '...',
+                    'full_mint': mint,
+                    'tokens': tokens,
+                    'entry_sol': entry_sol,
+                    'age_minutes': round(age_minutes, 1)
+                })
+        
+        return {
+            'balance': round(self.mock_balance, 4),
+            'starting_balance': round(self.mock_starting_balance, 4),
+            'pnl': round(self.mock_balance - self.mock_starting_balance, 4),
+            'pnl_percent': round((self.mock_balance / self.mock_starting_balance - 1) * 100, 2) if self.mock_starting_balance > 0 else 0,
+            'active_positions': active_positions,
+            'position_count': len(active_positions),
+            'max_positions': self.config.max_positions,
+            'recent_trades': self.mock_trades_history[-20:],
+            'last_updated': datetime.now().isoformat()
+        }
     
     async def _on_transaction(self, tx: WalletTransaction) -> None:
         """Called when a new transaction is detected from a target wallet."""
@@ -1024,6 +1107,20 @@ class CopyTrader:
             total_tokens=self.mock_token_positions[swap.token_mint]
         )
         
+        # Track trade in history
+        self.mock_trades_history.append({
+            'type': 'buy',
+            'token': swap.token_mint[:8],
+            'full_mint': swap.token_mint,
+            'sol': trade_sol,
+            'tokens': estimated_tokens,
+            'balance_after': self.mock_balance,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Save state after each trade
+        self._save_mock_state()
+        
         return CopyTradeResult(
             success=True,
             signature=f"MOCK_BUY_{swap.signature[:8]}",
@@ -1039,6 +1136,10 @@ class CopyTrader:
             # Fallback: assume same ratio as buy
             sol_received = token_balance / 1_000_000
         
+        # Calculate P&L for this trade (get entry_sol BEFORE removing)
+        entry_sol = self.mock_position_entry_sol.get(swap.token_mint, 0)
+        pnl = sol_received - entry_sol
+        
         # Add SOL to mock balance
         self.mock_balance += sol_received
         
@@ -1052,8 +1153,26 @@ class CopyTrader:
             token=swap.token_mint[:8],
             tokens_sold=token_balance,
             sol_received=f"{sol_received:.4f}",
+            entry_sol=f"{entry_sol:.4f}",
+            pnl=f"{pnl:+.4f}",
             new_balance=f"{self.mock_balance:.4f}"
         )
+        
+        # Track trade in history
+        self.mock_trades_history.append({
+            'type': 'sell',
+            'token': swap.token_mint[:8],
+            'full_mint': swap.token_mint,
+            'sol': sol_received,
+            'tokens': token_balance,
+            'entry_sol': entry_sol,
+            'pnl': pnl,
+            'balance_after': self.mock_balance,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Save state after each trade
+        self._save_mock_state()
         
         return CopyTradeResult(
             success=True,
