@@ -50,24 +50,24 @@ LOGIN_HTML = """
     <title>Windbreaker - Login</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-        }
-        .login-box {
+        }}
+        .login-box {{
             background: rgba(255,255,255,0.1);
             padding: 40px;
             border-radius: 16px;
             backdrop-filter: blur(10px);
             box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-        }
-        h1 { color: #fff; margin-bottom: 30px; text-align: center; }
-        input {
+        }}
+        h1 {{ color: #fff; margin-bottom: 30px; text-align: center; }}
+        input {{
             width: 100%;
             padding: 12px 16px;
             margin: 10px 0;
@@ -76,9 +76,9 @@ LOGIN_HTML = """
             background: rgba(255,255,255,0.2);
             color: #fff;
             font-size: 16px;
-        }
-        input::placeholder { color: rgba(255,255,255,0.5); }
-        button {
+        }}
+        input::placeholder {{ color: rgba(255,255,255,0.5); }}
+        button {{
             width: 100%;
             padding: 14px;
             margin-top: 20px;
@@ -89,9 +89,9 @@ LOGIN_HTML = """
             font-size: 16px;
             cursor: pointer;
             transition: background 0.3s;
-        }
-        button:hover { background: #45a049; }
-        .error { color: #ff6b6b; text-align: center; margin-top: 15px; }
+        }}
+        button:hover {{ background: #45a049; }}
+        .error {{ color: #ff6b6b; text-align: center; margin-top: 15px; }}
     </style>
 </head>
 <body>
