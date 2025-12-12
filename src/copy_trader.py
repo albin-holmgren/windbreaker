@@ -893,11 +893,12 @@ class CopyTrader:
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
                     
+                    # Estimate tokens received from the swap
+                    # In reality, we'd parse this from the transaction result
+                    estimated_tokens = int(trade_lamports * 1000)  # Placeholder
+                    
                     # Register position for auto-sell management
                     if self.position_manager:
-                        # Estimate tokens received from the swap
-                        # In reality, we'd parse this from the transaction result
-                        estimated_tokens = int(trade_lamports * 1000)  # Placeholder
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
