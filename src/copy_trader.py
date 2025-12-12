@@ -121,6 +121,8 @@ class CopyTrader:
         self.mock_token_positions: Dict[str, int] = {}  # mint -> token amount (base units)
         self.mock_position_entry_time: Dict[str, float] = {}  # mint -> entry timestamp
         self.mock_position_entry_sol: Dict[str, float] = {}  # mint -> SOL spent
+        self.trader_sold_cooldown: Dict[str, float] = {}  # mint -> timestamp when trader sold (but we had no position)
+        self.sell_cooldown_seconds = 60  # Don't buy tokens the trader just sold (prevents out-of-sync positions)
         # Max age before abandoning - pump.fun tokens rug fast, use short timeout
         self.mock_position_max_age_minutes = int(os.getenv('MOCK_MAX_POSITION_AGE_MINUTES', '10'))
         if self.mock_trading:
@@ -319,6 +321,17 @@ class CopyTrader:
         
         # For buys, check position limits (but allow stacking same token)
         if swap.is_buy:
+            # Check sell cooldown - don't buy tokens the trader just sold
+            # This prevents us from getting out of sync (buying after they exit)
+            if swap.token_mint in self.trader_sold_cooldown:
+                cooldown_elapsed = time.time() - self.trader_sold_cooldown[swap.token_mint]
+                if cooldown_elapsed < self.sell_cooldown_seconds:
+                    remaining = self.sell_cooldown_seconds - cooldown_elapsed
+                    return False, f"sell_cooldown_active ({remaining:.0f}s remaining)"
+                else:
+                    # Cooldown expired, remove from tracking
+                    del self.trader_sold_cooldown[swap.token_mint]
+            
             # Check if we can open more positions (only for NEW tokens)
             if self.position_manager:
                 has_token = self.position_manager.has_position(swap.token_mint)
@@ -348,6 +361,15 @@ class CopyTrader:
                 token_balance = await self._get_token_balance(swap.token_mint)
                 if token_balance == 0:
                     logger.debug("no_tokens_to_sell", token=swap.token_mint[:8])
+                    # Track this sell - don't buy this token for a cooldown period
+                    # This prevents us from buying right after trader exits
+                    self.trader_sold_cooldown[swap.token_mint] = time.time()
+                    logger.info(
+                        "sell_cooldown_started",
+                        token=swap.token_mint[:8],
+                        cooldown_seconds=self.sell_cooldown_seconds,
+                        reason="trader_sold_but_we_had_no_position"
+                    )
                     return CopyTradeResult(success=False, error="no_tokens_to_sell", original_swap=swap)
                 
                 logger.info(
