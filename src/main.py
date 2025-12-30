@@ -13,6 +13,7 @@ from .config import load_config
 from .wallet import create_wallet
 from .rpc import RPCClient
 from .copy_trader import CopyTrader
+from .web_dashboard import WebDashboard
 
 # Configure logging
 structlog.configure(
@@ -41,6 +42,7 @@ class CopyTradingBot:
         self.wallet = None
         self.rpc = None
         self.copy_trader = None
+        self.dashboard = None
         self.running = False
     
     async def initialize(self) -> None:
@@ -114,6 +116,8 @@ class CopyTradingBot:
         
         if self.copy_trader:
             await self.copy_trader.stop()
+        if self.dashboard:
+            await self.dashboard.stop()
         if self.rpc:
             await self.rpc.close()
     
@@ -132,6 +136,10 @@ class CopyTradingBot:
         )
         
         try:
+            # Start web dashboard
+            self.dashboard = WebDashboard()
+            await self.dashboard.start()
+            
             # Start copy trader (this blocks)
             await self.copy_trader.start()
         except asyncio.CancelledError:
