@@ -108,14 +108,12 @@ DASHBOARD_HTML = '''
                             <tr>
                                 <th class="px-6 py-4">Token</th>
                                 <th class="px-6 py-4">Entry</th>
-                                <th class="px-6 py-4">Amount</th>
-                                <th class="px-6 py-4">Current Value</th>
-                                <th class="px-6 py-4">PnL</th>
-                                <th class="px-6 py-4">Time</th>
+                                <th class="px-6 py-4">Tokens</th>
+                                <th class="px-6 py-4">Opened</th>
                             </tr>
                         </thead>
                         <tbody id="openPositionsBody" class="text-sm">
-                            <tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>
+                            <tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -251,15 +249,13 @@ DASHBOARD_HTML = '''
                             </td>
                             <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
                             <td class="px-6 py-4 text-neutral-500">${Number(amt).toLocaleString()}</td>
-                            <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
-                            <td class="px-6 py-4 text-neutral-500">-</td>
                             <td class="px-6 py-4 text-neutral-500">${formatTime(entryTime)}</td>
                         </tr>
                     `;
                 }).join('');
                 document.getElementById('openPositionsBody').innerHTML = posHtml;
             } else {
-                document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
+                document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
             }
             
             // Update closed trades (sells only)
