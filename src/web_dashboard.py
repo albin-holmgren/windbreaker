@@ -51,10 +51,12 @@ DASHBOARD_HTML = '''
                 <p class="text-neutral-500 text-sm mt-1">Copy Trading</p>
             </div>
             <div class="flex items-center gap-4">
-                <span class="flex items-center gap-2 text-neutral-400 text-sm">
-                    <span class="w-2 h-2 bg-white rounded-full pulse"></span>
-                    Live
-                </span>
+                <button onclick="refreshData()" id="refreshBtn" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm transition-all">
+                    <svg id="refreshIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                    Refresh
+                </button>
                 <span id="lastUpdate" class="text-neutral-600 text-xs"></span>
             </div>
         </div>
@@ -149,6 +151,7 @@ DASHBOARD_HTML = '''
 
     <script>
         let currentData = null;
+        let isRefreshing = false;
         
         function switchTab(tab) {
             const openTab = document.getElementById('tabOpen');
@@ -167,6 +170,24 @@ DASHBOARD_HTML = '''
                 openContent.className = 'hidden';
                 closedContent.className = 'block';
             }
+        }
+        
+        async function refreshData() {
+            if (isRefreshing) return;
+            isRefreshing = true;
+            
+            const btn = document.getElementById('refreshBtn');
+            const icon = document.getElementById('refreshIcon');
+            btn.disabled = true;
+            icon.classList.add('animate-spin');
+            
+            await fetchData();
+            
+            setTimeout(() => {
+                isRefreshing = false;
+                btn.disabled = false;
+                icon.classList.remove('animate-spin');
+            }, 500);
         }
         
         async function fetchData() {
@@ -226,12 +247,12 @@ DASHBOARD_HTML = '''
                     return `
                         <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
                             <td class="px-6 py-4">
-                                <span class="font-mono text-neutral-300">${shortMint}</span>
+                                <a href="https://pump.fun/${mint}" target="_blank" class="font-mono text-neutral-300 hover:text-white transition-colors">${shortMint}</a>
                             </td>
                             <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
-                            <td class="px-6 py-4 text-neutral-500">${Number(amt).toLocaleString()} tokens</td>
-                            <td class="px-6 py-4 text-neutral-400">-</td>
-                            <td class="px-6 py-4 text-neutral-400">-</td>
+                            <td class="px-6 py-4 text-neutral-500">${Number(amt).toLocaleString()}</td>
+                            <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
+                            <td class="px-6 py-4 text-neutral-500">-</td>
                             <td class="px-6 py-4 text-neutral-500">${formatTime(entryTime)}</td>
                         </tr>
                     `;
@@ -248,6 +269,7 @@ DASHBOARD_HTML = '''
             if (closedTrades.length > 0) {
                 const closedHtml = closedTrades.slice(-20).reverse().map(t => {
                     const token = t.token || t.token_mint?.slice(0, 8) || 'Unknown';
+                    const fullMint = t.full_mint || '';
                     const sol = t.sol || t.sol_amount || 0;
                     const pnl = t.pnl;
                     const time = t.timestamp || t.created_at;
@@ -255,7 +277,7 @@ DASHBOARD_HTML = '''
                     return `
                         <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
                             <td class="px-6 py-4">
-                                <span class="font-mono text-neutral-300">${token}</span>
+                                <a href="https://pump.fun/${fullMint}" target="_blank" class="font-mono text-neutral-300 hover:text-white transition-colors">${token}</a>
                             </td>
                             <td class="px-6 py-4">
                                 <span class="text-neutral-400">SELL</span>
@@ -276,9 +298,9 @@ DASHBOARD_HTML = '''
             document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
         }
         
-        // Initial fetch and refresh every 5 seconds
+        // Initial fetch and auto-refresh every 30 seconds (for new trades)
         fetchData();
-        setInterval(fetchData, 5000);
+        setInterval(fetchData, 30000);
     </script>
 </body>
 </html>
