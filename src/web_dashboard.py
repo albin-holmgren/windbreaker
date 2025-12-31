@@ -20,112 +20,120 @@ DASHBOARD_HTML = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Windbreaker - Copy Trading Dashboard</title>
+    <title>Windbreaker</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <style>
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 100: '#212121', 200: '#181818', 300: '#2a2a2a', 400: '#333333' }
+                    }
+                }
+            }
         }
-        .animate-pulse-slow { animation: pulse 2s infinite; }
-        .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    </script>
+    <style>
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .pulse { animation: pulse 2s infinite; }
+        body { background: #181818; }
+        .card { background: #212121; border: 1px solid #2a2a2a; }
+        .tab-active { background: #212121; color: #fff; }
+        .tab-inactive { background: transparent; color: #666; }
     </style>
 </head>
-<body class="bg-gray-900 text-white min-h-screen">
-    <div class="container mx-auto px-4 py-8">
+<body class="text-white min-h-screen font-sans">
+    <div class="max-w-7xl mx-auto px-6 py-8">
         <!-- Header -->
-        <div class="flex items-center justify-between mb-8">
+        <div class="flex items-center justify-between mb-10">
             <div>
-                <h1 class="text-3xl font-bold bg-gradient-to-r from-purple-400 to-pink-500 bg-clip-text text-transparent">
-                    🌊 Windbreaker
-                </h1>
-                <p class="text-gray-400 mt-1">Copy Trading Dashboard</p>
+                <h1 class="text-2xl font-semibold tracking-tight">Windbreaker</h1>
+                <p class="text-neutral-500 text-sm mt-1">Copy Trading</p>
             </div>
             <div class="flex items-center gap-4">
-                <span id="status" class="flex items-center gap-2 px-3 py-1 rounded-full bg-green-500/20 text-green-400">
-                    <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse-slow"></span>
+                <span class="flex items-center gap-2 text-neutral-400 text-sm">
+                    <span class="w-2 h-2 bg-white rounded-full pulse"></span>
                     Live
                 </span>
-                <span id="lastUpdate" class="text-gray-500 text-sm"></span>
+                <span id="lastUpdate" class="text-neutral-600 text-xs"></span>
             </div>
         </div>
 
         <!-- Stats Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-            <div class="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400">Balance</span>
-                    <i data-lucide="wallet" class="w-5 h-5 text-purple-400"></i>
-                </div>
-                <p id="balance" class="text-2xl font-bold mt-2">0.00 SOL</p>
-                <p id="balanceChange" class="text-sm text-gray-500 mt-1">from 1.00 SOL start</p>
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+            <div class="card rounded-2xl p-5">
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Balance</p>
+                <p id="balance" class="text-2xl font-medium">0.00 SOL</p>
+                <p id="balanceChange" class="text-neutral-600 text-xs mt-1">from 1.00 SOL</p>
             </div>
             
-            <div class="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400">Realized PnL</span>
-                    <i data-lucide="trending-up" class="w-5 h-5 text-green-400"></i>
-                </div>
-                <p id="realizedPnl" class="text-2xl font-bold mt-2 text-green-400">+0.00 SOL</p>
-                <p id="returnPct" class="text-sm text-gray-500 mt-1">0% return</p>
+            <div class="card rounded-2xl p-5">
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Realized PnL</p>
+                <p id="realizedPnl" class="text-2xl font-medium">+0.00 SOL</p>
+                <p id="returnPct" class="text-neutral-600 text-xs mt-1">0% return</p>
             </div>
             
-            <div class="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400">Open Positions</span>
-                    <i data-lucide="layers" class="w-5 h-5 text-blue-400"></i>
-                </div>
-                <p id="openPositions" class="text-2xl font-bold mt-2">0</p>
-                <p class="text-sm text-gray-500 mt-1">active tokens</p>
+            <div class="card rounded-2xl p-5">
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Positions</p>
+                <p id="openPositions" class="text-2xl font-medium">0</p>
+                <p class="text-neutral-600 text-xs mt-1">active</p>
             </div>
             
-            <div class="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400">Total Trades</span>
-                    <i data-lucide="activity" class="w-5 h-5 text-yellow-400"></i>
-                </div>
-                <p id="totalTrades" class="text-2xl font-bold mt-2">0</p>
-                <p id="tradeBreakdown" class="text-sm text-gray-500 mt-1">0 buys, 0 sells</p>
+            <div class="card rounded-2xl p-5">
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Trades</p>
+                <p id="totalTrades" class="text-2xl font-medium">0</p>
+                <p id="tradeBreakdown" class="text-neutral-600 text-xs mt-1">0 buys, 0 sells</p>
             </div>
         </div>
 
-        <!-- Main Content Grid -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- Open Positions -->
-            <div class="lg:col-span-1 bg-gray-800 rounded-xl border border-gray-700">
-                <div class="p-4 border-b border-gray-700">
-                    <h2 class="text-lg font-semibold flex items-center gap-2">
-                        <i data-lucide="briefcase" class="w-5 h-5 text-blue-400"></i>
-                        Open Positions
-                    </h2>
-                </div>
-                <div id="positions" class="p-4 space-y-3 max-h-96 overflow-y-auto">
-                    <p class="text-gray-500 text-center py-4">No open positions</p>
-                </div>
+        <!-- Trades Section with Tabs -->
+        <div class="card rounded-2xl overflow-hidden">
+            <!-- Tab Header -->
+            <div class="flex border-b border-neutral-800">
+                <button id="tabOpen" onclick="switchTab('open')" class="tab-active px-6 py-4 text-sm font-medium transition-all">
+                    Open Positions
+                </button>
+                <button id="tabClosed" onclick="switchTab('closed')" class="tab-inactive px-6 py-4 text-sm font-medium transition-all">
+                    Closed Trades
+                </button>
             </div>
-
-            <!-- Recent Trades -->
-            <div class="lg:col-span-2 bg-gray-800 rounded-xl border border-gray-700">
-                <div class="p-4 border-b border-gray-700">
-                    <h2 class="text-lg font-semibold flex items-center gap-2">
-                        <i data-lucide="list" class="w-5 h-5 text-purple-400"></i>
-                        Recent Trades
-                    </h2>
-                </div>
-                <div id="trades" class="overflow-x-auto">
+            
+            <!-- Open Positions Tab -->
+            <div id="openContent" class="block">
+                <div class="overflow-x-auto">
                     <table class="w-full">
-                        <thead class="text-left text-gray-400 text-sm border-b border-gray-700">
+                        <thead class="text-left text-neutral-500 text-xs uppercase tracking-wider border-b border-neutral-800">
                             <tr>
-                                <th class="p-4">Type</th>
-                                <th class="p-4">Token</th>
-                                <th class="p-4">SOL</th>
-                                <th class="p-4">PnL</th>
-                                <th class="p-4">Time</th>
+                                <th class="px-6 py-4">Token</th>
+                                <th class="px-6 py-4">Entry</th>
+                                <th class="px-6 py-4">Amount</th>
+                                <th class="px-6 py-4">Current Value</th>
+                                <th class="px-6 py-4">PnL</th>
+                                <th class="px-6 py-4">Time</th>
                             </tr>
                         </thead>
-                        <tbody id="tradesBody" class="text-sm">
-                            <tr><td colspan="5" class="p-4 text-center text-gray-500">No trades yet</td></tr>
+                        <tbody id="openPositionsBody" class="text-sm">
+                            <tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Closed Trades Tab -->
+            <div id="closedContent" class="hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full">
+                        <thead class="text-left text-neutral-500 text-xs uppercase tracking-wider border-b border-neutral-800">
+                            <tr>
+                                <th class="px-6 py-4">Token</th>
+                                <th class="px-6 py-4">Type</th>
+                                <th class="px-6 py-4">SOL</th>
+                                <th class="px-6 py-4">PnL</th>
+                                <th class="px-6 py-4">Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="closedTradesBody" class="text-sm">
+                            <tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -133,40 +141,66 @@ DASHBOARD_HTML = '''
         </div>
 
         <!-- Tracked Wallet -->
-        <div class="mt-6 bg-gray-800 rounded-xl p-4 border border-gray-700">
-            <div class="flex items-center gap-2 text-gray-400">
-                <i data-lucide="eye" class="w-4 h-4"></i>
-                <span>Tracking wallet:</span>
-                <code id="trackedWallet" class="text-purple-400 font-mono text-sm">Loading...</code>
-            </div>
+        <div class="mt-6 flex items-center gap-2 text-neutral-600 text-xs">
+            <span>Tracking:</span>
+            <code id="trackedWallet" class="text-neutral-400 font-mono">Loading...</code>
         </div>
     </div>
 
     <script>
-        lucide.createIcons();
+        let currentData = null;
+        
+        function switchTab(tab) {
+            const openTab = document.getElementById('tabOpen');
+            const closedTab = document.getElementById('tabClosed');
+            const openContent = document.getElementById('openContent');
+            const closedContent = document.getElementById('closedContent');
+            
+            if (tab === 'open') {
+                openTab.className = 'tab-active px-6 py-4 text-sm font-medium transition-all';
+                closedTab.className = 'tab-inactive px-6 py-4 text-sm font-medium transition-all';
+                openContent.className = 'block';
+                closedContent.className = 'hidden';
+            } else {
+                openTab.className = 'tab-inactive px-6 py-4 text-sm font-medium transition-all';
+                closedTab.className = 'tab-active px-6 py-4 text-sm font-medium transition-all';
+                openContent.className = 'hidden';
+                closedContent.className = 'block';
+            }
+        }
         
         async function fetchData() {
             try {
                 const response = await fetch('/api/stats');
-                const data = await response.json();
-                updateUI(data);
+                currentData = await response.json();
+                updateUI(currentData);
             } catch (e) {
                 console.error('Failed to fetch data:', e);
             }
         }
         
+        function formatTime(timestamp) {
+            if (!timestamp) return '-';
+            const date = new Date(timestamp);
+            const now = new Date();
+            const diff = now - date;
+            
+            if (diff < 60000) return 'Just now';
+            if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+            if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+            return Math.floor(diff / 86400000) + 'd ago';
+        }
+        
         function updateUI(data) {
             // Update stats
             document.getElementById('balance').textContent = data.balance.toFixed(4) + ' SOL';
-            document.getElementById('balanceChange').textContent = 'from ' + data.starting_balance.toFixed(2) + ' SOL start';
+            document.getElementById('balanceChange').textContent = 'from ' + data.starting_balance.toFixed(2) + ' SOL';
             
             const pnl = data.realized_pnl || 0;
-            const pnlEl = document.getElementById('realizedPnl');
-            pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' SOL';
-            pnlEl.className = 'text-2xl font-bold mt-2 ' + (pnl >= 0 ? 'text-green-400' : 'text-red-400');
+            document.getElementById('realizedPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' SOL';
             
             const returnPct = data.total_return_pct || 0;
-            document.getElementById('returnPct').textContent = returnPct.toFixed(1) + '% return';
+            document.getElementById('returnPct').textContent = (returnPct >= 0 ? '+' : '') + returnPct.toFixed(1) + '% return';
             
             document.getElementById('openPositions').textContent = data.open_positions || 0;
             document.getElementById('totalTrades').textContent = (data.buys || 0) + (data.sells || 0);
@@ -176,51 +210,70 @@ DASHBOARD_HTML = '''
                 document.getElementById('trackedWallet').textContent = data.tracked_wallet;
             }
             
-            // Update positions
-            if (data.positions && Object.keys(data.positions).length > 0) {
-                const posHtml = Object.entries(data.positions)
-                    .filter(([_, amt]) => amt > 0)
-                    .map(([mint, amt]) => `
-                        <div class="bg-gray-700/50 rounded-lg p-3">
-                            <div class="flex justify-between items-center">
-                                <span class="font-mono text-sm text-purple-300">${mint.slice(0, 8)}...</span>
-                            </div>
-                            <p class="text-xs text-gray-400 mt-1">${Number(amt).toLocaleString()} tokens</p>
-                        </div>
-                    `).join('');
-                document.getElementById('positions').innerHTML = posHtml || '<p class="text-gray-500 text-center py-4">No open positions</p>';
-            }
+            // Update open positions with entry data
+            const positions = data.positions || {};
+            const entrySol = data.entry_sol || {};
+            const entryTimes = data.entry_times || {};
             
-            // Update trades
-            if (data.trades && data.trades.length > 0) {
-                const tradesHtml = data.trades.slice(0, 20).map(t => {
-                    const isBuy = t.trade_type === 'buy' || t.type === 'buy';
-                    const pnl = t.pnl;
-                    const token = t.token_symbol || t.token || t.token_mint?.slice(0, 8) || 'Unknown';
-                    const sol = t.sol_amount || t.sol || 0;
-                    const time = t.created_at || t.timestamp || '';
-                    const timeStr = time ? new Date(time).toLocaleString() : '';
+            const openPositions = Object.entries(positions).filter(([_, amt]) => amt > 0);
+            
+            if (openPositions.length > 0) {
+                const posHtml = openPositions.map(([mint, amt]) => {
+                    const entry = entrySol[mint] || 0;
+                    const entryTime = entryTimes[mint] ? new Date(entryTimes[mint] * 1000).toISOString() : null;
+                    const shortMint = mint.slice(0, 8);
                     
                     return `
-                        <tr class="border-b border-gray-700/50 hover:bg-gray-700/30">
-                            <td class="p-4">
-                                <span class="px-2 py-1 rounded text-xs font-medium ${isBuy ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}">
-                                    ${isBuy ? 'BUY' : 'SELL'}
-                                </span>
+                        <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
+                            <td class="px-6 py-4">
+                                <span class="font-mono text-neutral-300">${shortMint}</span>
                             </td>
-                            <td class="p-4 font-mono text-sm">${token}</td>
-                            <td class="p-4">${Number(sol).toFixed(4)}</td>
-                            <td class="p-4 ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}">
-                                ${pnl !== null && pnl !== undefined ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) : '-'}
-                            </td>
-                            <td class="p-4 text-gray-400 text-xs">${timeStr}</td>
+                            <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
+                            <td class="px-6 py-4 text-neutral-500">${Number(amt).toLocaleString()} tokens</td>
+                            <td class="px-6 py-4 text-neutral-400">-</td>
+                            <td class="px-6 py-4 text-neutral-400">-</td>
+                            <td class="px-6 py-4 text-neutral-500">${formatTime(entryTime)}</td>
                         </tr>
                     `;
                 }).join('');
-                document.getElementById('tradesBody').innerHTML = tradesHtml;
+                document.getElementById('openPositionsBody').innerHTML = posHtml;
+            } else {
+                document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
             }
             
-            document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+            // Update closed trades (sells only)
+            const trades = data.trades || [];
+            const closedTrades = trades.filter(t => t.type === 'sell' || t.trade_type === 'sell');
+            
+            if (closedTrades.length > 0) {
+                const closedHtml = closedTrades.slice(-20).reverse().map(t => {
+                    const token = t.token || t.token_mint?.slice(0, 8) || 'Unknown';
+                    const sol = t.sol || t.sol_amount || 0;
+                    const pnl = t.pnl;
+                    const time = t.timestamp || t.created_at;
+                    
+                    return `
+                        <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
+                            <td class="px-6 py-4">
+                                <span class="font-mono text-neutral-300">${token}</span>
+                            </td>
+                            <td class="px-6 py-4">
+                                <span class="text-neutral-400">SELL</span>
+                            </td>
+                            <td class="px-6 py-4 text-neutral-400">${Number(sol).toFixed(4)}</td>
+                            <td class="px-6 py-4 text-neutral-300">
+                                ${pnl !== null && pnl !== undefined ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) : '-'}
+                            </td>
+                            <td class="px-6 py-4 text-neutral-500">${formatTime(time)}</td>
+                        </tr>
+                    `;
+                }).join('');
+                document.getElementById('closedTradesBody').innerHTML = closedHtml;
+            } else {
+                document.getElementById('closedTradesBody').innerHTML = '<tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>';
+            }
+            
+            document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
         }
         
         // Initial fetch and refresh every 5 seconds
@@ -383,7 +436,9 @@ class WebDashboard:
             'realized_pnl': realized_pnl,
             'total_return_pct': ((state.get('balance', 1.0) + realized_pnl - state.get('starting_balance', 1.0)) / state.get('starting_balance', 1.0) * 100),
             'positions': state.get('positions', {}),
-            'trades': state.get('trades_history', [])[-20:],
+            'entry_sol': state.get('entry_sol', {}),
+            'entry_times': state.get('entry_times', {}),
+            'trades': state.get('trades_history', [])[-50:],
             'tracked_wallet': os.getenv('COPY_WALLETS', '').split(',')[0] if os.getenv('COPY_WALLETS') else 'Not configured'
         }
     
