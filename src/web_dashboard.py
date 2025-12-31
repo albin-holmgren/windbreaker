@@ -248,6 +248,7 @@ class WebDashboard:
         self.app.router.add_get('/api/trades', self.handle_trades)
         self.app.router.add_get('/api/positions', self.handle_positions)
         self.app.router.add_post('/api/reset', self.handle_reset)
+        self.app.router.add_post('/api/import', self.handle_import)
         self.app.router.add_get('/health', self.handle_health)
     
     async def handle_dashboard(self, request):
@@ -320,6 +321,38 @@ class WebDashboard:
             
             return web.json_response({'success': True, 'starting_balance': starting_balance})
         except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+    
+    async def handle_import(self, request):
+        """Import full state from another instance."""
+        try:
+            state = await request.json()
+            
+            # Validate required fields
+            if 'balance' not in state or 'positions' not in state:
+                return web.json_response({'error': 'Invalid state format'}, status=400)
+            
+            # Ensure required fields exist
+            state.setdefault('starting_balance', 1.0)
+            state.setdefault('trades_history', [])
+            state['last_updated'] = datetime.utcnow().isoformat()
+            
+            # Save the imported state
+            self._save_json_state(state)
+            
+            logger.info("state_imported", 
+                       balance=state['balance'],
+                       positions=len([v for v in state.get('positions', {}).values() if v > 0]),
+                       trades=len(state.get('trades_history', [])))
+            
+            return web.json_response({
+                'success': True, 
+                'balance': state['balance'],
+                'positions': len([v for v in state.get('positions', {}).values() if v > 0]),
+                'trades': len(state.get('trades_history', []))
+            })
+        except Exception as e:
+            logger.error("import_error", error=str(e))
             return web.json_response({'error': str(e)}, status=500)
     
     async def handle_health(self, request):
