@@ -237,8 +237,10 @@ DASHBOARD_HTML = '''
             const openPositions = Object.entries(positions).filter(([_, amt]) => amt > 0);
             
             if (openPositions.length > 0) {
+                let totalInvested = 0;
                 const posHtml = openPositions.map(([mint, amt]) => {
                     const entry = entrySol[mint] || 0;
+                    totalInvested += entry;
                     const entryTime = entryTimes[mint] ? new Date(entryTimes[mint] * 1000).toISOString() : null;
                     const shortMint = mint.slice(0, 8);
                     
@@ -253,7 +255,17 @@ DASHBOARD_HTML = '''
                         </tr>
                     `;
                 }).join('');
-                document.getElementById('openPositionsBody').innerHTML = posHtml;
+                
+                // Add total row
+                const totalRow = `
+                    <tr class="border-t border-neutral-700 bg-neutral-800/50">
+                        <td class="px-6 py-4 text-neutral-400 font-medium">Total Invested</td>
+                        <td class="px-6 py-4 text-white font-medium">${totalInvested.toFixed(4)} SOL</td>
+                        <td class="px-6 py-4"></td>
+                        <td class="px-6 py-4"></td>
+                    </tr>
+                `;
+                document.getElementById('openPositionsBody').innerHTML = posHtml + totalRow;
             } else {
                 document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
             }
