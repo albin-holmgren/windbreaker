@@ -67,11 +67,13 @@ class CopyTrader:
         target_wallets: List[str],
         wallet_keypair,  # solders.Keypair
         rpc_client,      # RPCClient from rpc.py
+        state_file: str = 'mock_state.json',
     ):
         self.config = config
         self.target_wallets = target_wallets
         self.wallet = wallet_keypair
         self.rpc = rpc_client
+        self.state_file = state_file
         
         # Components
         self.monitor: Optional[WalletMonitor] = None
@@ -102,6 +104,7 @@ class CopyTrader:
         self.max_dev_holdings_pct = config.max_dev_holdings_pct
         self.min_holders_count = config.min_holders_count
         self.trust_trader_pumpfun = config.trust_trader_pumpfun
+        self.skip_creator_tokens = config.skip_creator_tokens
         
         # Cache for token info (to avoid repeated API calls)
         # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
@@ -125,7 +128,7 @@ class CopyTrader:
         self.mock_position_entry_sol: Dict[str, float] = {}  # mint -> SOL spent
         self.trader_sold_cooldown: Dict[str, float] = {}  # mint -> timestamp when trader sold (but we had no position)
         self.sell_cooldown_seconds = 60  # Don't buy tokens the trader just sold (prevents out-of-sync positions)
-        self.mock_state_file = Path(os.getenv('MOCK_STATE_FILE', '/windbreaker/mock_state.json'))
+        self.mock_state_file = Path(self.state_file)
         self.mock_trades_history: List[Dict] = []  # Track all trades for dashboard
         self.mock_starting_balance = self.config.mock_balance_sol  # Remember starting balance
         # Max age before abandoning - pump.fun tokens rug fast, use short timeout
@@ -521,6 +524,16 @@ class CopyTrader:
                     self.position_manager.queue_failed_sell(swap.token_mint, token_balance)
                 
                 return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
+            
+            # BUYS: Check if wallet is token creator (skip pump and dumps)
+            if self.skip_creator_tokens:
+                is_creator = await self._is_wallet_token_creator(swap.token_mint, swap.wallet)
+                if is_creator:
+                    return CopyTradeResult(
+                        success=False,
+                        error="wallet_is_creator (skipping pump and dump)",
+                        original_swap=swap
+                    )
             
             # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
@@ -1393,6 +1406,55 @@ class CopyTrader:
         except Exception as e:
             logger.debug("holder_info_fetch_error", mint=mint[:8], error=str(e))
             return 0, 0, 0
+    
+    async def _is_wallet_token_creator(self, mint: str, wallet: str) -> bool:
+        """Check if the wallet is the creator of the token using Pump.fun API.
+        
+        Returns:
+            bool: True if wallet is the token creator, False otherwise
+        """
+        try:
+            # Try Pump.fun API first (most pump.fun tokens)
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    creator = data.get("creator")
+                    if creator:
+                        # Compare with tracked wallet (case-insensitive, first 8 chars for logging)
+                        is_creator = creator.lower() == wallet.lower()
+                        if is_creator:
+                            logger.info(
+                                "wallet_is_token_creator",
+                                token=mint[:8],
+                                wallet=wallet[:8],
+                                message="Skipping - tracked wallet created this token"
+                            )
+                        return is_creator
+            
+            # Try RugCheck API as fallback
+            url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    creator_info = data.get("creator", {})
+                    if isinstance(creator_info, dict):
+                        creator_addr = creator_info.get("address", "")
+                        if creator_addr:
+                            is_creator = creator_addr.lower() == wallet.lower()
+                            if is_creator:
+                                logger.info(
+                                    "wallet_is_token_creator",
+                                    token=mint[:8],
+                                    wallet=wallet[:8],
+                                    message="Skipping - tracked wallet created this token (RugCheck)"
+                                )
+                            return is_creator
+            
+            return False
+        except Exception as e:
+            logger.debug("creator_check_error", mint=mint[:8], error=str(e))
+            return False
     
     async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
         """Remove token from recent copies after delay."""

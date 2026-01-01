@@ -58,6 +58,7 @@ class Config:
     max_dev_holdings_pct: float  # Skip if dev owns more than this % (0 = disabled)
     min_holders_count: int  # Minimum number of holders (0 = disabled)
     trust_trader_pumpfun: bool  # If true, skip all filters for pump.fun tokens and trust trader
+    skip_creator_tokens: bool  # If true, skip tokens created by the tracked wallet (avoid pump and dumps)
     mock_trading: bool  # If true, simulate trades without sending transactions
     mock_balance_sol: float  # Starting SOL balance for mock trading
     
@@ -93,9 +94,9 @@ class Config:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
 
-def load_config() -> Config:
+def load_config(env_file: str = '.env') -> Config:
     """Load configuration from environment variables."""
-    load_dotenv()
+    load_dotenv(env_file)
     
     # Validate required fields
     rpc_url = os.getenv('RPC_URL')
@@ -152,6 +153,7 @@ def load_config() -> Config:
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
         min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
         trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust trader for pump.fun
+        skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
         

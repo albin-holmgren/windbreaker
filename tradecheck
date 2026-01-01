@@ -1,0 +1,23 @@
+cd /windbreaker
+
+# 1) Quick status (balance, PnL, trade counts, open positions)
+jq '{
+  balance,
+  starting_balance,
+  open_positions: ([.positions[] | select(.>0)] | length),
+  buys: [.trades_history[] | select(.type=="buy")] | length,
+  sells: [.trades_history[] | select(.type=="sell")] | length,
+  realized_pnl: ([.trades_history[] | select(.type=="sell") | .pnl] | add)
+}' mock_state.json
+
+# 2) Open positions (mint + token amount)
+jq '.positions | to_entries | map(select(.value>0))' mock_state.json
+
+# 3) Last 5 trades (buy/sell history)
+jq '.trades_history[-5:]' mock_state.json
+
+# 4) Bot process (ensure single instance)
+ps aux | grep "python -m src.main" | grep -v grep
+
+# 5) Recent trading activity from log
+grep -E "mock_buy|mock_sell|swap_detected" bot.log | tail -20

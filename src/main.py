@@ -6,6 +6,7 @@ Run with: python -m src.main_copy
 import asyncio
 import signal
 import sys
+import argparse
 from datetime import datetime
 import structlog
 
@@ -37,20 +38,22 @@ logger = structlog.get_logger(__name__)
 class CopyTradingBot:
     """Main copy trading bot class."""
     
-    def __init__(self):
+    def __init__(self, env_file: str = '.env', state_file: str = 'mock_state.json'):
         self.config = None
         self.wallet = None
         self.rpc = None
         self.copy_trader = None
         self.dashboard = None
         self.running = False
+        self.env_file = env_file
+        self.state_file = state_file
     
     async def initialize(self) -> None:
         """Initialize all components."""
-        logger.info("initializing_copy_trader")
+        logger.info("initializing_copy_trader", env_file=self.env_file, state_file=self.state_file)
         
         # Load config
-        self.config = load_config()
+        self.config = load_config(self.env_file)
         
         if not self.config.copy_enabled:
             logger.error("copy_trading_disabled", 
@@ -97,7 +100,8 @@ class CopyTradingBot:
             config=self.config,
             target_wallets=target_wallets,
             wallet_keypair=self.wallet.keypair,
-            rpc_client=self.rpc
+            rpc_client=self.rpc,
+            state_file=self.state_file
         )
         
         logger.info(
@@ -137,7 +141,7 @@ class CopyTradingBot:
         
         try:
             # Start web dashboard
-            self.dashboard = WebDashboard()
+            self.dashboard = WebDashboard(state_file=self.state_file)
             await self.dashboard.start()
             
             # Start copy trader (this blocks)
@@ -161,7 +165,12 @@ class CopyTradingBot:
 
 async def main():
     """Entry point."""
-    bot = CopyTradingBot()
+    parser = argparse.ArgumentParser(description='Windbreaker Copy Trading Bot')
+    parser.add_argument('--env', default='.env', help='Path to .env file (default: .env)')
+    parser.add_argument('--state', default='mock_state.json', help='Path to state file (default: mock_state.json)')
+    args = parser.parse_args()
+    
+    bot = CopyTradingBot(env_file=args.env, state_file=args.state)
     
     try:
         await bot.initialize()

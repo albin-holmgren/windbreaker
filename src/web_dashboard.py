@@ -331,8 +331,9 @@ DASHBOARD_HTML = '''
 class WebDashboard:
     """Web dashboard server for monitoring the bot."""
     
-    def __init__(self, db=None):
+    def __init__(self, db=None, state_file: str = 'mock_state.json'):
         self.db = db
+        self.state_file = state_file
         self.app = web.Application()
         self.runner = None
         self._setup_routes()
@@ -458,7 +459,7 @@ class WebDashboard:
     def _load_json_state(self) -> Dict[str, Any]:
         """Load state from JSON file."""
         try:
-            with open('mock_state.json', 'r') as f:
+            with open(self.state_file, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
             return {'starting_balance': 1.0, 'balance': 1.0, 'positions': {}, 'trades_history': []}
@@ -487,7 +488,7 @@ class WebDashboard:
     
     def _save_json_state(self, state: Dict[str, Any]):
         """Save state to JSON file."""
-        with open('mock_state.json', 'w') as f:
+        with open(self.state_file, 'w') as f:
             json.dump(state, f, indent=2)
     
     async def start(self, host='0.0.0.0', port=None):
