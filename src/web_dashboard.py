@@ -245,7 +245,6 @@ DASHBOARD_HTML = '''
             
             // Update open positions with entry data
             const positions = data.positions || {};
-            const entrySol = data.entry_sol || {};
             const entryTimes = data.entry_times || {};
             
             const openPositions = Object.entries(positions).filter(([_, amt]) => amt > 0);
