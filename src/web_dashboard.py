@@ -62,7 +62,7 @@ DASHBOARD_HTML = '''
         </div>
 
         <!-- Stats Cards -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-10">
             <div class="card rounded-2xl p-5">
                 <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Balance</p>
                 <p id="balance" class="text-2xl font-medium">0.00 SOL</p>
@@ -70,8 +70,14 @@ DASHBOARD_HTML = '''
             </div>
             
             <div class="card rounded-2xl p-5">
-                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Realized PnL</p>
-                <p id="realizedPnl" class="text-2xl font-medium">+0.00 SOL</p>
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Total Portfolio</p>
+                <p id="totalPortfolio" class="text-2xl font-medium">0.00 SOL</p>
+                <p id="totalInvested" class="text-neutral-600 text-xs mt-1">0.00 invested</p>
+            </div>
+            
+            <div class="card rounded-2xl p-5">
+                <p class="text-neutral-500 text-xs uppercase tracking-wider mb-2">Total PnL</p>
+                <p id="totalPnl" class="text-2xl font-medium">+0.00 SOL</p>
                 <p id="returnPct" class="text-neutral-600 text-xs mt-1">0% return</p>
             </div>
             
@@ -211,14 +217,22 @@ DASHBOARD_HTML = '''
         }
         
         function updateUI(data) {
+            // Calculate total invested and portfolio value
+            const entrySol = data.entry_sol || {};
+            const totalInvestedAmount = Object.values(entrySol).reduce((sum, val) => sum + val, 0);
+            const totalPortfolioValue = data.balance + totalInvestedAmount;
+            const totalPnl = totalPortfolioValue - data.starting_balance;
+            
             // Update stats
             document.getElementById('balance').textContent = data.balance.toFixed(4) + ' SOL';
             document.getElementById('balanceChange').textContent = 'from ' + data.starting_balance.toFixed(2) + ' SOL';
             
-            const pnl = data.realized_pnl || 0;
-            document.getElementById('realizedPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' SOL';
+            document.getElementById('totalPortfolio').textContent = totalPortfolioValue.toFixed(4) + ' SOL';
+            document.getElementById('totalInvested').textContent = totalInvestedAmount.toFixed(4) + ' invested';
             
-            const returnPct = data.total_return_pct || 0;
+            document.getElementById('totalPnl').textContent = (totalPnl >= 0 ? '+' : '') + totalPnl.toFixed(4) + ' SOL';
+            
+            const returnPct = (totalPnl / data.starting_balance) * 100;
             document.getElementById('returnPct').textContent = (returnPct >= 0 ? '+' : '') + returnPct.toFixed(1) + '% return';
             
             document.getElementById('openPositions').textContent = data.open_positions || 0;
