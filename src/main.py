@@ -6,6 +6,7 @@ Run with: python -m src.main_copy
 import asyncio
 import signal
 import sys
+import os
 import argparse
 from datetime import datetime
 import structlog
@@ -163,12 +164,32 @@ class CopyTradingBot:
             self.copy_trader.running = False
 
 
+async def run_dashboard_only(state_file: str):
+    """Run only the dashboard without trading (for Railway)."""
+    logger.info("starting_dashboard_only_mode", state_file=state_file)
+    
+    dashboard = WebDashboard(state_file=state_file)
+    await dashboard.start()
+    
+    # Keep running
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def main():
     """Entry point."""
     parser = argparse.ArgumentParser(description='Windbreaker Copy Trading Bot')
     parser.add_argument('--env', default='.env', help='Path to .env file (default: .env)')
     parser.add_argument('--state', default='mock_state.json', help='Path to state file (default: mock_state.json)')
+    parser.add_argument('--dashboard-only', action='store_true', help='Run dashboard only without trading')
     args = parser.parse_args()
+    
+    # Check for DASHBOARD_ONLY environment variable
+    dashboard_only = args.dashboard_only or os.getenv('DASHBOARD_ONLY', 'false').lower() == 'true'
+    
+    if dashboard_only:
+        await run_dashboard_only(args.state)
+        return
     
     bot = CopyTradingBot(env_file=args.env, state_file=args.state)
     
