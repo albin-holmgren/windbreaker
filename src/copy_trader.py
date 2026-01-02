@@ -1437,19 +1437,25 @@ class CopyTrader:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    creator_info = data.get("creator", {})
-                    if isinstance(creator_info, dict):
+                    creator_info = data.get("creator")
+                    creator_addr = ""
+                    
+                    # Handle both string and dict formats from RugCheck
+                    if isinstance(creator_info, str):
+                        creator_addr = creator_info
+                    elif isinstance(creator_info, dict):
                         creator_addr = creator_info.get("address", "")
-                        if creator_addr:
-                            is_creator = creator_addr.lower() == wallet.lower()
-                            if is_creator:
-                                logger.info(
-                                    "wallet_is_token_creator",
-                                    token=mint[:8],
-                                    wallet=wallet[:8],
-                                    message="Skipping - tracked wallet created this token (RugCheck)"
-                                )
-                            return is_creator
+                    
+                    if creator_addr:
+                        is_creator = creator_addr.lower() == wallet.lower()
+                        if is_creator:
+                            logger.info(
+                                "wallet_is_token_creator",
+                                token=mint[:8],
+                                wallet=wallet[:8],
+                                message="Skipping - tracked wallet created this token (RugCheck)"
+                            )
+                        return is_creator
             
             return False
         except Exception as e:
