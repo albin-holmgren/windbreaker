@@ -141,7 +141,8 @@ class WalletMonitor:
     
     async def _poll_wallet(self, wallet: str) -> None:
         """Poll a single wallet for new transactions."""
-        signatures = await self._get_recent_signatures(wallet, limit=5)
+        # Increased from 5 to 20 - active traders can do many transactions between polls
+        signatures = await self._get_recent_signatures(wallet, limit=20)
         
         for sig in signatures:
             if sig in self.seen_signatures[wallet]:
