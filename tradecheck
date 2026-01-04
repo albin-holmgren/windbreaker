@@ -1,23 +1,53 @@
 cd /windbreaker
 
-# 1) Quick status (balance, PnL, trade counts, open positions)
+echo "==================== BOT 1 (6mWEJG9L... - Original) ===================="
 jq '{
   balance,
   starting_balance,
-  open_positions: ([.positions[] | select(.>0)] | length),
-  buys: [.trades_history[] | select(.type=="buy")] | length,
-  sells: [.trades_history[] | select(.type=="sell")] | length,
-  realized_pnl: ([.trades_history[] | select(.type=="sell") | .pnl] | add)
+  pnl,
+  open_positions: ([.positions | to_entries[] | select(.value>0)] | length),
+  buys: [.trades_history[]? | select(.type=="buy")] | length,
+  sells: [.trades_history[]? | select(.type=="sell")] | length
 }' mock_state.json
-
-# 2) Open positions (mint + token amount)
-jq '.positions | to_entries | map(select(.value>0))' mock_state.json
-
-# 3) Last 5 trades (buy/sell history)
+echo "--- Last 5 Trades ---"
 jq '.trades_history[-5:]' mock_state.json
 
-# 4) Bot process (ensure single instance)
-ps aux | grep "python -m src.main" | grep -v grep
+echo ""
+echo "==================== BOT 2 (2fg5QD1e...) ===================="
+jq '{
+  balance,
+  starting_balance,
+  pnl,
+  open_positions: ([.positions | to_entries[]? | select(.value>0)] | length),
+  buys: [.trades_history[]? | select(.type=="buy")] | length,
+  sells: [.trades_history[]? | select(.type=="sell")] | length
+}' mock_state_bot2.json
+jq '.trades_history[-5:]' mock_state_bot2.json 2>/dev/null || echo "No trades yet"
 
-# 5) Recent trading activity from log
-grep -E "mock_buy|mock_sell|swap_detected" bot.log | tail -20
+echo ""
+echo "==================== BOT 3 (4BdKaxN8...) ===================="
+jq '{
+  balance,
+  starting_balance,
+  pnl,
+  open_positions: ([.positions | to_entries[]? | select(.value>0)] | length),
+  buys: [.trades_history[]? | select(.type=="buy")] | length,
+  sells: [.trades_history[]? | select(.type=="sell")] | length
+}' mock_state_bot3.json
+jq '.trades_history[-5:]' mock_state_bot3.json 2>/dev/null || echo "No trades yet"
+
+echo ""
+echo "==================== BOT 4 (Ez2jp3rw...) ===================="
+jq '{
+  balance,
+  starting_balance,
+  pnl,
+  open_positions: ([.positions | to_entries[]? | select(.value>0)] | length),
+  buys: [.trades_history[]? | select(.type=="buy")] | length,
+  sells: [.trades_history[]? | select(.type=="sell")] | length
+}' mock_state_bot4.json
+jq '.trades_history[-5:]' mock_state_bot4.json 2>/dev/null || echo "No trades yet"
+
+echo ""
+echo "==================== PROCESS STATUS ===================="
+ps aux | grep "python -m src.main" | grep -v grep
