@@ -13,6 +13,30 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Wallet configurations for tabs
+WALLET_CONFIGS = {
+    'slingor': {
+        'name': 'Slingor',
+        'address': '6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd',
+        'state_file': 'mock_state.json'
+    },
+    'cented': {
+        'name': 'Cented',
+        'address': 'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o',
+        'state_file': 'mock_state_cented.json'
+    },
+    'cupsey': {
+        'name': 'Cupsey',
+        'address': '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f',
+        'state_file': 'mock_state_cupsey.json'
+    },
+    'jijo': {
+        'name': 'Jijo',
+        'address': '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk',
+        'state_file': 'mock_state_jijo.json'
+    }
+}
+
 # HTML template for the dashboard
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
@@ -40,10 +64,29 @@ DASHBOARD_HTML = '''
         .card { background: #212121; border: 1px solid #2a2a2a; }
         .tab-active { background: #212121; color: #fff; }
         .tab-inactive { background: transparent; color: #666; }
+        .wallet-tab { transition: all 0.2s; border-bottom: 2px solid transparent; }
+        .wallet-tab.active { border-bottom-color: #4ade80; color: #fff; }
+        .wallet-tab:hover { color: #fff; }
     </style>
 </head>
 <body class="text-white min-h-screen font-sans">
     <div class="max-w-7xl mx-auto px-6 py-8">
+        <!-- Wallet Tabs -->
+        <div class="flex items-center gap-1 mb-6 border-b border-neutral-800 pb-0">
+            <button onclick="switchWallet('slingor')" id="wallet-slingor" class="wallet-tab active px-4 py-3 text-sm font-medium text-neutral-400">
+                Slingor
+            </button>
+            <button onclick="switchWallet('cented')" id="wallet-cented" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
+                Cented
+            </button>
+            <button onclick="switchWallet('cupsey')" id="wallet-cupsey" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
+                Cupsey
+            </button>
+            <button onclick="switchWallet('jijo')" id="wallet-jijo" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
+                Jijo
+            </button>
+        </div>
+
         <!-- Header -->
         <div class="flex items-center justify-between mb-10">
             <div>
@@ -156,6 +199,27 @@ DASHBOARD_HTML = '''
     <script>
         let currentData = null;
         let isRefreshing = false;
+        let currentWallet = 'slingor';
+        
+        const walletConfigs = {
+            'slingor': { name: 'Slingor', address: '6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd' },
+            'cented': { name: 'Cented', address: 'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o' },
+            'cupsey': { name: 'Cupsey', address: '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f' },
+            'jijo': { name: 'Jijo', address: '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk' }
+        };
+        
+        function switchWallet(wallet) {
+            currentWallet = wallet;
+            
+            // Update tab styles
+            document.querySelectorAll('.wallet-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.getElementById('wallet-' + wallet).classList.add('active');
+            
+            // Fetch data for new wallet
+            fetchData();
+        }
         
         function switchTab(tab) {
             const openTab = document.getElementById('tabOpen');
@@ -196,7 +260,7 @@ DASHBOARD_HTML = '''
         
         async function fetchData() {
             try {
-                const response = await fetch('/api/stats');
+                const response = await fetch('/api/stats?wallet=' + currentWallet);
                 currentData = await response.json();
                 updateUI(currentData);
             } catch (e) {
@@ -355,14 +419,19 @@ class WebDashboard:
     async def handle_stats(self, request):
         """Get trading statistics."""
         try:
+            # Get wallet from query param, default to slingor
+            wallet_id = request.query.get('wallet', 'slingor')
+            wallet_config = WALLET_CONFIGS.get(wallet_id, WALLET_CONFIGS['slingor'])
+            
             if self.db:
                 stats = await self.db.get_stats()
                 state = await self.db.get_state()
                 stats['positions'] = state.get('positions', {})
-                stats['trades'] = state.get('trades_history', [])[-20:]  # Last 20 trades
-                stats['tracked_wallet'] = os.getenv('COPY_WALLETS', '').split(',')[0] if os.getenv('COPY_WALLETS') else 'Not configured'
+                stats['trades'] = state.get('trades_history', [])[-20:]
+                stats['tracked_wallet'] = wallet_config['address']
             else:
-                stats = self._load_json_stats()
+                stats = self._load_json_stats(wallet_config['state_file'])
+                stats['tracked_wallet'] = wallet_config['address']
             
             return web.json_response(stats)
         except Exception as e:
@@ -456,17 +525,18 @@ class WebDashboard:
         """Health check endpoint."""
         return web.json_response({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
     
-    def _load_json_state(self) -> Dict[str, Any]:
+    def _load_json_state(self, state_file: str = None) -> Dict[str, Any]:
         """Load state from JSON file."""
+        file_to_load = state_file or self.state_file
         try:
-            with open(self.state_file, 'r') as f:
+            with open(file_to_load, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
             return {'starting_balance': 1.0, 'balance': 1.0, 'positions': {}, 'trades_history': []}
     
-    def _load_json_stats(self) -> Dict[str, Any]:
+    def _load_json_stats(self, state_file: str = None) -> Dict[str, Any]:
         """Load stats from JSON file."""
-        state = self._load_json_state()
+        state = self._load_json_state(state_file)
         buys = [t for t in state.get('trades_history', []) if t.get('type') == 'buy']
         sells = [t for t in state.get('trades_history', []) if t.get('type') == 'sell']
         realized_pnl = sum(t.get('pnl', 0) for t in sells if t.get('pnl'))
