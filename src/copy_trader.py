@@ -202,10 +202,14 @@ class CopyTrader:
                 logger.error("mock_cleanup_error", error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
-        """Abandon mock positions based on token health (liquidity, market cap)."""
+        """Check mock positions for stop-loss, take-profit, and token health."""
         # Thresholds for considering a token rugged
         MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '1000'))  # Abandon if liquidity < $1000
         MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '5000'))  # Abandon if mcap < $5000
+        
+        # Get stop-loss and take-profit from config
+        stop_loss_pct = self.config.stop_loss_pct  # e.g., -35 means sell if down 35%
+        take_profit_pct = self.config.take_profit_pct  # e.g., 50 means sell if up 50%
         
         # Get active positions
         active_mints = [mint for mint, tokens in self.mock_token_positions.items() if tokens > 0]
@@ -217,43 +221,121 @@ class CopyTrader:
             "mock_health_check",
             active_positions=len(active_mints),
             min_liquidity=f"${MIN_LIQUIDITY_USD:,.0f}",
-            min_mcap=f"${MIN_MARKET_CAP_USD:,.0f}"
+            min_mcap=f"${MIN_MARKET_CAP_USD:,.0f}",
+            stop_loss=f"{stop_loss_pct}%",
+            take_profit=f"{take_profit_pct}%"
         )
         
         for mint in active_mints:
             try:
-                # Get current token health from DexScreener
+                # Get current token info from DexScreener
                 market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(mint)
                 
                 entry_sol = self.mock_position_entry_sol.get(mint, 0)
+                tokens_held = self.mock_token_positions.get(mint, 0)
                 reason = None
+                should_sell = False
+                
+                # Get current token price and calculate PnL
+                current_value = await self._get_mock_position_value(mint, tokens_held)
+                if entry_sol > 0 and current_value > 0:
+                    pnl_pct = ((current_value - entry_sol) / entry_sol) * 100
+                    
+                    # Check stop-loss (e.g., -35% means sell if pnl_pct <= -35)
+                    if pnl_pct <= stop_loss_pct:
+                        reason = f"stop_loss_triggered (PnL: {pnl_pct:.1f}%)"
+                        should_sell = True
+                    # Check take-profit (e.g., 50% means sell if pnl_pct >= 50)
+                    elif pnl_pct >= take_profit_pct:
+                        reason = f"take_profit_triggered (PnL: {pnl_pct:.1f}%)"
+                        should_sell = True
                 
                 # Check if rugged (liquidity pulled or market cap crashed)
-                if liquidity < MIN_LIQUIDITY_USD and liquidity > 0:
-                    reason = f"liquidity_too_low (${liquidity:,.0f})"
-                elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0:
-                    reason = f"mcap_too_low (${market_cap:,.0f})"
-                elif market_cap == 0 and liquidity == 0 and age_minutes > 5:
-                    # Token not found on DexScreener after 5 min = likely rugged
-                    reason = "not_on_dexscreener_anymore"
+                if not should_sell:
+                    if liquidity < MIN_LIQUIDITY_USD and liquidity > 0:
+                        reason = f"liquidity_too_low (${liquidity:,.0f})"
+                        should_sell = True
+                    elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0:
+                        reason = f"mcap_too_low (${market_cap:,.0f})"
+                        should_sell = True
+                    elif market_cap == 0 and liquidity == 0 and age_minutes > 5:
+                        reason = "not_on_dexscreener_anymore"
+                        should_sell = True
                 
-                if reason:
-                    logger.warning(
-                        "mock_position_abandoned",
-                        token=mint[:8],
-                        entry_sol=f"{entry_sol:.4f}",
-                        market_cap=f"${market_cap:,.0f}",
-                        liquidity=f"${liquidity:,.0f}",
-                        reason=reason
-                    )
-                    
-                    # Clear the position (assume 100% loss)
-                    self.mock_token_positions[mint] = 0
-                    self.mock_position_entry_time.pop(mint, None)
-                    self.mock_position_entry_sol.pop(mint, None)
+                if should_sell and reason:
+                    # Perform the mock sell
+                    await self._auto_mock_sell(mint, tokens_held, entry_sol, current_value, reason)
                     
             except Exception as e:
                 logger.debug("health_check_error", token=mint[:8], error=str(e))
+    
+    async def _get_mock_position_value(self, mint: str, tokens_held: int) -> float:
+        """Get current value of a mock position in SOL using DexScreener price."""
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        # Get price in native token (SOL) from highest liquidity pair
+                        best_pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+                        price_native = float(best_pair.get("priceNative", 0) or 0)
+                        
+                        # Calculate current value in SOL
+                        # price_native is price per token in SOL
+                        # tokens_held is in smallest units (like lamports for SOL)
+                        # Need to adjust for token decimals
+                        decimals = 6  # Most SPL tokens use 6 decimals
+                        token_amount = tokens_held / (10 ** decimals)
+                        current_value = token_amount * price_native
+                        return current_value
+            return 0
+        except Exception as e:
+            logger.debug("get_position_value_error", mint=mint[:8], error=str(e))
+            return 0
+    
+    async def _auto_mock_sell(self, mint: str, tokens_held: int, entry_sol: float, current_value: float, reason: str) -> None:
+        """Perform automatic mock sell for stop-loss/take-profit/rug detection."""
+        # Calculate PnL
+        sol_received = current_value if current_value > 0 else 0
+        pnl = sol_received - entry_sol
+        
+        # Add SOL to mock balance
+        self.mock_balance += sol_received
+        
+        # Remove tokens from mock positions and tracking
+        self.mock_token_positions[mint] = 0
+        self.mock_position_entry_time.pop(mint, None)
+        self.mock_position_entry_sol.pop(mint, None)
+        
+        logger.warning(
+            "mock_auto_sell",
+            token=mint[:8],
+            tokens_sold=tokens_held,
+            sol_received=f"{sol_received:.4f}",
+            entry_sol=f"{entry_sol:.4f}",
+            pnl=f"{pnl:+.4f}",
+            reason=reason,
+            new_balance=f"{self.mock_balance:.4f}"
+        )
+        
+        # Track trade in history
+        self.mock_trades_history.append({
+            'type': 'auto_sell',
+            'token': mint[:8],
+            'full_mint': mint,
+            'sol': sol_received,
+            'tokens': tokens_held,
+            'entry_sol': entry_sol,
+            'pnl': pnl,
+            'reason': reason,
+            'balance_after': self.mock_balance,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Save state after each trade
+        self._save_mock_state()
     
     async def stop(self) -> None:
         """Stop the copy trader."""
