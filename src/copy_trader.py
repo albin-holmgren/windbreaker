@@ -406,13 +406,25 @@ class CopyTrader:
         """Recalculate balance from trade history to fix any corruption."""
         starting_balance = state.get('starting_balance', 1.0)
         trades = state.get('trades_history', [])
+        entry_sol = state.get('entry_sol', {})
+        total_invested = sum(entry_sol.values())
+        old_balance = state.get('balance', 1.0)
         
-        if not trades:
+        # If no trades and no open positions, balance should equal starting balance
+        if not trades and total_invested == 0:
+            if abs(old_balance - starting_balance) > 0.01:
+                logger.warning(
+                    "balance_reset_no_trades",
+                    old_balance=f"{old_balance:.4f}",
+                    new_balance=f"{starting_balance:.4f}",
+                    reason="no_trades_no_positions"
+                )
+                state['balance'] = starting_balance
+                state['pnl'] = 0
             return state
         
         # Calculate balance by replaying all trades
         calculated_balance = starting_balance
-        total_invested = 0
         
         for trade in trades:
             trade_type = trade.get('type', '')
@@ -422,12 +434,6 @@ class CopyTrader:
                 calculated_balance -= sol_amount
             elif trade_type in ('sell', 'auto_sell'):
                 calculated_balance += sol_amount
-        
-        # Add back any currently invested SOL (open positions)
-        entry_sol = state.get('entry_sol', {})
-        total_invested = sum(entry_sol.values())
-        
-        old_balance = state.get('balance', 1.0)
         
         # Only fix if there's a significant discrepancy (>0.01 SOL)
         if abs(calculated_balance - old_balance) > 0.01:
