@@ -209,11 +209,14 @@ class CopyTrader:
                 logger.error("mock_cleanup_error", error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
-        """Check mock positions for stop-loss, take-profit, and token health across all wallets."""
-        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '1000'))
-        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '5000'))
-        stop_loss_pct = self.config.stop_loss_pct
-        take_profit_pct = self.config.take_profit_pct
+        """Check mock positions for rug detection (low liquidity/mcap) across all wallets.
+        
+        NOTE: We do NOT auto-sell based on PnL because DexScreener prices are unrealistic.
+        Instead, we only sell when the tracked wallet sells (copy their sell) or when
+        rug detection triggers (token removed from DEX, very low liquidity/mcap).
+        """
+        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '500'))
+        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '2000'))
         
         # Iterate over all tracked wallets
         for wallet, state in self.wallet_states.items():
@@ -229,9 +232,7 @@ class CopyTrader:
                 wallet=wallet[:8],
                 active_positions=len(active_mints),
                 min_liquidity=f"${MIN_LIQUIDITY_USD:,.0f}",
-                min_mcap=f"${MIN_MARKET_CAP_USD:,.0f}",
-                stop_loss=f"{stop_loss_pct}%",
-                take_profit=f"{take_profit_pct}%"
+                min_mcap=f"${MIN_MARKET_CAP_USD:,.0f}"
             )
             
             for mint in active_mints:
@@ -243,30 +244,21 @@ class CopyTrader:
                     reason = None
                     should_sell = False
                     
-                    current_value = await self._get_mock_position_value(mint, tokens_held)
-                    if entry_sol > 0 and current_value > 0:
-                        pnl_pct = ((current_value - entry_sol) / entry_sol) * 100
-                        
-                        if pnl_pct <= stop_loss_pct:
-                            reason = f"stop_loss_triggered (PnL: {pnl_pct:.1f}%)"
-                            should_sell = True
-                        elif pnl_pct >= take_profit_pct:
-                            reason = f"take_profit_triggered (PnL: {pnl_pct:.1f}%)"
-                            should_sell = True
-                    
-                    if not should_sell:
-                        if liquidity < MIN_LIQUIDITY_USD and liquidity > 0:
-                            reason = f"liquidity_too_low (${liquidity:,.0f})"
-                            should_sell = True
-                        elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0:
-                            reason = f"mcap_too_low (${market_cap:,.0f})"
-                            should_sell = True
-                        elif market_cap == 0 and liquidity == 0 and age_minutes > 5:
-                            reason = "not_on_dexscreener_anymore"
-                            should_sell = True
+                    # Only auto-sell on rug detection - NOT on PnL
+                    # Real sells happen when we copy the tracked wallet's sell
+                    if liquidity < MIN_LIQUIDITY_USD and liquidity > 0 and age_minutes > 10:
+                        reason = f"rug_detected_low_liquidity (${liquidity:,.0f})"
+                        should_sell = True
+                    elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0 and age_minutes > 10:
+                        reason = f"rug_detected_low_mcap (${market_cap:,.0f})"
+                        should_sell = True
+                    elif market_cap == 0 and liquidity == 0 and age_minutes > 10:
+                        reason = "rug_detected_not_on_dex"
+                        should_sell = True
                     
                     if should_sell and reason:
-                        await self._auto_mock_sell(wallet, mint, tokens_held, entry_sol, current_value, reason)
+                        # For rug detection, sell at entry value (assume total loss)
+                        await self._auto_mock_sell(wallet, mint, tokens_held, entry_sol, entry_sol * 0.1, reason)
                         
                 except Exception as e:
                     logger.debug("health_check_error", wallet=wallet[:8], token=mint[:8], error=str(e))

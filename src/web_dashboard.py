@@ -350,9 +350,9 @@ DASHBOARD_HTML = '''
                 document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
             }
             
-            // Update closed trades (sells only)
+            // Update closed trades (sells and auto_sells)
             const trades = data.trades || [];
-            const closedTrades = trades.filter(t => t.type === 'sell' || t.trade_type === 'sell');
+            const closedTrades = trades.filter(t => t.type === 'sell' || t.type === 'auto_sell' || t.trade_type === 'sell');
             
             if (closedTrades.length > 0) {
                 const closedHtml = closedTrades.slice(-20).reverse().map(t => {
@@ -541,8 +541,8 @@ class WebDashboard:
         """Load stats from JSON file."""
         state = self._load_json_state(state_file)
         buys = [t for t in state.get('trades_history', []) if t.get('type') == 'buy']
-        sells = [t for t in state.get('trades_history', []) if t.get('type') == 'sell']
-        realized_pnl = sum(t.get('pnl', 0) for t in sells if t.get('pnl'))
+        sells = [t for t in state.get('trades_history', []) if t.get('type') in ('sell', 'auto_sell')]
+        realized_pnl = sum(t.get('pnl', 0) for t in sells if t.get('pnl') is not None)
         
         return {
             'starting_balance': state.get('starting_balance', 1.0),
