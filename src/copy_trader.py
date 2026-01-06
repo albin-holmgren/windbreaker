@@ -371,6 +371,10 @@ class CopyTrader:
                 if Path(state_file).exists():
                     with open(state_file, 'r') as f:
                         state = json.load(f)
+                    
+                    # Recalculate balance from trade history to fix any corruption
+                    state = self._recalculate_balance_from_history(state)
+                    
                     self.wallet_states[wallet] = state
                     logger.info("wallet_state_loaded", 
                         wallet=wallet[:8],
@@ -397,6 +401,47 @@ class CopyTrader:
             'last_updated': datetime.now().isoformat(),
             'pnl': 0
         }
+    
+    def _recalculate_balance_from_history(self, state: dict) -> dict:
+        """Recalculate balance from trade history to fix any corruption."""
+        starting_balance = state.get('starting_balance', 1.0)
+        trades = state.get('trades_history', [])
+        
+        if not trades:
+            return state
+        
+        # Calculate balance by replaying all trades
+        calculated_balance = starting_balance
+        total_invested = 0
+        
+        for trade in trades:
+            trade_type = trade.get('type', '')
+            sol_amount = trade.get('sol', 0)
+            
+            if trade_type == 'buy':
+                calculated_balance -= sol_amount
+            elif trade_type in ('sell', 'auto_sell'):
+                calculated_balance += sol_amount
+        
+        # Add back any currently invested SOL (open positions)
+        entry_sol = state.get('entry_sol', {})
+        total_invested = sum(entry_sol.values())
+        
+        old_balance = state.get('balance', 1.0)
+        
+        # Only fix if there's a significant discrepancy (>0.01 SOL)
+        if abs(calculated_balance - old_balance) > 0.01:
+            logger.warning(
+                "balance_recalculated",
+                old_balance=f"{old_balance:.4f}",
+                new_balance=f"{calculated_balance:.4f}",
+                trades_count=len(trades),
+                starting_balance=f"{starting_balance:.4f}"
+            )
+            state['balance'] = calculated_balance
+            state['pnl'] = calculated_balance + total_invested - starting_balance
+        
+        return state
     
     def _get_wallet_state(self, wallet: str) -> dict:
         """Get state for a specific wallet, creating if needed."""
