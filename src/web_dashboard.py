@@ -300,8 +300,11 @@ DASHBOARD_HTML = '''
             document.getElementById('returnPct').textContent = (returnPct >= 0 ? '+' : '') + returnPct.toFixed(1) + '% return';
             
             document.getElementById('openPositions').textContent = data.open_positions || 0;
-            document.getElementById('totalTrades').textContent = (data.buys || 0) + (data.sells || 0);
-            document.getElementById('tradeBreakdown').textContent = (data.buys || 0) + ' buys, ' + (data.sells || 0) + ' sells';
+            // A completed trade = buy + sell, so count sells as completed trades
+            const completedTrades = data.sells || 0;
+            const openTrades = data.open_positions || 0;
+            document.getElementById('totalTrades').textContent = completedTrades;
+            document.getElementById('tradeBreakdown').textContent = completedTrades + ' closed, ' + openTrades + ' open';
             
             if (data.tracked_wallet) {
                 document.getElementById('trackedWallet').textContent = data.tracked_wallet;
