@@ -187,6 +187,9 @@ class TransactionParser:
             post_sol = meta.get("postBalances", [])[wallet_index] if wallet_index < len(meta.get("postBalances", [])) else 0
             sol_change = post_sol - pre_sol
         
+        # Also check wrapped SOL changes for this wallet
+        wsol_change = self._get_wrapped_sol_change(meta, wallet)
+        
         # For pump.fun, look at ALL token balance changes (not just wallet-owned)
         # Since this is a pump.fun tx initiated by the wallet, token changes are theirs
         pre_balances_all = {}
@@ -210,6 +213,7 @@ class TransactionParser:
         logger.debug("pump_fun_balances", 
             wallet=wallet[:8],
             sol_change=sol_change,
+            wsol_change=wsol_change,
             pre_mints=len(pre_balances_all),
             post_mints=len(post_balances_all),
             all_mints=len(all_mints)
@@ -230,23 +234,63 @@ class TransactionParser:
             logger.debug("pump_fun_no_token_change", wallet=wallet[:8])
             return None
         
-        # Determine if buy or sell
-        if token_change > 0 and sol_change < 0:
+        # Combine native SOL and wrapped SOL changes for total SOL movement
+        # Use the larger absolute value, or add them if they're in same direction
+        total_sol_change = sol_change
+        if wsol_change != 0:
+            # If wsol_change is significant and sol_change is near 0 (just fees), use wsol
+            if abs(sol_change) < 0.01 * 1e9:  # Less than 0.01 SOL (probably just fees)
+                total_sol_change = wsol_change
+            elif (sol_change > 0 and wsol_change > 0) or (sol_change < 0 and wsol_change < 0):
+                # Same direction, add them
+                total_sol_change = sol_change + wsol_change
+            else:
+                # Different directions, use the larger magnitude
+                total_sol_change = sol_change if abs(sol_change) > abs(wsol_change) else wsol_change
+        
+        # Determine if buy or sell - now with improved logic
+        swap_type = None
+        estimated_sol = abs(total_sol_change)
+        
+        if token_change > 0 and total_sol_change < 0:
+            # Clear buy: gained tokens, lost SOL
             swap_type = SwapType.BUY
-        elif token_change < 0 and sol_change > 0:
+        elif token_change < 0 and total_sol_change > 0:
+            # Clear sell: lost tokens, gained SOL
             swap_type = SwapType.SELL
-        else:
+        elif token_change > 0 and total_sol_change >= 0:
+            # Gained tokens but SOL change unclear - likely a BUY where fees offset
+            # Estimate SOL value from token change and typical pump.fun mechanics
+            swap_type = SwapType.BUY
+            # Estimate: if we can't determine SOL, use a reasonable estimate
+            # This is better than missing the trade entirely
+            if estimated_sol < self.min_sol_value * 1e9:
+                estimated_sol = self._estimate_sol_from_pump_fun(tx_data, token_change)
+            logger.debug("pump_fun_inferred_buy", token=token_mint[:8], estimated_sol=estimated_sol/1e9)
+        elif token_change < 0 and total_sol_change <= 0:
+            # Lost tokens but SOL change unclear - likely a SELL where we received wrapped SOL
+            swap_type = SwapType.SELL
+            if estimated_sol < self.min_sol_value * 1e9:
+                estimated_sol = self._estimate_sol_from_pump_fun(tx_data, token_change)
+            logger.debug("pump_fun_inferred_sell", token=token_mint[:8], estimated_sol=estimated_sol/1e9)
+        
+        if not swap_type:
+            logger.debug("pump_fun_cannot_determine_type", 
+                token=token_mint[:8], 
+                token_change=token_change, 
+                sol_change=total_sol_change)
             return None
         
         # Filter by minimum SOL value
-        if abs(sol_change) / 1e9 < self.min_sol_value:
+        if estimated_sol / 1e9 < self.min_sol_value:
+            logger.debug("pump_fun_below_min_sol", estimated_sol=estimated_sol/1e9)
             return None
         
         return ParsedSwap(
             swap_type=swap_type,
             token_mint=token_mint,
             token_symbol=None,  # Would need to fetch from metadata
-            sol_amount=abs(sol_change),
+            sol_amount=int(estimated_sol),
             token_amount=abs(token_change),
             dex="pump.fun",
             signature=tx_data.get("transaction", {}).get("signatures", [""])[0],
@@ -280,6 +324,53 @@ class TransactionParser:
         
         return self._parse_from_balance_changes(tx_data, wallet, meta, dex="raydium")
     
+    def _get_wrapped_sol_change(self, meta: Dict, wallet: str) -> int:
+        """
+        Get wrapped SOL (WSOL) balance change for a wallet.
+        Many DEXes use wrapped SOL for swaps.
+        """
+        wsol_pre = 0
+        wsol_post = 0
+        
+        # Check all token balances for wrapped SOL owned by this wallet
+        for b in meta.get("preTokenBalances", []):
+            if b.get("mint") == NATIVE_SOL_MINT and b.get("owner") == wallet:
+                wsol_pre = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+        
+        for b in meta.get("postTokenBalances", []):
+            if b.get("mint") == NATIVE_SOL_MINT and b.get("owner") == wallet:
+                wsol_post = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+        
+        return wsol_post - wsol_pre
+    
+    def _estimate_sol_from_pump_fun(self, tx_data: Dict, token_change: int) -> int:
+        """
+        Estimate SOL value when we can't determine it directly.
+        Uses total SOL movement in transaction as a proxy.
+        """
+        meta = tx_data.get("meta", {})
+        pre_balances = meta.get("preBalances", [])
+        post_balances = meta.get("postBalances", [])
+        
+        # Calculate total SOL movement (excluding fees)
+        # Look for significant SOL movements between accounts
+        max_sol_movement = 0
+        
+        for i in range(min(len(pre_balances), len(post_balances))):
+            change = abs(post_balances[i] - pre_balances[i])
+            # Skip very small changes (likely fees) and very large ones (likely pool reserves)
+            if change > 0.01 * 1e9 and change < 1000 * 1e9:
+                if change > max_sol_movement:
+                    max_sol_movement = change
+        
+        # If we found a reasonable movement, use it
+        if max_sol_movement > self.min_sol_value * 1e9:
+            return int(max_sol_movement)
+        
+        # Fallback: estimate based on typical pump.fun trade sizes
+        # Use 0.1 SOL as a conservative estimate
+        return int(0.1 * 1e9)
+    
     def _parse_from_balance_changes(
         self, 
         tx_data: Dict, 
@@ -289,19 +380,34 @@ class TransactionParser:
     ) -> Optional[ParsedSwap]:
         """
         Fallback parser that detects swaps from balance changes.
-        Works for any DEX.
+        Works for any DEX. Now with improved detection for edge cases.
         """
-        # Get pre and post token balances for this wallet
+        # Get pre and post token balances - check ALL accounts, not just wallet-owned
+        # because some DEXes route through intermediate accounts
         pre_balances = {}
         post_balances = {}
+        wallet_owned_pre = {}
+        wallet_owned_post = {}
         
         for b in meta.get("preTokenBalances", []):
+            mint = b.get("mint")
+            amount = int(b.get("uiTokenAmount", {}).get("amount", "0"))
             if b.get("owner") == wallet:
-                pre_balances[b.get("mint")] = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+                wallet_owned_pre[mint] = amount
+            # Track all balances
+            if mint not in pre_balances:
+                pre_balances[mint] = 0
+            pre_balances[mint] += amount
         
         for b in meta.get("postTokenBalances", []):
+            mint = b.get("mint")
+            amount = int(b.get("uiTokenAmount", {}).get("amount", "0"))
             if b.get("owner") == wallet:
-                post_balances[b.get("mint")] = int(b.get("uiTokenAmount", {}).get("amount", "0"))
+                wallet_owned_post[mint] = amount
+            # Track all balances
+            if mint not in post_balances:
+                post_balances[mint] = 0
+            post_balances[mint] += amount
         
         # Get SOL balance change
         account_keys = self._get_account_keys(
@@ -316,17 +422,30 @@ class TransactionParser:
             post_sol = meta.get("postBalances", [])[wallet_index]
             sol_change = post_sol - pre_sol
         
-        # Find the non-SOL/stable token that changed
+        # Also check wrapped SOL
+        wsol_change = self._get_wrapped_sol_change(meta, wallet)
+        total_sol_change = sol_change
+        if wsol_change != 0:
+            if abs(sol_change) < 0.01 * 1e9:
+                total_sol_change = wsol_change
+            elif (sol_change > 0 and wsol_change > 0) or (sol_change < 0 and wsol_change < 0):
+                total_sol_change = sol_change + wsol_change
+            else:
+                total_sol_change = sol_change if abs(sol_change) > abs(wsol_change) else wsol_change
+        
+        # Find the non-SOL/stable token that changed for THIS wallet
+        # Prefer wallet-owned changes, fall back to all changes
         token_mint = None
         token_change = 0
         
-        all_mints = set(pre_balances.keys()) | set(post_balances.keys())
-        for mint in all_mints:
+        # First try wallet-owned balances
+        all_wallet_mints = set(wallet_owned_pre.keys()) | set(wallet_owned_post.keys())
+        for mint in all_wallet_mints:
             if mint in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
                 continue
             
-            pre_amount = pre_balances.get(mint, 0)
-            post_amount = post_balances.get(mint, 0)
+            pre_amount = wallet_owned_pre.get(mint, 0)
+            post_amount = wallet_owned_post.get(mint, 0)
             change = post_amount - pre_amount
             
             if abs(change) > 0:
@@ -334,20 +453,52 @@ class TransactionParser:
                 token_change = change
                 break
         
+        # If no wallet-owned token changed, check all token changes
+        # (for cases where ownership isn't properly tagged)
+        if not token_mint:
+            all_mints = set(pre_balances.keys()) | set(post_balances.keys())
+            for mint in all_mints:
+                if mint in (NATIVE_SOL_MINT, USDC_MINT, USDT_MINT):
+                    continue
+                
+                pre_amount = pre_balances.get(mint, 0)
+                post_amount = post_balances.get(mint, 0)
+                change = post_amount - pre_amount
+                
+                # For non-wallet-owned, we look for significant changes that 
+                # correlate with SOL movement (indicating a swap)
+                if abs(change) > 0 and abs(total_sol_change) > 0.01 * 1e9:
+                    token_mint = mint
+                    token_change = change
+                    break
+        
         if not token_mint:
             return None
         
-        # Determine swap type
-        if token_change > 0 and sol_change < 0:
+        # Determine swap type with improved logic
+        swap_type = None
+        estimated_sol = abs(total_sol_change)
+        
+        if token_change > 0 and total_sol_change < 0:
             swap_type = SwapType.BUY
-        elif token_change < 0 and sol_change > 0:
+        elif token_change < 0 and total_sol_change > 0:
             swap_type = SwapType.SELL
-        else:
-            # Could be token-to-token swap, skip for now
+        elif token_change > 0 and total_sol_change >= 0:
+            # Infer buy from token gain
+            swap_type = SwapType.BUY
+            if estimated_sol < self.min_sol_value * 1e9:
+                estimated_sol = self._estimate_sol_from_pump_fun(tx_data, token_change)
+        elif token_change < 0 and total_sol_change <= 0:
+            # Infer sell from token loss
+            swap_type = SwapType.SELL
+            if estimated_sol < self.min_sol_value * 1e9:
+                estimated_sol = self._estimate_sol_from_pump_fun(tx_data, token_change)
+        
+        if not swap_type:
             return None
         
         # Filter by minimum SOL value
-        if abs(sol_change) / 1e9 < self.min_sol_value:
+        if estimated_sol / 1e9 < self.min_sol_value:
             return None
         
         signature = ""
@@ -359,7 +510,7 @@ class TransactionParser:
             swap_type=swap_type,
             token_mint=token_mint,
             token_symbol=None,
-            sol_amount=abs(sol_change),
+            sol_amount=int(estimated_sol),
             token_amount=abs(token_change),
             dex=dex,
             signature=signature,

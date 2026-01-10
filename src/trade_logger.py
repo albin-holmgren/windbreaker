@@ -13,8 +13,8 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Trade history file
-TRADE_HISTORY_FILE = "/windbreaker/trade_history.json"
+# Trade history file (relative to working directory)
+TRADE_HISTORY_FILE = "trade_history.json"
 
 
 @dataclass

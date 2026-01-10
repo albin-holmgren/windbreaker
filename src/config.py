@@ -138,7 +138,7 @@ def load_config(env_file: str = '.env') -> Config:
         copy_balance_pct=float(os.getenv('COPY_BALANCE_PCT', '50')),  # 50% of balance per copy
         copy_max_sol=float(os.getenv('COPY_MAX_SOL', '0.5')),  # Max 0.5 SOL per trade
         copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
-        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '1000')),  # Poll every 1 sec (faster!)
+        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '1000')),  # Poll every 1 sec (fast detection)
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
         exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.001')),  # 0.001 SOL per position for exit fees
@@ -147,7 +147,7 @@ def load_config(env_file: str = '.env') -> Config:
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
         min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
         min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '30000')),  # Min 30k USD 24h volume
-        max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '300')),  # Don't buy if pumped 300%+ in 1h
+        max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),  # 0 = disabled - trust trader's judgment on momentum
         min_txns_1h=int(os.getenv('MIN_TXNS_1H', '20')),  # At least 20 transactions in last hour
         max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%

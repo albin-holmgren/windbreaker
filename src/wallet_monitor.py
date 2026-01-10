@@ -46,6 +46,7 @@ class WalletMonitor:
         self.seen_signatures: Dict[str, Set[str]] = {w: set() for w in target_wallets}
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
+        self._poll_count = 0
         
     async def start(self) -> None:
         """Start the wallet monitor."""
@@ -65,8 +66,18 @@ class WalletMonitor:
         while self.running:
             try:
                 await self._poll_all_wallets()
+                self._poll_count += 1
+                
+                # Log heartbeat every 60 polls (~1 min at 1s interval)
+                if self._poll_count % 60 == 0:
+                    logger.info(
+                        "wallet_monitor_heartbeat",
+                        poll_count=self._poll_count,
+                        wallets=len(self.target_wallets),
+                        seen_sigs={w[:8]: len(s) for w, s in self.seen_signatures.items()}
+                    )
             except Exception as e:
-                logger.error("poll_error", error=str(e))
+                logger.error("poll_error", error=str(e), error_type=type(e).__name__)
             
             await asyncio.sleep(self.poll_interval)
     
@@ -103,10 +114,25 @@ class WalletMonitor:
             ]
         }
         
-        async with self.session.post(self.rpc_url, json=payload) as resp:
-            data = await resp.json()
+        try:
+            async with self.session.post(self.rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    logger.warning("rpc_http_error", wallet=wallet[:8], status=resp.status)
+                    return []
+                data = await resp.json()
+        except asyncio.TimeoutError:
+            logger.warning("rpc_timeout", wallet=wallet[:8])
+            return []
+        except Exception as e:
+            logger.warning("rpc_request_error", wallet=wallet[:8], error=str(e), error_type=type(e).__name__)
+            return []
+            
+        if "error" in data:
+            logger.warning("rpc_error", wallet=wallet[:8], error=data["error"])
+            return []
             
         if "result" not in data:
+            logger.debug("rpc_no_result", wallet=wallet[:8], response_keys=list(data.keys()))
             return []
         
         return [tx["signature"] for tx in data["result"]]
@@ -133,16 +159,30 @@ class WalletMonitor:
     
     async def _poll_all_wallets(self) -> None:
         """Poll all target wallets for new transactions."""
-        for wallet in self.target_wallets:
+        for i, wallet in enumerate(self.target_wallets):
             try:
                 await self._poll_wallet(wallet)
             except Exception as e:
-                logger.warning("poll_wallet_failed", wallet=wallet[:8], error=str(e))
+                logger.warning("poll_wallet_failed", wallet=wallet[:8], error=str(e), error_type=type(e).__name__)
+            
+            # Add delay between wallets to avoid RPC rate limiting (except after last wallet)
+            if i < len(self.target_wallets) - 1:
+                await asyncio.sleep(0.5)
     
     async def _poll_wallet(self, wallet: str) -> None:
         """Poll a single wallet for new transactions."""
         # Increased from 5 to 20 - active traders can do many transactions between polls
         signatures = await self._get_recent_signatures(wallet, limit=20)
+        
+        # Log polling status periodically (every poll shows we're alive)
+        new_count = sum(1 for sig in signatures if sig not in self.seen_signatures[wallet])
+        if new_count > 0:
+            logger.info(
+                "poll_found_new",
+                wallet=wallet[:8],
+                total_sigs=len(signatures),
+                new_sigs=new_count
+            )
         
         for sig in signatures:
             if sig in self.seen_signatures[wallet]:

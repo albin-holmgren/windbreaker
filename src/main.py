@@ -87,14 +87,17 @@ class CopyTradingBot:
         # Create RPC client
         self.rpc = RPCClient(self.config)
         
-        # Check balance
-        balance = await self.rpc.get_balance(self.wallet.pubkey)
-        balance_sol = balance / 1e9
-        logger.info("wallet_balance", balance_sol=f"{balance_sol:.4f}")
-        
-        if balance_sol < 0.05:
-            logger.warning("low_balance", 
-                          message="Balance is very low, may not be able to execute trades")
+        # Check balance (non-fatal if it fails - don't crash on RPC issues at startup)
+        try:
+            balance = await self.rpc.get_balance(self.wallet.pubkey)
+            balance_sol = balance / 1e9
+            logger.info("wallet_balance", balance_sol=f"{balance_sol:.4f}")
+            
+            if balance_sol < 0.05:
+                logger.warning("low_balance", 
+                              message="Balance is very low, may not be able to execute trades")
+        except Exception as e:
+            logger.warning("balance_check_failed", error=str(e), message="Continuing without balance check")
         
         # Create copy trader
         self.copy_trader = CopyTrader(

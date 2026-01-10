@@ -296,6 +296,12 @@ class CopyTrader:
         sol_received = current_value if current_value > 0 else 0
         pnl = sol_received - entry_sol
         
+        # Calculate hold duration before removing entry_times
+        entry_times = state.get('entry_times', {})
+        entry_time = entry_times.get(mint, time.time())
+        hold_seconds = time.time() - entry_time
+        hold_minutes = hold_seconds / 60
+        
         # Add SOL to wallet's mock balance
         state['balance'] = state.get('balance', 1.0) + sol_received
         
@@ -329,7 +335,8 @@ class CopyTrader:
             'pnl': pnl,
             'reason': reason,
             'balance_after': state['balance'],
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'hold_minutes': hold_minutes
         })
         
         # Save state for this wallet
@@ -585,16 +592,8 @@ class CopyTrader:
         
         # For buys, check position limits (but allow stacking same token)
         if swap.is_buy:
-            # Check sell cooldown - don't buy tokens the trader just sold
-            # This prevents us from getting out of sync (buying after they exit)
-            if swap.token_mint in self.trader_sold_cooldown:
-                cooldown_elapsed = time.time() - self.trader_sold_cooldown[swap.token_mint]
-                if cooldown_elapsed < self.sell_cooldown_seconds:
-                    remaining = self.sell_cooldown_seconds - cooldown_elapsed
-                    return False, f"sell_cooldown_active ({remaining:.0f}s remaining)"
-                else:
-                    # Cooldown expired, remove from tracking
-                    del self.trader_sold_cooldown[swap.token_mint]
+            # NOTE: Removed sell cooldown check - it was blocking profitable re-entries
+            # when we missed the initial buy but the trader re-bought after selling
             
             # Check if we can open more positions (only for NEW tokens)
             if self.position_manager:
@@ -625,14 +624,16 @@ class CopyTrader:
                 token_balance = await self._get_token_balance(swap.token_mint, swap.wallet)
                 if token_balance == 0:
                     logger.debug("no_tokens_to_sell", token=swap.token_mint[:8])
-                    # Track this sell - don't buy this token for a cooldown period
-                    # This prevents us from buying right after trader exits
-                    self.trader_sold_cooldown[swap.token_mint] = time.time()
+                    # DON'T trigger cooldown when we never had a position!
+                    # Old logic was blocking profitable re-entries when:
+                    # 1. Trader buys (we miss due to filters/timing)
+                    # 2. Trader sells (we have nothing to sell)
+                    # 3. Trader re-buys (we were blocked by cooldown!)
+                    # Now we only log this as informational and allow future buys
                     logger.info(
-                        "sell_cooldown_started",
+                        "missed_sell_opportunity",
                         token=swap.token_mint[:8],
-                        cooldown_seconds=self.sell_cooldown_seconds,
-                        reason="trader_sold_but_we_had_no_position"
+                        reason="never_had_position"
                     )
                     return CopyTradeResult(success=False, error="no_tokens_to_sell", original_swap=swap)
                 
@@ -745,18 +746,32 @@ class CopyTrader:
                     logger.debug("pumpfun_api_failed_trying_dexscreener", token=swap.token_mint[:8])
                     market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
                 
-                # If still no data, skip
+                # If still no data, trust trader if enabled (these are early entries!)
                 if market_cap == 0 and age_minutes == 0:
-                    logger.info(
-                        "skipping_unknown_token",
-                        token=swap.token_mint[:8],
-                        reason="no_data_available"
-                    )
-                    return CopyTradeResult(
-                        success=False,
-                        error="token_unknown (not found on pump.fun or DexScreener)",
-                        original_swap=swap
-                    )
+                    if self.trust_trader_pumpfun:
+                        logger.info(
+                            "trust_trader_unknown_pumpfun",
+                            token=swap.token_mint[:8],
+                            message="Token not found on APIs but trusting trader - early entry!"
+                        )
+                        # Set defaults for unknown token - assume it's brand new
+                        market_cap = 50000  # Assume small cap
+                        age_minutes = 0.5   # Very new
+                        liquidity = 5000    # Low liquidity
+                        volume_24h = 1000
+                        price_change_1h = 0
+                        txns_1h = 100
+                    else:
+                        logger.info(
+                            "skipping_unknown_token",
+                            token=swap.token_mint[:8],
+                            reason="no_data_available"
+                        )
+                        return CopyTradeResult(
+                            success=False,
+                            error="token_unknown (not found on pump.fun or DexScreener)",
+                            original_swap=swap
+                        )
                 
                 logger.info(
                     "pumpfun_token_info",
@@ -769,32 +784,21 @@ class CopyTrader:
                 # Use DexScreener for other DEXes
                 market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
                 
-                # If not on DexScreener, skip (unless trusting trader)
+                # If not on DexScreener, ALWAYS trust trader - they're buying for a reason!
+                # These are often the best early entries that APIs don't know about yet
                 if market_cap == 0 and age_minutes == 0:
-                    if self.trust_trader_pumpfun:  # Trust trader mode applies to all
-                        logger.info(
-                            "trust_trader_unknown_token",
-                            token=swap.token_mint[:8],
-                            message="Token not on DexScreener but trusting trader"
-                        )
-                        # Set defaults for unknown token
-                        market_cap = 100000
-                        age_minutes = 1
-                        liquidity = 10000
-                        volume_24h = 1000
-                        price_change_1h = 0
-                        txns_1h = 100
-                    else:
-                        logger.info(
-                            "skipping_unknown_token",
-                            token=swap.token_mint[:8],
-                            reason="not_on_dexscreener"
-                        )
-                        return CopyTradeResult(
-                            success=False,
-                            error="token_unknown (not on DexScreener yet)",
-                            original_swap=swap
-                        )
+                    logger.info(
+                        "trust_trader_unknown_token",
+                        token=swap.token_mint[:8],
+                        message="Token not on DexScreener - trusting trader's early entry!"
+                    )
+                    # Set defaults for unknown token - assume brand new
+                    market_cap = 50000
+                    age_minutes = 0.5
+                    liquidity = 5000
+                    volume_24h = 1000
+                    price_change_1h = 0
+                    txns_1h = 100
             
             # Skip all filters in trust trader mode
             skip_filters = self.trust_trader_pumpfun
@@ -1344,6 +1348,12 @@ class CopyTrader:
         entry_sol = entry_sol_map.get(swap.token_mint, 0)
         pnl = sol_received - entry_sol
         
+        # Calculate hold duration
+        entry_times = state.get('entry_times', {})
+        entry_time = entry_times.get(swap.token_mint, time.time())
+        hold_seconds = time.time() - entry_time
+        hold_minutes = hold_seconds / 60
+        
         # Add SOL to wallet's mock balance
         state['balance'] = state.get('balance', 1.0) + sol_received
         
@@ -1375,7 +1385,8 @@ class CopyTrader:
             'entry_sol': entry_sol,
             'pnl': pnl,
             'balance_after': state['balance'],
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'hold_minutes': hold_minutes
         })
         
         # Save state for this wallet

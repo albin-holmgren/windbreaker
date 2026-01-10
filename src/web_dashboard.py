@@ -178,7 +178,7 @@ DASHBOARD_HTML = '''
                                 <th class="px-6 py-4">Type</th>
                                 <th class="px-6 py-4">SOL</th>
                                 <th class="px-6 py-4">PnL</th>
-                                <th class="px-6 py-4">Time</th>
+                                <th class="px-6 py-4">Held</th>
                             </tr>
                         </thead>
                         <tbody id="closedTradesBody" class="text-sm">
@@ -360,7 +360,16 @@ DASHBOARD_HTML = '''
                     const fullMint = t.full_mint || '';
                     const sol = t.sol || t.sol_amount || 0;
                     const pnl = t.pnl;
-                    const time = t.timestamp || t.created_at;
+                    const holdMins = t.hold_minutes;
+                    
+                    // Format hold duration
+                    let holdStr = '-';
+                    if (holdMins !== null && holdMins !== undefined) {
+                        if (holdMins < 1) holdStr = Math.floor(holdMins * 60) + 's';
+                        else if (holdMins < 60) holdStr = Math.floor(holdMins) + 'm';
+                        else if (holdMins < 1440) holdStr = (holdMins / 60).toFixed(1) + 'h';
+                        else holdStr = (holdMins / 1440).toFixed(1) + 'd';
+                    }
                     
                     return `
                         <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
@@ -374,7 +383,7 @@ DASHBOARD_HTML = '''
                             <td class="px-6 py-4 text-neutral-300">
                                 ${pnl !== null && pnl !== undefined ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) : '-'}
                             </td>
-                            <td class="px-6 py-4 text-neutral-500">${formatTime(time)}</td>
+                            <td class="px-6 py-4 text-neutral-500">${holdStr}</td>
                         </tr>
                     `;
                 }).join('');
