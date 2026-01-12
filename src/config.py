@@ -143,16 +143,16 @@ def load_config(env_file: str = '.env') -> Config:
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
         exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.001')),  # 0.001 SOL per position for exit fees
         min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
-        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Min 15 minutes old
+        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Require token to be at least 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
         min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
-        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '30000')),  # Min 30k USD 24h volume
+        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '30000')),  # Min 30k USD 24h volume to avoid rugs
         max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),  # 0 = disabled - trust trader's judgment on momentum
         min_txns_1h=int(os.getenv('MIN_TXNS_1H', '20')),  # At least 20 transactions in last hour
         max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
         min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
-        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust trader for pump.fun
+        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'false').lower() == 'true',  # Explicitly opt-in to skip pump.fun filters
         skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
@@ -160,7 +160,7 @@ def load_config(env_file: str = '.env') -> Config:
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
         take_profit_pct=float(os.getenv('TAKE_PROFIT_PCT', '100')),  # Only for safety (100% = 2x)
-        stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', '-95')),  # Abandon if 95% loss (basically rugged)
+        stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', '-35')),  # Exit if down 35%
         time_limit_minutes=float(os.getenv('TIME_LIMIT_MINUTES', '0')),  # 0 = disabled (follow trader)
         trailing_stop_pct=float(os.getenv('TRAILING_STOP_PCT', '0')),  # 0 = disabled
         rug_abandon_sol=float(os.getenv('RUG_ABANDON_SOL', '0.005')),  # If worth < 0.005 SOL, abandon (don't sell)

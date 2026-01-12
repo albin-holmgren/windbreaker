@@ -176,13 +176,14 @@ DASHBOARD_HTML = '''
                             <tr>
                                 <th class="px-6 py-4">Token</th>
                                 <th class="px-6 py-4">Type</th>
-                                <th class="px-6 py-4">SOL</th>
+                                <th class="px-6 py-4">Entry</th>
+                                <th class="px-6 py-4">Received</th>
                                 <th class="px-6 py-4">PnL</th>
                                 <th class="px-6 py-4">Held</th>
                             </tr>
                         </thead>
                         <tbody id="closedTradesBody" class="text-sm">
-                            <tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>
+                            <tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -358,7 +359,8 @@ DASHBOARD_HTML = '''
                 const closedHtml = closedTrades.slice(-20).reverse().map(t => {
                     const token = t.token || t.token_mint?.slice(0, 8) || 'Unknown';
                     const fullMint = t.full_mint || '';
-                    const sol = t.sol || t.sol_amount || 0;
+                    const solReceived = t.sol || t.sol_amount || 0;
+                    const entrySol = t.entry_sol || 0;
                     const pnl = t.pnl;
                     const holdMins = t.hold_minutes;
                     
@@ -371,6 +373,8 @@ DASHBOARD_HTML = '''
                         else holdStr = (holdMins / 1440).toFixed(1) + 'd';
                     }
                     
+                    const pnlClass = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-neutral-300';
+                    
                     return `
                         <tr class="border-b border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
                             <td class="px-6 py-4">
@@ -379,8 +383,9 @@ DASHBOARD_HTML = '''
                             <td class="px-6 py-4">
                                 <span class="text-neutral-400">SELL</span>
                             </td>
-                            <td class="px-6 py-4 text-neutral-400">${Number(sol).toFixed(4)}</td>
-                            <td class="px-6 py-4 text-neutral-300">
+                            <td class="px-6 py-4 text-neutral-400">${Number(entrySol).toFixed(4)}</td>
+                            <td class="px-6 py-4 text-neutral-400">${Number(solReceived).toFixed(4)}</td>
+                            <td class="px-6 py-4 ${pnlClass}">
                                 ${pnl !== null && pnl !== undefined ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) : '-'}
                             </td>
                             <td class="px-6 py-4 text-neutral-500">${holdStr}</td>
@@ -389,7 +394,7 @@ DASHBOARD_HTML = '''
                 }).join('');
                 document.getElementById('closedTradesBody').innerHTML = closedHtml;
             } else {
-                document.getElementById('closedTradesBody').innerHTML = '<tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>';
+                document.getElementById('closedTradesBody').innerHTML = '<tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>';
             }
             
             document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
