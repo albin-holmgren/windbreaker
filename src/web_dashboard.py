@@ -265,6 +265,15 @@ DASHBOARD_HTML = '''
             try {
                 const response = await fetch('/api/stats?wallet=' + currentWallet);
                 currentData = await response.json();
+                if (currentData.error) {
+                    console.error('API error:', currentData.error);
+                    // Use defaults on error
+                    currentData = {
+                        balance: 0, starting_balance: 0, open_positions: 0,
+                        buys: 0, sells: 0, positions: {}, entry_sol: {}, entry_times: {},
+                        trades: [], tracked_wallet: walletConfigs[currentWallet]?.address || ''
+                    };
+                }
                 updateUI(currentData);
             } catch (e) {
                 console.error('Failed to fetch data:', e);
@@ -564,8 +573,11 @@ class WebDashboard:
         try:
             with open(file_to_load, 'r') as f:
                 return json.load(f)
-        except FileNotFoundError:
-            return {'starting_balance': 1.0, 'balance': 1.0, 'positions': {}, 'trades_history': []}
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Return defaults - use 0 for real wallet, 1 for mock wallets
+            is_real = 'real' in (file_to_load or '')
+            default_balance = 0.0 if is_real else 1.0
+            return {'starting_balance': default_balance, 'balance': default_balance, 'positions': {}, 'trades_history': [], 'entry_sol': {}, 'entry_times': {}}
     
     def _load_json_stats(self, state_file: str = None) -> Dict[str, Any]:
         """Load stats from JSON file."""
@@ -574,14 +586,18 @@ class WebDashboard:
         sells = [t for t in state.get('trades_history', []) if t.get('type') in ('sell', 'auto_sell')]
         realized_pnl = sum(t.get('pnl', 0) for t in sells if t.get('pnl') is not None)
         
+        starting_bal = state.get('starting_balance', 0) or 1.0  # Avoid division by zero
+        balance = state.get('balance', 0)
+        total_return_pct = ((balance + realized_pnl - starting_bal) / starting_bal * 100) if starting_bal > 0 else 0
+        
         return {
-            'starting_balance': state.get('starting_balance', 1.0),
-            'balance': state.get('balance', 1.0),
+            'starting_balance': state.get('starting_balance', 0),
+            'balance': balance,
             'open_positions': len([v for v in state.get('positions', {}).values() if v > 0]),
             'buys': len(buys),
             'sells': len(sells),
             'realized_pnl': realized_pnl,
-            'total_return_pct': ((state.get('balance', 1.0) + realized_pnl - state.get('starting_balance', 1.0)) / state.get('starting_balance', 1.0) * 100),
+            'total_return_pct': total_return_pct,
             'positions': state.get('positions', {}),
             'entry_sol': state.get('entry_sol', {}),
             'entry_times': state.get('entry_times', {}),
