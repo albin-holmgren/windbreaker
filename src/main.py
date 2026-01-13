@@ -144,8 +144,12 @@ class CopyTradingBot:
         )
         
         try:
-            # Start web dashboard
-            self.dashboard = WebDashboard(state_file=self.state_file)
+            # Start web dashboard with RPC client and wallet for real-time balance
+            self.dashboard = WebDashboard(
+                state_file=self.state_file,
+                rpc_client=self.rpc,
+                wallet_keypair=self.wallet
+            )
             await self.dashboard.start()
             
             # Start copy trader (this blocks)

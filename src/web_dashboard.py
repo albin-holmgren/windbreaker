@@ -17,7 +17,7 @@ logger = structlog.get_logger()
 WALLET_CONFIGS = {
     'real': {
         'name': 'Real',
-        'address': 'HjjBujnySvtMbWx5uexA2JCb7x575binjCwgkapTEsme',  # Bot's wallet
+        'address': 'x1ULQweY5qNirmn9zUhyVM4kS7jRQYe9B2a4eHPXQA6',  # Bot's wallet
         'state_file': 'real_state.json',
         'is_real': True
     },
@@ -205,7 +205,7 @@ DASHBOARD_HTML = '''
         let currentWallet = 'real';
         
         const walletConfigs = {
-            'real': { name: 'Real', address: 'HjjBujnySvtMbWx5uexA2JCb7x575binjCwgkapTEsme', isReal: true },
+            'real': { name: 'Real', address: 'x1ULQweY5qNirmn9zUhyVM4kS7jRQYe9B2a4eHPXQA6', isReal: true },
             'cented': { name: 'Cented', address: 'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o' },
             'cupsey': { name: 'Cupsey', address: '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f' },
             'jijo': { name: 'Jijo', address: '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk' }
@@ -437,9 +437,11 @@ DASHBOARD_HTML = '''
 class WebDashboard:
     """Web dashboard server for monitoring the bot."""
     
-    def __init__(self, db=None, state_file: str = 'mock_state.json'):
+    def __init__(self, db=None, state_file: str = 'mock_state.json', rpc_client=None, wallet_keypair=None):
         self.db = db
         self.state_file = state_file
+        self.rpc_client = rpc_client
+        self.wallet_keypair = wallet_keypair
         self.app = web.Application()
         self.runner = None
         self._setup_routes()
@@ -464,6 +466,7 @@ class WebDashboard:
             # Get wallet from query param, default to real
             wallet_id = request.query.get('wallet', 'real')
             wallet_config = WALLET_CONFIGS.get(wallet_id, WALLET_CONFIGS['real'])
+            is_real_wallet = wallet_config.get('is_real', False)
             
             if self.db:
                 stats = await self.db.get_stats()
@@ -474,6 +477,17 @@ class WebDashboard:
             else:
                 stats = self._load_json_stats(wallet_config['state_file'])
                 stats['tracked_wallet'] = wallet_config['address']
+                
+                # For real wallet, fetch actual on-chain balance
+                if is_real_wallet and self.rpc_client and self.wallet_keypair:
+                    try:
+                        balance_resp = await self.rpc_client.get_balance(self.wallet_keypair.pubkey())
+                        balance_lamports = balance_resp.value
+                        balance_sol = balance_lamports / 1e9
+                        stats['balance'] = balance_sol
+                        stats['starting_balance'] = balance_sol  # For real wallet, current balance is the starting point
+                    except Exception as e:
+                        logger.warning("failed_to_fetch_real_balance", error=str(e))
             
             return web.json_response(stats)
         except Exception as e:
