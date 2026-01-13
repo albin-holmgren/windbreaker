@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Dict, Any, List
 from aiohttp import web
 import structlog
+from solders.pubkey import Pubkey  # For real balance fetch
 
 logger = structlog.get_logger()
 
@@ -481,8 +482,18 @@ class WebDashboard:
                 # For real wallet, fetch actual on-chain balance
                 if is_real_wallet and self.rpc_client and self.wallet_keypair:
                     try:
-                        balance_resp = await self.rpc_client.get_balance(self.wallet_keypair.pubkey())
-                        balance_lamports = balance_resp.value
+                        pubkey_attr = getattr(self.wallet_keypair, "pubkey", None)
+                        pubkey_obj = None
+                        if pubkey_attr:
+                            pubkey_obj = pubkey_attr() if callable(pubkey_attr) else pubkey_attr
+                        elif hasattr(self.wallet_keypair, "address"):
+                            from solders.pubkey import Pubkey
+                            pubkey_obj = Pubkey.from_string(self.wallet_keypair.address)
+                        
+                        if not pubkey_obj:
+                            raise ValueError("wallet pubkey unavailable")
+                        
+                        balance_lamports = await self.rpc_client.get_balance(pubkey_obj)
                         balance_sol = balance_lamports / 1e9
                         stats['balance'] = balance_sol
                         stats['starting_balance'] = balance_sol  # For real wallet, current balance is the starting point
