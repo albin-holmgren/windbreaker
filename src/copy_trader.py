@@ -1121,9 +1121,9 @@ class CopyTrader:
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
-                            our_sol=trade_sol,
-                            our_tokens=estimated_tokens,
-                            our_signature=result.signature,
+                            entry_sol=trade_sol,
+                            token_amount=estimated_tokens,
+                            entry_signature=result.signature or "",
                             copied_from=swap.wallet,
                             dex="pump.fun" if is_pumpfun else swap.dex
                         )
