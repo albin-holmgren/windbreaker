@@ -1073,34 +1073,44 @@ class CopyTrader:
                  (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
             )
             
-            if is_pumpfun:
-                # Use Pump.fun API for bonding curve tokens
-                if self.mock_trading:
-                    result = self._simulate_mock_buy(swap, trade_sol)
-                if should_execute_real:
+            real_result = None
+            mock_result = None
+
+            # Execute real trade first so we only update mock state if real succeeded
+            if should_execute_real:
+                if is_pumpfun:
                     real_result = await self._execute_pumpfun_swap(
                         token_mint=swap.token_mint,
                         sol_amount=trade_sol,
                         is_buy=True
                     )
-                    if not self.mock_trading:
-                        result = real_result
-                    elif real_result.success:
-                        logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
-            else:
-                if self.mock_trading:
-                    result = self._simulate_mock_buy(swap, trade_sol)
-                if should_execute_real:
-                    # Use Jupiter for Raydium/other DEXes
+                else:
                     real_result = await self._execute_swap(
                         input_mint=NATIVE_SOL,
                         output_mint=swap.token_mint,
                         amount=trade_lamports
                     )
-                    if not self.mock_trading:
-                        result = real_result
-                    elif real_result.success:
-                        logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
+                
+                if not real_result.success:
+                    logger.error(
+                        "real_trade_failed",
+                        token=swap.token_mint[:8],
+                        sol=f"{trade_sol:.4f}",
+                        error=real_result.error
+                    )
+                    return real_result
+                
+                logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
+            
+            # Simulate/mock trade after real succeeds (or when real disabled)
+            if self.mock_trading:
+                mock_result = self._simulate_mock_buy(swap, trade_sol)
+            
+            # Determine which result to return for downstream logic
+            if self.mock_trading:
+                result = mock_result
+            else:
+                result = real_result
             
             if result.success:
                 # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
@@ -1134,7 +1144,7 @@ class CopyTrader:
                         token_symbol=swap.token_symbol,
                         our_sol=trade_sol,
                         our_tokens=estimated_tokens,
-                        our_signature=result.signature,
+                        our_signature=(real_result.signature if real_result else result.signature),
                         copied_wallet=swap.wallet,
                         their_sol=swap.sol_value,
                         their_signature=swap.signature,
