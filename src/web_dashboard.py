@@ -75,7 +75,7 @@ DASHBOARD_HTML = '''
         <!-- Wallet Tabs -->
         <div class="flex items-center gap-1 mb-6 border-b border-neutral-800 pb-0">
             <button onclick="switchWallet('real')" id="wallet-real" class="wallet-tab active px-4 py-3 text-sm font-medium text-green-400 border border-green-500/30 rounded-t bg-green-500/10">
-                💰 Real
+                Real
             </button>
             <button onclick="switchWallet('cented')" id="wallet-cented" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
                 Cented
