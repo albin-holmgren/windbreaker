@@ -15,10 +15,11 @@ logger = structlog.get_logger()
 
 # Wallet configurations for tabs
 WALLET_CONFIGS = {
-    'slingor': {
-        'name': 'Slingor',
-        'address': '6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd',
-        'state_file': 'mock_state.json'
+    'real': {
+        'name': 'Real',
+        'address': 'HjjBujnySvtMbWx5uexA2JCb7x575binjCwgkapTEsme',  # Bot's wallet
+        'state_file': 'real_state.json',
+        'is_real': True
     },
     'cented': {
         'name': 'Cented',
@@ -73,8 +74,8 @@ DASHBOARD_HTML = '''
     <div class="max-w-7xl mx-auto px-6 py-8">
         <!-- Wallet Tabs -->
         <div class="flex items-center gap-1 mb-6 border-b border-neutral-800 pb-0">
-            <button onclick="switchWallet('slingor')" id="wallet-slingor" class="wallet-tab active px-4 py-3 text-sm font-medium text-neutral-400">
-                Slingor
+            <button onclick="switchWallet('real')" id="wallet-real" class="wallet-tab active px-4 py-3 text-sm font-medium text-green-400 border border-green-500/30 rounded-t bg-green-500/10">
+                💰 Real
             </button>
             <button onclick="switchWallet('cented')" id="wallet-cented" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
                 Cented
@@ -180,10 +181,11 @@ DASHBOARD_HTML = '''
                                 <th class="px-6 py-4">Received</th>
                                 <th class="px-6 py-4">PnL</th>
                                 <th class="px-6 py-4">Held</th>
+                                <th class="px-6 py-4">Closed</th>
                             </tr>
                         </thead>
                         <tbody id="closedTradesBody" class="text-sm">
-                            <tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>
+                            <tr><td colspan="7" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -200,10 +202,10 @@ DASHBOARD_HTML = '''
     <script>
         let currentData = null;
         let isRefreshing = false;
-        let currentWallet = 'slingor';
+        let currentWallet = 'real';
         
         const walletConfigs = {
-            'slingor': { name: 'Slingor', address: '6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd' },
+            'real': { name: 'Real', address: 'HjjBujnySvtMbWx5uexA2JCb7x575binjCwgkapTEsme', isReal: true },
             'cented': { name: 'Cented', address: 'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o' },
             'cupsey': { name: 'Cupsey', address: '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f' },
             'jijo': { name: 'Jijo', address: '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk' }
@@ -373,6 +375,19 @@ DASHBOARD_HTML = '''
                         else holdStr = (holdMins / 1440).toFixed(1) + 'd';
                     }
                     
+                    // Format closed ago time
+                    let closedStr = '-';
+                    if (t.timestamp) {
+                        const closedDate = new Date(t.timestamp);
+                        const now = new Date();
+                        const diffMs = now - closedDate;
+                        const diffMins = diffMs / 60000;
+                        if (diffMins < 1) closedStr = Math.floor(diffMs / 1000) + 's ago';
+                        else if (diffMins < 60) closedStr = Math.floor(diffMins) + 'm ago';
+                        else if (diffMins < 1440) closedStr = (diffMins / 60).toFixed(1) + 'h ago';
+                        else closedStr = (diffMins / 1440).toFixed(1) + 'd ago';
+                    }
+                    
                     const pnlClass = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-neutral-300';
                     
                     return `
@@ -389,12 +404,13 @@ DASHBOARD_HTML = '''
                                 ${pnl !== null && pnl !== undefined ? (pnl >= 0 ? '+' : '') + pnl.toFixed(4) : '-'}
                             </td>
                             <td class="px-6 py-4 text-neutral-500">${holdStr}</td>
+                            <td class="px-6 py-4 text-neutral-500">${closedStr}</td>
                         </tr>
                     `;
                 }).join('');
                 document.getElementById('closedTradesBody').innerHTML = closedHtml;
             } else {
-                document.getElementById('closedTradesBody').innerHTML = '<tr><td colspan="6" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>';
+                document.getElementById('closedTradesBody').innerHTML = '<tr><td colspan="7" class="px-6 py-8 text-center text-neutral-600">No closed trades</td></tr>';
             }
             
             document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
@@ -436,9 +452,9 @@ class WebDashboard:
     async def handle_stats(self, request):
         """Get trading statistics."""
         try:
-            # Get wallet from query param, default to slingor
-            wallet_id = request.query.get('wallet', 'slingor')
-            wallet_config = WALLET_CONFIGS.get(wallet_id, WALLET_CONFIGS['slingor'])
+            # Get wallet from query param, default to real
+            wallet_id = request.query.get('wallet', 'real')
+            wallet_config = WALLET_CONFIGS.get(wallet_id, WALLET_CONFIGS['real'])
             
             if self.db:
                 stats = await self.db.get_stats()

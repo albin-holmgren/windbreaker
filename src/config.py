@@ -146,7 +146,7 @@ def load_config(env_file: str = '.env') -> Config:
         min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Require token to be at least 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
         min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
-        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '30000')),  # Min 30k USD 24h volume to avoid rugs
+        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '0')),  # Disabled - early meme coins have low volume
         max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),  # 0 = disabled - trust trader's judgment on momentum
         min_txns_1h=int(os.getenv('MIN_TXNS_1H', '20')),  # At least 20 transactions in last hour
         max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%

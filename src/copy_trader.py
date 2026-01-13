@@ -24,7 +24,6 @@ logger = structlog.get_logger(__name__)
 
 # Wallet-to-state-file mapping for multi-wallet tracking
 WALLET_STATE_FILES = {
-    '6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd': 'mock_state.json',  # Slingor
     'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o': 'mock_state_cented.json',  # Cented
     '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f': 'mock_state_cupsey.json',  # Cupsey
     '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk': 'mock_state_jijo.json',  # Jijo
@@ -130,6 +129,9 @@ class CopyTrader:
         
         # Mock trading support - now per-wallet
         self.mock_trading = self.config.mock_trading
+        # Real trading can run alongside mock (for actual execution while still tracking mock stats)
+        self.real_trading_enabled = os.getenv('REAL_TRADING_ENABLED', 'false').lower() == 'true'
+        self.real_trading_wallet = os.getenv('REAL_TRADING_FOLLOW', '')  # Which wallet to copy for real trades
         self.trader_sold_cooldown: Dict[str, float] = {}  # mint -> timestamp when trader sold
         self.sell_cooldown_seconds = 60
         # Max age before abandoning
@@ -157,8 +159,8 @@ class CopyTrader:
         self.session = aiohttp.ClientSession()
         self.running = True
         
-        # Create position manager unless we're in mock mode
-        if not self.mock_trading:
+        # Create position manager for real trading (either standalone or alongside mock)
+        if not self.mock_trading or self.real_trading_enabled:
             self.position_manager = PositionManager(
                 config=self.config,
                 wallet_keypair=self.wallet,
@@ -172,6 +174,12 @@ class CopyTrader:
                 mcap_stop_loss_usd=self.config.mcap_stop_loss_usd,
             )
             await self.position_manager.start()
+            if self.real_trading_enabled:
+                logger.info(
+                    "real_trading_enabled",
+                    follow_wallet=self.real_trading_wallet[:8] if self.real_trading_wallet else "all",
+                    alongside_mock=self.mock_trading
+                )
         
         # Create wallet monitor
         self.monitor = WalletMonitor(
@@ -210,9 +218,10 @@ class CopyTrader:
     
     async def _cleanup_stale_mock_positions(self) -> None:
         """Check mock positions for stop-loss and rug detection across all wallets."""
-        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '500'))
-        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '2000'))
+        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '5000'))
+        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '10000'))
         STOP_LOSS_PCT = self.config.stop_loss_pct  # e.g. -35 means exit at -35%
+        RUG_DROP_PCT = float(os.getenv('RUG_DROP_PCT', '-50'))  # Sell if price drops 50% in 1h (rug signal)
         
         # Iterate over all tracked wallets
         for wallet, state in self.wallet_states.items():
@@ -252,6 +261,13 @@ class CopyTrader:
                             if pnl_pct <= STOP_LOSS_PCT:
                                 reason = f"stop_loss_triggered ({pnl_pct:.1f}% < {STOP_LOSS_PCT}%)"
                                 should_sell = True
+                    
+                    # Rug detection: sudden price drop in last hour (e.g. -50%)
+                    if not should_sell and price_change_1h <= RUG_DROP_PCT:
+                        reason = f"rug_sudden_drop ({price_change_1h:.1f}% in 1h < {RUG_DROP_PCT}%)"
+                        should_sell = True
+                        if current_value == 0:
+                            current_value = entry_sol * 0.3  # Assume 70% loss if no price
                     
                     # Check how long we've held this position
                     entry_times = state.get('entry_times', {})
@@ -675,8 +691,17 @@ class CopyTrader:
                 # Detect if this is a pump.fun token
                 is_pumpfun_sell = swap.dex == "pump.fun"
                 
+                # Check if we should execute real sell
+                should_execute_real = (
+                    not self.mock_trading or 
+                    (self.real_trading_enabled and 
+                     (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
+                )
+                
                 if self.mock_trading:
-                    return self._simulate_mock_sell(swap, token_balance)
+                    mock_result = self._simulate_mock_sell(swap, token_balance)
+                    if not should_execute_real:
+                        return mock_result
 
                 # AGGRESSIVE RETRY LOOP with exponential backoff
                 max_retries = 5
@@ -1041,26 +1066,41 @@ class CopyTrader:
             )
             
             # Buy: Use appropriate API based on DEX
+            # Check if we should execute real trade (either real-only mode, or real+mock mode for specific wallet)
+            should_execute_real = (
+                not self.mock_trading or 
+                (self.real_trading_enabled and 
+                 (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
+            )
+            
             if is_pumpfun:
                 # Use Pump.fun API for bonding curve tokens
                 if self.mock_trading:
                     result = self._simulate_mock_buy(swap, trade_sol)
-                else:
-                    result = await self._execute_pumpfun_swap(
+                if should_execute_real:
+                    real_result = await self._execute_pumpfun_swap(
                         token_mint=swap.token_mint,
                         sol_amount=trade_sol,
                         is_buy=True
                     )
+                    if not self.mock_trading:
+                        result = real_result
+                    elif real_result.success:
+                        logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
             else:
                 if self.mock_trading:
                     result = self._simulate_mock_buy(swap, trade_sol)
-                else:
+                if should_execute_real:
                     # Use Jupiter for Raydium/other DEXes
-                    result = await self._execute_swap(
+                    real_result = await self._execute_swap(
                         input_mint=NATIVE_SOL,
                         output_mint=swap.token_mint,
                         amount=trade_lamports
                     )
+                    if not self.mock_trading:
+                        result = real_result
+                    elif real_result.success:
+                        logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
             
             if result.success:
                 # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
