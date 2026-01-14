@@ -27,6 +27,9 @@ class Config:
     trade_balance_pct: float  # Percentage of balance to trade (0-100)
     fee_reserve_sol: float  # SOL to reserve for tx fees
     slippage_bps: int
+    slippage_steps_bps: str  # Comma-separated list of slippage bps to try
+    jupiter_priority_fee_lamports: int
+    pumpfun_priority_fee_sol: float
     poll_interval_ms: int
     
     # Jupiter API
@@ -61,6 +64,7 @@ class Config:
     skip_creator_tokens: bool  # If true, skip tokens created by the tracked wallet (avoid pump and dumps)
     mock_trading: bool  # If true, simulate trades without sending transactions
     mock_balance_sol: float  # Starting SOL balance for mock trading
+    sync_mock_with_real: bool  # If true, only record mock trades when real execution succeeds
     
     # Position Management
     max_positions: int  # Maximum concurrent positions
@@ -122,6 +126,9 @@ def load_config(env_file: str = '.env') -> Config:
         trade_balance_pct=float(os.getenv('TRADE_BALANCE_PCT', '80')),  # 80% of balance
         fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.05')),  # Reserve 0.05 SOL for fees
         slippage_bps=int(os.getenv('SLIPPAGE_BPS', '50')),
+        slippage_steps_bps=os.getenv('SLIPPAGE_STEPS_BPS', '50,100,200'),
+        jupiter_priority_fee_lamports=int(os.getenv('JUPITER_PRIORITY_FEE_LAMPORTS', '500000')),
+        pumpfun_priority_fee_sol=float(os.getenv('PUMPFUN_PRIORITY_FEE_SOL', '0.001')),
         poll_interval_ms=int(os.getenv('POLL_INTERVAL_MS', '500')),
         
         # Jupiter API
@@ -156,6 +163,7 @@ def load_config(env_file: str = '.env') -> Config:
         skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
+        sync_mock_with_real=os.getenv('SYNC_MOCK_WITH_REAL', 'true').lower() == 'true',
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once

@@ -111,7 +111,25 @@ class CopyTrader:
         self.max_dev_holdings_pct = config.max_dev_holdings_pct
         self.min_holders_count = config.min_holders_count
         self.trust_trader_pumpfun = config.trust_trader_pumpfun
-        self.skip_creator_tokens = config.skip_creator_tokens
+        self.skip_creator_tokens = self.config.skip_creator_tokens
+        raw_slippage_steps = [str(self.config.slippage_bps)]
+        if self.config.slippage_steps_bps:
+            raw_slippage_steps.extend(self.config.slippage_steps_bps.split(','))
+        self.slippage_steps_bps: List[int] = []
+        for step in raw_slippage_steps:
+            try:
+                value = int(step.strip())
+                if value <= 0:
+                    continue
+                if value not in self.slippage_steps_bps:
+                    self.slippage_steps_bps.append(value)
+            except ValueError:
+                continue
+        if not self.slippage_steps_bps:
+            self.slippage_steps_bps = [50]
+        self.sync_mock_with_real = self.config.sync_mock_with_real
+        self.jupiter_priority_fee_lamports = max(0, self.config.jupiter_priority_fee_lamports)
+        self.pumpfun_priority_fee_sol = max(0.0, self.config.pumpfun_priority_fee_sol)
         
         # Cache for token info (to avoid repeated API calls)
         # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
@@ -1075,36 +1093,37 @@ class CopyTrader:
             
             real_result = None
             mock_result = None
+            require_real_success = self.sync_mock_with_real and should_execute_real and self.real_trading_enabled
 
             # Execute real trade first so we only update mock state if real succeeded
             if should_execute_real:
-                if is_pumpfun:
-                    real_result = await self._execute_pumpfun_swap(
-                        token_mint=swap.token_mint,
-                        sol_amount=trade_sol,
-                        is_buy=True
-                    )
-                else:
-                    real_result = await self._execute_swap(
-                        input_mint=NATIVE_SOL,
-                        output_mint=swap.token_mint,
-                        amount=trade_lamports
-                    )
+                real_result = await self._execute_real_trade_with_fallbacks(
+                    swap=swap,
+                    trade_lamports=trade_lamports,
+                    trade_sol=trade_sol,
+                    is_pumpfun=is_pumpfun
+                )
                 
                 if not real_result.success:
-                    logger.error(
-                        "real_trade_failed",
-                        token=swap.token_mint[:8],
-                        sol=f"{trade_sol:.4f}",
-                        error=real_result.error
-                    )
-                    return real_result
-                
-                logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
+                    if not self.mock_trading or require_real_success:
+                        return real_result
+                else:
+                    logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
             
             # Simulate/mock trade after real succeeds (or when real disabled)
-            if self.mock_trading:
+            allow_mock_execution = self.mock_trading and (not require_real_success or (real_result and real_result.success))
+            if allow_mock_execution:
                 mock_result = self._simulate_mock_buy(swap, trade_sol)
+            elif self.mock_trading and require_real_success:
+                logger.warning(
+                    "mock_trade_skipped_due_to_real_failure",
+                    token=swap.token_mint[:8]
+                )
+                return real_result or CopyTradeResult(
+                    success=False,
+                    error="real_trade_required_but_failed",
+                    original_swap=swap
+                )
             
             # Determine which result to return for downstream logic
             if self.mock_trading:
@@ -1170,7 +1189,10 @@ class CopyTrader:
         self, 
         input_mint: str, 
         output_mint: str, 
-        amount: int
+        amount: int,
+        *,
+        slippage_bps: Optional[int] = None,
+        priority_fee_lamports: Optional[int] = None
     ) -> CopyTradeResult:
         """Execute a swap via Jupiter."""
         try:
@@ -1179,7 +1201,7 @@ class CopyTrader:
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": str(self.config.slippage_bps)
+                "slippageBps": str(slippage_bps if slippage_bps is not None else self.config.slippage_bps)
             }
             
             async with self.session.get(JUPITER_QUOTE_API, params=quote_params) as resp:
@@ -1194,7 +1216,7 @@ class CopyTrader:
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 500000  # Very high priority ~0.0005 SOL for fastest execution
+                "prioritizationFeeLamports": int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
