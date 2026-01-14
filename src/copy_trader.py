@@ -29,7 +29,7 @@ WALLET_STATE_FILES = {
     '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk': 'mock_state_jijo.json',  # Jijo
 }
 
-# Jupiter API for swaps - using lite-api (public, no auth required)
+# Jupiter API for swaps (lite-api, no auth required)
 JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
 
@@ -539,6 +539,47 @@ class CopyTrader:
         for wallet in self.wallet_states:
             self._save_wallet_state(wallet)
     
+    def _log_real_trade_to_state(self, swap: 'ParsedSwap', trade_sol: float, trade_type: str, signature: str = None) -> None:
+        """Log a real trade to the state file for dashboard display."""
+        try:
+            # Use a separate real trades state file
+            real_state_file = Path('real_trades_state.json')
+            
+            # Load existing state or create new
+            if real_state_file.exists():
+                with open(real_state_file, 'r') as f:
+                    state = json.load(f)
+            else:
+                state = {
+                    'trades_history': [],
+                    'last_updated': datetime.now().isoformat()
+                }
+            
+            # Add trade to history
+            trades = state.setdefault('trades_history', [])
+            trades.append({
+                'type': trade_type,
+                'token': swap.token_mint[:8],
+                'full_mint': swap.token_mint,
+                'sol': trade_sol,
+                'signature': signature[:16] if signature else None,
+                'timestamp': datetime.now().isoformat(),
+                'real': True  # Mark as real trade
+            })
+            
+            # Keep last 100 trades
+            state['trades_history'] = trades[-100:]
+            state['last_updated'] = datetime.now().isoformat()
+            
+            # Save state
+            with open(real_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            logger.info("real_trade_logged", type=trade_type, token=swap.token_mint[:8], sol=f"{trade_sol:.4f}")
+            
+        except Exception as e:
+            logger.warning("real_trade_log_error", error=str(e))
+    
     def get_dashboard_state(self, wallet: str = None) -> Dict:
         """Get current state for dashboard display. If wallet specified, returns that wallet's state."""
         if wallet:
@@ -683,15 +724,32 @@ class CopyTrader:
         try:
             # FAST PATH for sells - skip balance calculations, AGGRESSIVE RETRIES
             if not swap.is_buy:
-                token_balance = await self._get_token_balance(swap.token_mint, swap.wallet)
-                if token_balance == 0:
+                # Check if we should execute real sell
+                should_execute_real = (
+                    not self.mock_trading or 
+                    (self.real_trading_enabled and 
+                     (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
+                )
+                
+                # Get mock balance for mock trading
+                mock_balance = 0
+                if self.mock_trading:
+                    state = self._get_wallet_state(swap.wallet)
+                    mock_balance = state.get('positions', {}).get(swap.token_mint, 0)
+                
+                # Get real balance for real trading (separate check)
+                real_balance = 0
+                if should_execute_real:
+                    # Temporarily disable mock to get real balance
+                    original_mock = self.mock_trading
+                    self.mock_trading = False
+                    real_balance = await self._get_token_balance(swap.token_mint, swap.wallet)
+                    self.mock_trading = original_mock
+                    logger.debug("real_sell_balance_check", token=swap.token_mint[:8], real_balance=real_balance)
+                
+                # Check if we have anything to sell (mock or real)
+                if mock_balance == 0 and real_balance == 0:
                     logger.debug("no_tokens_to_sell", token=swap.token_mint[:8])
-                    # DON'T trigger cooldown when we never had a position!
-                    # Old logic was blocking profitable re-entries when:
-                    # 1. Trader buys (we miss due to filters/timing)
-                    # 2. Trader sells (we have nothing to sell)
-                    # 3. Trader re-buys (we were blocked by cooldown!)
-                    # Now we only log this as informational and allow future buys
                     logger.info(
                         "missed_sell_opportunity",
                         token=swap.token_mint[:8],
@@ -702,33 +760,33 @@ class CopyTrader:
                 logger.info(
                     "fast_sell",
                     token=swap.token_mint[:8],
-                    our_balance=token_balance,
+                    mock_balance=mock_balance,
+                    real_balance=real_balance,
                     their_sol=f"{swap.sol_value:.4f}"
                 )
                 
                 # Detect if this is a pump.fun token
                 is_pumpfun_sell = swap.dex == "pump.fun"
                 
-                # Check if we should execute real sell
-                should_execute_real = (
-                    not self.mock_trading or 
-                    (self.real_trading_enabled and 
-                     (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
-                )
-                
-                if self.mock_trading:
-                    mock_result = self._simulate_mock_sell(swap, token_balance)
-                    if not should_execute_real:
+                # Execute mock sell if we have mock balance
+                if self.mock_trading and mock_balance > 0:
+                    mock_result = self._simulate_mock_sell(swap, mock_balance)
+                    if not should_execute_real or real_balance == 0:
                         return mock_result
 
-                # AGGRESSIVE RETRY LOOP with exponential backoff
+                # Only execute real sell if we have real balance
+                if real_balance == 0:
+                    logger.info("skip_real_sell", token=swap.token_mint[:8], reason="no_real_balance")
+                    return CopyTradeResult(success=True, mock=True, original_swap=swap)
+
+                # AGGRESSIVE RETRY LOOP with exponential backoff for REAL sells
                 max_retries = 5
                 result = None
                 for attempt in range(max_retries):
                     if is_pumpfun_sell:
                         # Use Pump.fun API for bonding curve sells
                         # Estimate SOL value from token balance (rough estimate)
-                        estimated_sol = token_balance / 1e9 * 0.00001  # Very rough, will be adjusted by API
+                        estimated_sol = real_balance / 1e9 * 0.00001  # Very rough, will be adjusted by API
                         result = await self._execute_pumpfun_swap(
                             token_mint=swap.token_mint,
                             sol_amount=estimated_sol,
@@ -739,7 +797,7 @@ class CopyTrader:
                         result = await self._execute_swap(
                             input_mint=swap.token_mint,
                             output_mint=NATIVE_SOL,
-                            amount=token_balance
+                            amount=real_balance
                         )
                     
                     if result.success:
@@ -748,12 +806,19 @@ class CopyTrader:
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
                             sol_received=0,
-                            tokens_sold=token_balance,
+                            tokens_sold=real_balance,
                             our_signature=result.signature or "",
                             trigger="copied_sell",
                             success=True
                         )
                         logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
+                        # Log real sell to state file for dashboard display
+                        self._log_real_trade_to_state(
+                            swap=swap,
+                            trade_sol=swap.sol_value * 0.01,  # Estimate
+                            trade_type="sell",
+                            signature=result.signature
+                        )
                         return result
                     
                     # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
@@ -825,8 +890,8 @@ class CopyTrader:
                     price_change_1h = 0
                     txns_1h = 100
             
-            # Skip all filters in trust trader mode
-            skip_filters = self.trust_trader_pumpfun
+            # Skip all filters in trust trader mode OR for pump.fun tokens
+            skip_filters = is_pumpfun or self.trust_trader_pumpfun
             
             # Check token age
             if not skip_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
@@ -981,12 +1046,35 @@ class CopyTrader:
                     )
             
             # BUYS: Full calculation path
+            # Check if we should execute real trades
+            should_execute_real = (
+                not self.mock_trading or 
+                (self.real_trading_enabled and 
+                 (not self.real_trading_wallet or swap.wallet == self.real_trading_wallet))
+            )
+            
+            # Get mock balance for mock trading
+            mock_balance_sol = 0
             if self.mock_trading:
                 wallet_state = self._get_wallet_state(swap.wallet)
-                balance_sol = wallet_state.get('balance', 1.0)
+                mock_balance_sol = wallet_state.get('balance', 1.0)
+            
+            # Get real balance for real trading
+            real_balance_sol = 0
+            if should_execute_real:
+                real_balance = await self.rpc.get_balance(self.wallet.pubkey())
+                real_balance_sol = real_balance / 1e9
+            
+            # Use mock balance for sizing when mock trading is enabled
+            # Real trade execution will be skipped if real balance is insufficient
+            # This ensures mock trades proceed even when real balance is low
+            if self.mock_trading:
+                balance_sol = mock_balance_sol
             else:
-                balance = await self.rpc.get_balance(self.wallet.pubkey())
-                balance_sol = balance / 1e9
+                balance_sol = real_balance_sol
+            
+            # Track if real balance is too low (will skip real execution but allow mock)
+            real_balance_insufficient = should_execute_real and real_balance_sol < 0.03
             
             # Calculate fee reserve needed for existing + new positions
             if self.mock_trading:
@@ -1008,9 +1096,11 @@ class CopyTrader:
             # Available balance after fee reserve
             available_sol = max(0, balance_sol - total_fee_reserve)
             
-            logger.debug(
+            logger.info(
                 "balance_calculation",
                 balance=f"{balance_sol:.4f}",
+                mock_bal=f"{mock_balance_sol:.4f}" if self.mock_trading else "N/A",
+                real_bal=f"{real_balance_sol:.4f}" if should_execute_real else "N/A",
                 positions=current_positions,
                 fee_reserve=f"{total_fee_reserve:.4f}",
                 available=f"{available_sol:.4f}"
@@ -1095,8 +1185,8 @@ class CopyTrader:
             mock_result = None
             require_real_success = self.sync_mock_with_real and should_execute_real and self.real_trading_enabled
 
-            # Execute real trade first so we only update mock state if real succeeded
-            if should_execute_real:
+            # Execute real trade first (only if real balance is sufficient)
+            if should_execute_real and not real_balance_insufficient:
                 real_result = await self._execute_real_trade_with_fallbacks(
                     swap=swap,
                     trade_lamports=trade_lamports,
@@ -1109,9 +1199,29 @@ class CopyTrader:
                         return real_result
                 else:
                     logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
+                    # Log real trade to state file for dashboard display
+                    self._log_real_trade_to_state(
+                        swap=swap,
+                        trade_sol=trade_sol,
+                        trade_type="buy",
+                        signature=real_result.signature
+                    )
+            elif should_execute_real and real_balance_insufficient:
+                logger.info(
+                    "real_trade_skipped_low_balance",
+                    token=swap.token_mint[:8],
+                    real_balance=f"{real_balance_sol:.4f}",
+                    min_required="0.03"
+                )
             
-            # Simulate/mock trade after real succeeds (or when real disabled)
-            allow_mock_execution = self.mock_trading and (not require_real_success or (real_result and real_result.success))
+            # Simulate/mock trade - allow if:
+            # 1. Mock trading is enabled AND
+            # 2. Either real success is not required, OR real succeeded, OR real was skipped due to low balance
+            allow_mock_execution = self.mock_trading and (
+                not require_real_success or 
+                (real_result and real_result.success) or
+                real_balance_insufficient  # Allow mock even when real skipped due to low balance
+            )
             if allow_mock_execution:
                 mock_result = self._simulate_mock_buy(swap, trade_sol)
             elif self.mock_trading and require_real_success:
@@ -1214,7 +1324,9 @@ class CopyTrader:
             logger.debug(
                 "trying_jupiter_slippage",
                 token=swap.token_mint[:8],
-                slippage_bps=slippage
+                full_mint=swap.token_mint,
+                slippage_bps=slippage,
+                lamports=trade_lamports
             )
             result = await self._execute_swap(
                 input_mint=NATIVE_SOL,
@@ -1282,12 +1394,14 @@ class CopyTrader:
     ) -> CopyTradeResult:
         """Execute a swap via Jupiter."""
         try:
-            # Get quote
+            # Get quote with expanded routing options
             quote_params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": str(slippage_bps if slippage_bps is not None else self.config.slippage_bps)
+                "slippageBps": str(slippage_bps if slippage_bps is not None else self.config.slippage_bps),
+                "onlyDirectRoutes": "false",
+                "asLegacyTransaction": "false"
             }
             
             async with self.session.get(JUPITER_QUOTE_API, params=quote_params) as resp:
@@ -1349,8 +1463,8 @@ class CopyTrader:
             action = "buy" if is_buy else "sell"
             
             # Request transaction from PumpPortal
-            # Use high slippage for pump.fun (tokens move fast) - minimum 15%
-            pumpfun_slippage = max(self.config.slippage_bps / 100, 15)
+            # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 30%
+            pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
             if is_buy:
                 payload = {
@@ -1360,7 +1474,7 @@ class CopyTrader:
                     "denominatedInSol": "true",
                     "amount": sol_amount,
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.001,  # Higher priority for faster execution
+                    "priorityFee": 0.005,  # High priority for faster execution
                     "pool": "pump"
                 }
             else:
@@ -1372,7 +1486,7 @@ class CopyTrader:
                     "denominatedInSol": "false",
                     "amount": f"{sell_percentage}%",
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.001,
+                    "priorityFee": 0.005,
                     "pool": "pump"
                 }
             
@@ -1380,12 +1494,14 @@ class CopyTrader:
                 "pumpfun_swap_request",
                 action=action,
                 token=token_mint[:8],
+                full_mint=token_mint,
                 sol=f"{sol_amount:.4f}"
             )
             
             async with self.session.post(PUMPFUN_API, json=payload) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
+                    logger.warning("pumpfun_api_error_detail", status=resp.status, response=error_text[:200], mint=token_mint)
                     return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {error_text}")
                 
                 # Response is the raw transaction bytes

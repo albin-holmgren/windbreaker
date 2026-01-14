@@ -26,12 +26,86 @@ def check_auth(request: Request) -> bool:
     """Check if user is authenticated."""
     return request.session.get('authenticated', False)
 
+REAL_STATE_FILE = Path('real_trades_state.json')
+
+# Wallet-specific state files (same as copy_trader.py)
+WALLET_STATE_FILES = [
+    'mock_state_cented.json',
+    'mock_state_cupsey.json', 
+    'mock_state_jijo.json',
+    'mock_state.json',  # Fallback
+]
+
 def get_state() -> dict:
-    """Load current state from file."""
+    """Load current state from all wallet state files."""
     try:
-        if STATE_FILE.exists():
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
+        # Aggregate state from all wallet files
+        combined_state = {
+            'balance': 0,
+            'starting_balance': 0,
+            'pnl': 0,
+            'positions': {},
+            'entry_sol': {},
+            'entry_times': {},
+            'trades_history': [],
+            'last_updated': 'Never'
+        }
+        
+        files_found = 0
+        for state_file in WALLET_STATE_FILES:
+            state_path = Path(state_file)
+            if state_path.exists():
+                try:
+                    with open(state_path, 'r') as f:
+                        state = json.load(f)
+                        files_found += 1
+                        # Aggregate balances
+                        combined_state['balance'] += state.get('balance', 0)
+                        combined_state['starting_balance'] += state.get('starting_balance', 0)
+                        # Merge positions
+                        combined_state['positions'].update(state.get('positions', {}))
+                        combined_state['entry_sol'].update(state.get('entry_sol', {}))
+                        combined_state['entry_times'].update(state.get('entry_times', {}))
+                        # Append trades
+                        combined_state['trades_history'].extend(state.get('trades_history', []))
+                        # Use latest update time
+                        if state.get('last_updated', '') > combined_state['last_updated']:
+                            combined_state['last_updated'] = state.get('last_updated', 'Never')
+                except Exception:
+                    pass
+        
+        # Also check the main STATE_FILE path
+        if STATE_FILE.exists() and str(STATE_FILE) not in WALLET_STATE_FILES:
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                    combined_state['balance'] += state.get('balance', 0)
+                    combined_state['starting_balance'] += state.get('starting_balance', 0)
+                    combined_state['positions'].update(state.get('positions', {}))
+                    combined_state['entry_sol'].update(state.get('entry_sol', {}))
+                    combined_state['entry_times'].update(state.get('entry_times', {}))
+                    combined_state['trades_history'].extend(state.get('trades_history', []))
+            except Exception:
+                pass
+        
+        # Also load real trades and merge them
+        if REAL_STATE_FILE.exists():
+            try:
+                with open(REAL_STATE_FILE, 'r') as f:
+                    real_state = json.load(f)
+                    real_trades = real_state.get('trades_history', [])
+                    combined_state['trades_history'].extend(real_trades)
+            except Exception:
+                pass
+        
+        # Sort trades by timestamp and keep last 50
+        combined_state['trades_history'].sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        combined_state['trades_history'] = combined_state['trades_history'][:50]
+        
+        # Calculate PnL
+        combined_state['pnl'] = combined_state['balance'] - combined_state['starting_balance']
+        
+        return combined_state
     except Exception:
         pass
     return {
@@ -166,6 +240,8 @@ DASHBOARD_HTML = """
         }}
         .badge.buy {{ background: #4CAF50; }}
         .badge.sell {{ background: #2196F3; }}
+        .badge.real {{ background: #FF9800; margin-left: 4px; }}
+        .badge.mock {{ background: #9E9E9E; margin-left: 4px; }}
         
         .updated {{ font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 20px; }}
         
@@ -275,18 +351,20 @@ async def home(request: Request):
         positions_rows = "<tr><td colspan='3' style='text-align:center;color:rgba(255,255,255,0.5)'>No open positions</td></tr>"
     
     # Build trades table
-    trades = state.get('trades_history', [])[-20:][::-1]  # Last 20, reversed
+    trades = state.get('trades_history', [])[:20]  # Already sorted, take first 20
     trades_rows = ""
     for t in trades:
         trade_type = t.get('type', 'unknown')
         badge_class = 'buy' if trade_type == 'buy' else 'sell'
+        is_real = t.get('real', False)
+        mode_badge = '<span class="badge real">REAL</span>' if is_real else '<span class="badge mock">MOCK</span>'
         token = t.get('token', '?')
         sol = t.get('sol', 0)
         trade_pnl = t.get('pnl', 0) if trade_type == 'sell' else '-'
         pnl_display = f"{trade_pnl:+.4f}" if isinstance(trade_pnl, (int, float)) else trade_pnl
         timestamp = t.get('timestamp', '')[:19].replace('T', ' ')
         trades_rows += f"""<tr>
-            <td><span class="badge {badge_class}">{trade_type.upper()}</span></td>
+            <td><span class="badge {badge_class}">{trade_type.upper()}</span>{mode_badge}</td>
             <td>{token}</td>
             <td>{sol:.4f}</td>
             <td>{pnl_display}</td>

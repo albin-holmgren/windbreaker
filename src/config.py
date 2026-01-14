@@ -148,7 +148,7 @@ def load_config(env_file: str = '.env') -> Config:
         copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '1000')),  # Poll every 1 sec (fast detection)
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
-        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.001')),  # 0.001 SOL per position for exit fees
+        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.01')),  # 0.01 SOL per position for exit fees (covers pump.fun priority fees)
         min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
         min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Require token to be at least 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
@@ -163,7 +163,7 @@ def load_config(env_file: str = '.env') -> Config:
         skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
-        sync_mock_with_real=os.getenv('SYNC_MOCK_WITH_REAL', 'true').lower() == 'true',
+        sync_mock_with_real=os.getenv('SYNC_MOCK_WITH_REAL', 'false').lower() == 'true',
         
         # Position Management
         max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once

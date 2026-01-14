@@ -12,6 +12,7 @@ logger = structlog.get_logger(__name__)
 
 # Known program IDs
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_FUN_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"  # For graduated tokens
 JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 RAYDIUM_AMM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 RAYDIUM_CLMM_PROGRAM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
@@ -96,8 +97,13 @@ class TransactionParser:
             account_keys = self._get_account_keys(message, meta)
             
             # Log programs involved
-            programs_involved = [k for k in account_keys if k in [PUMP_FUN_PROGRAM, JUPITER_V6_PROGRAM, RAYDIUM_AMM_PROGRAM, RAYDIUM_CLMM_PROGRAM]]
-            logger.debug("tx_programs", wallet=wallet[:8], programs=len(programs_involved), has_pump=PUMP_FUN_PROGRAM in account_keys)
+            known_programs = [PUMP_FUN_PROGRAM, PUMP_FUN_AMM_PROGRAM, JUPITER_V6_PROGRAM, RAYDIUM_AMM_PROGRAM, RAYDIUM_CLMM_PROGRAM]
+            programs_involved = [k for k in account_keys if k in known_programs]
+            has_pump = PUMP_FUN_PROGRAM in account_keys or PUMP_FUN_AMM_PROGRAM in account_keys
+            
+            # Log first 5 account keys to help identify unknown programs
+            sample_keys = [k[:12] for k in account_keys[:8]] if account_keys else []
+            logger.debug("tx_programs", wallet=wallet[:8], programs=len(programs_involved), has_pump=has_pump, has_pump_amm=PUMP_FUN_AMM_PROGRAM in account_keys, total_keys=len(account_keys), sample=",".join(sample_keys))
             
             # Get instructions
             instructions = message.get("instructions", [])
@@ -157,13 +163,16 @@ class TransactionParser:
         wallet: str, 
         account_keys: List[str]
     ) -> Optional[ParsedSwap]:
-        """Parse Pump.fun swap."""
-        # Check if Pump.fun program is involved
-        if PUMP_FUN_PROGRAM not in account_keys:
+        """Parse Pump.fun swap (bonding curve or AMM)."""
+        # Check if any Pump.fun program is involved
+        has_bonding_curve = PUMP_FUN_PROGRAM in account_keys
+        has_amm = PUMP_FUN_AMM_PROGRAM in account_keys
+        
+        if not has_bonding_curve and not has_amm:
             logger.debug("pump_fun_not_in_keys", wallet=wallet[:8])
             return None
         
-        logger.debug("pump_fun_program_found", wallet=wallet[:8])
+        logger.debug("pump_fun_program_found", wallet=wallet[:8], bonding_curve=has_bonding_curve, amm=has_amm)
         meta = tx_data.get("meta", {})
         
         # Get SOL balance change for the wallet (first signer)

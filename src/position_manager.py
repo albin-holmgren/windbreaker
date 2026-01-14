@@ -93,8 +93,8 @@ class PositionManager:
         wallet_keypair,
         rpc_client,
         max_positions: int = 3,
-        take_profit_pct: float = 100.0,     # Safety: sell at 2x (optional)
-        stop_loss_pct: float = -95.0,       # Abandon at 95% loss
+        take_profit_pct: float = 50.0,      # Take profit at 50% gain (matches config)
+        stop_loss_pct: float = -35.0,       # Stop loss at -35% (matches mock trading)
         time_limit_minutes: float = 0,      # 0 = disabled (follow trader)
         trailing_stop_pct: float = 0,       # 0 = disabled
         rug_abandon_sol: float = 0.005,     # Abandon if worth < 0.005 SOL
@@ -444,10 +444,7 @@ class PositionManager:
     def _should_exit(self, position: Position) -> Optional[ExitReason]:
         """
         Determine if we should exit a position.
-        NOTE: We ONLY exit when:
-        1. Token is worthless (abandon) 
-        2. Trader sells (handled by trigger_sell)
-        NO automatic take profit - we follow the trader!
+        Matches mock trading logic for full parity.
         """
         # Check if token is worthless (abandon, don't sell)
         if position.current_value_sol > 0 and position.current_value_sol < self.rug_abandon_sol:
@@ -460,8 +457,27 @@ class PositionManager:
             )
             return ExitReason.ABANDONED
         
-        # NO take profit - we only sell when trader sells!
-        # NO time limit - we follow the trader!
+        # STOP LOSS - same as mock trading (default -35%)
+        if position.entry_sol > 0 and position.current_value_sol > 0:
+            pnl_pct = position.pnl_percent
+            if pnl_pct <= self.stop_loss_pct:
+                logger.info(
+                    "stop_loss_triggered",
+                    token=position.token_mint[:8],
+                    pnl=f"{pnl_pct:.1f}%",
+                    threshold=f"{self.stop_loss_pct}%"
+                )
+                return ExitReason.STOP_LOSS
+        
+        # TAKE PROFIT - optional safety limit (default 100% = 2x)
+        if self.take_profit_pct > 0 and position.pnl_percent >= self.take_profit_pct:
+            logger.info(
+                "take_profit_triggered",
+                token=position.token_mint[:8],
+                pnl=f"{position.pnl_percent:.1f}%",
+                threshold=f"{self.take_profit_pct}%"
+            )
+            return ExitReason.TAKE_PROFIT
         
         # Time limit (only if enabled, 0 = disabled) - DISABLED BY DEFAULT
         if self.time_limit_minutes > 0 and position.age_minutes >= self.time_limit_minutes:
