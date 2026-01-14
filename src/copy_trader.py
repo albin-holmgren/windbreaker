@@ -1185,6 +1185,92 @@ class CopyTrader:
                 original_swap=swap
             )
     
+    async def _execute_real_trade_with_fallbacks(
+        self,
+        swap: ParsedSwap,
+        trade_lamports: int,
+        trade_sol: float,
+        is_pumpfun: bool
+    ) -> CopyTradeResult:
+        """Execute real trade with slippage steps and pump.fun fallback."""
+        # Try pump.fun first if detected as pump.fun token
+        if is_pumpfun:
+            result = await self._execute_pumpfun_swap(
+                token_mint=swap.token_mint,
+                sol_amount=trade_sol,
+                is_buy=True
+            )
+            if result.success:
+                return result
+            logger.warning(
+                "pumpfun_direct_failed_trying_jupiter",
+                token=swap.token_mint[:8],
+                error=result.error
+            )
+        
+        # Try Jupiter with increasing slippage steps
+        last_error = None
+        for slippage in self.slippage_steps_bps:
+            logger.debug(
+                "trying_jupiter_slippage",
+                token=swap.token_mint[:8],
+                slippage_bps=slippage
+            )
+            result = await self._execute_swap(
+                input_mint=NATIVE_SOL,
+                output_mint=swap.token_mint,
+                amount=trade_lamports,
+                slippage_bps=slippage
+            )
+            if result.success:
+                return result
+            last_error = result.error
+            
+            # Check if error is worth retrying with higher slippage
+            error_text = (result.error or "").lower()
+            if "slippage" not in error_text and "price" not in error_text:
+                # Not a slippage issue, try fallback instead
+                break
+        
+        # Fallback to pump.fun if Jupiter failed (and we didn't already try it)
+        if not is_pumpfun:
+            logger.warning(
+                "jupiter_failed_trying_pumpfun_fallback",
+                token=swap.token_mint[:8],
+                sol=f"{trade_sol:.4f}",
+                last_error=last_error
+            )
+            fallback_result = await self._execute_pumpfun_swap(
+                token_mint=swap.token_mint,
+                sol_amount=trade_sol,
+                is_buy=True
+            )
+            if fallback_result.success:
+                logger.info(
+                    "pumpfun_fallback_success",
+                    token=swap.token_mint[:8],
+                    sol=f"{trade_sol:.4f}"
+                )
+                return fallback_result
+            logger.error(
+                "pumpfun_fallback_failed",
+                token=swap.token_mint[:8],
+                error=fallback_result.error
+            )
+            last_error = f"{last_error}; pumpfun_fallback: {fallback_result.error}"
+        
+        logger.error(
+            "real_trade_failed",
+            token=swap.token_mint[:8],
+            sol=f"{trade_sol:.4f}",
+            error=last_error
+        )
+        return CopyTradeResult(
+            success=False,
+            error=last_error or "all_routes_failed",
+            original_swap=swap
+        )
+    
     async def _execute_swap(
         self, 
         input_mint: str, 
