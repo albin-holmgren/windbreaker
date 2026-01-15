@@ -235,11 +235,22 @@ class CopyTrader:
                 logger.error("mock_cleanup_error", error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
-        """Check mock positions for stop-loss and rug detection across all wallets."""
-        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '5000'))
-        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '10000'))
-        STOP_LOSS_PCT = self.config.stop_loss_pct  # e.g. -35 means exit at -35%
-        RUG_DROP_PCT = float(os.getenv('RUG_DROP_PCT', '-50'))  # Sell if price drops 50% in 1h (rug signal)
+        """Check mock positions for rug protection and stop-loss.
+        
+        IMPORTANT: Even when trust_trader_pumpfun is enabled for BUYS,
+        we STILL protect ourselves on EXITS. We exit when liquidity drops
+        to avoid holding unsellable rugged tokens.
+        
+        Trust trader = follow their buys without filters
+        Rug protection = always exit before token becomes unsellable
+        """
+        STOP_LOSS_PCT = -60.0
+        RUG_DROP_PCT = float(os.getenv('RUG_DROP_PCT', '-80'))
+        
+        # ALWAYS use rug detection for EXITS - protect from holding unsellable tokens
+        # Exit BEFORE token becomes unsellable (rugs typically die at $5k mcap)
+        MIN_LIQUIDITY_USD = float(os.getenv('MOCK_MIN_LIQUIDITY_USD', '5000'))  # Exit if liquidity < $5k
+        MIN_MARKET_CAP_USD = float(os.getenv('MOCK_MIN_MARKET_CAP_USD', '10000'))  # Exit if mcap < $10k
         
         # Iterate over all tracked wallets
         for wallet, state in self.wallet_states.items():
@@ -272,10 +283,29 @@ class CopyTrader:
                     # Get current position value for stop-loss check
                     if entry_sol > 0:
                         current_value = await self._get_mock_position_value(mint, tokens_held)
+                        
+                        logger.debug(
+                            "position_value_check",
+                            wallet=wallet[:8],
+                            token=mint[:8],
+                            entry_sol=f"{entry_sol:.4f}",
+                            current_value=f"{current_value:.4f}",
+                            market_cap=f"${market_cap:,.0f}",
+                            liquidity=f"${liquidity:,.0f}"
+                        )
+                        
                         if current_value > 0:
                             pnl_pct = ((current_value - entry_sol) / entry_sol) * 100
                             
-                            # Check stop loss (-35% by default)
+                            logger.info(
+                                "position_pnl_check",
+                                wallet=wallet[:8],
+                                token=mint[:8],
+                                pnl_pct=f"{pnl_pct:.1f}%",
+                                stop_loss=f"{STOP_LOSS_PCT}%"
+                            )
+                            
+                            # Check stop loss
                             if pnl_pct <= STOP_LOSS_PCT:
                                 reason = f"stop_loss_triggered ({pnl_pct:.1f}% < {STOP_LOSS_PCT}%)"
                                 should_sell = True
@@ -298,20 +328,24 @@ class CopyTrader:
                         except:
                             pass
                     
-                    # Rug detection checks
+                    # Rug detection checks - ALWAYS run to protect from unsellable tokens
+                    # Even when trust_trader is on for buys, we still protect exits
                     if not should_sell:
-                        if liquidity < MIN_LIQUIDITY_USD and liquidity > 0 and age_minutes > 10:
-                            reason = f"rug_detected_low_liquidity (${liquidity:,.0f})"
+                        if liquidity < MIN_LIQUIDITY_USD and liquidity > 0 and age_minutes > 3:
+                            reason = f"rug_detected_low_liquidity (${liquidity:,.0f} < ${MIN_LIQUIDITY_USD:,.0f})"
                             should_sell = True
                             current_value = entry_sol * 0.1  # Assume 90% loss
-                        elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0 and age_minutes > 10:
-                            reason = f"rug_detected_low_mcap (${market_cap:,.0f})"
+                            logger.info("rug_low_liquidity", wallet=wallet[:8], token=mint[:8], liquidity=f"${liquidity:,.0f}")
+                        elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0 and age_minutes > 3:
+                            reason = f"rug_detected_low_mcap (${market_cap:,.0f} < ${MIN_MARKET_CAP_USD:,.0f})"
                             should_sell = True
                             current_value = entry_sol * 0.1
-                        elif market_cap == 0 and liquidity == 0 and age_minutes > 10:
+                            logger.info("rug_low_mcap", wallet=wallet[:8], token=mint[:8], market_cap=f"${market_cap:,.0f}")
+                        elif market_cap == 0 and liquidity == 0 and age_minutes > 3:
                             reason = "rug_detected_not_on_dex"
                             should_sell = True
                             current_value = entry_sol * 0.05  # Assume 95% loss
+                            logger.info("rug_not_on_dex", wallet=wallet[:8], token=mint[:8])
                     
                     # Stale position fallback: if held >4 hours and no price, force sell as dead
                     if not should_sell and hold_minutes > 240 and current_value == 0:
@@ -653,20 +687,40 @@ class CopyTrader:
         )
         
         # If trader sells a token we hold, copy the sell!
-        if swap.is_sell and self.position_manager and self.position_manager.has_position(swap.token_mint):
-            logger.info(
-                "copying_trader_sell",
-                token=swap.token_mint[:8] + "...",
-                message="Trader sold, we're selling too!"
-            )
-            from .position_manager import ExitReason
-            result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
-            if result.success:
-                self.stats.total_sol_received += result.sol_received
-                logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
-            else:
-                logger.warning("copied_sell_failed", error=result.error)
-            return
+        if swap.is_sell:
+            # Check if we have MOCK position to sell
+            mock_sold = False
+            if self.mock_trading:
+                state = self._get_wallet_state(swap.wallet)
+                mock_balance = state.get('positions', {}).get(swap.token_mint, 0)
+                if mock_balance > 0:
+                    logger.info(
+                        "copying_trader_sell_mock",
+                        token=swap.token_mint[:8] + "...",
+                        mock_balance=mock_balance,
+                        message="Trader sold, mock selling!"
+                    )
+                    self._simulate_mock_sell(swap, mock_balance)
+                    mock_sold = True
+            
+            # Check if we have REAL position to sell (only if real trading enabled)
+            if self.position_manager and self.position_manager.has_position(swap.token_mint):
+                logger.info(
+                    "copying_trader_sell_real",
+                    token=swap.token_mint[:8] + "...",
+                    message="Trader sold, real selling!"
+                )
+                from .position_manager import ExitReason
+                result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
+                if result.success:
+                    self.stats.total_sol_received += result.sol_received
+                    logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
+                else:
+                    logger.warning("copied_sell_failed", error=result.error)
+            
+            # If we sold anything, we're done
+            if mock_sold or (self.position_manager and self.position_manager.has_position(swap.token_mint)):
+                return
         
         # Decide whether to copy buy
         should_copy, reason = self._should_copy(swap)
@@ -854,44 +908,21 @@ class CopyTrader:
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
             is_pumpfun = swap.dex == "pump.fun"
             
-            # TRUST TRADER MODE: Always skip filters for pump.fun tokens from tracked wallets
-            # These traders are profitable - trust their judgment completely
-            if is_pumpfun:
-                logger.info(
-                    "trust_trader_pumpfun",
-                    token=swap.token_mint[:8],
-                    sol=f"{swap.sol_value:.4f}",
-                    message="Skipping filters - trusting trader for pump.fun token"
-                )
-                # Skip directly to trade execution (no filters)
-                market_cap = 0
-                age_minutes = 0
-                liquidity = 0
-                volume_24h = 0
-                price_change_1h = 0
-                txns_1h = 0
-            else:
-                # Use DexScreener for other DEXes
-                market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
-                
-                # If not on DexScreener, ALWAYS trust trader - they're buying for a reason!
-                # These are often the best early entries that APIs don't know about yet
-                if market_cap == 0 and age_minutes == 0:
-                    logger.info(
-                        "trust_trader_unknown_token",
-                        token=swap.token_mint[:8],
-                        message="Token not on DexScreener - trusting trader's early entry!"
-                    )
-                    # Set defaults for unknown token - assume brand new
-                    market_cap = 50000
-                    age_minutes = 0.5
-                    liquidity = 5000
-                    volume_24h = 1000
-                    price_change_1h = 0
-                    txns_1h = 100
+            # Get token info from DexScreener for ALL tokens (including pump.fun)
+            market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
             
-            # Skip all filters in trust trader mode OR for pump.fun tokens
-            skip_filters = is_pumpfun or self.trust_trader_pumpfun
+            # Log the token info
+            logger.info(
+                "token_info_fetched",
+                token=swap.token_mint[:8],
+                dex=swap.dex,
+                market_cap=f"${market_cap:,.0f}",
+                age=f"{age_minutes:.1f}m",
+                liquidity=f"${liquidity:,.0f}"
+            )
+            
+            # Only skip filters if explicitly configured (trust_trader_pumpfun setting)
+            skip_filters = self.trust_trader_pumpfun
             
             # Check token age
             if not skip_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
@@ -1255,8 +1286,9 @@ class CopyTrader:
                     # In reality, we'd parse this from the transaction result
                     estimated_tokens = int(trade_lamports * 1000)  # Placeholder
                     
-                    # Register position for auto-sell management
-                    if self.position_manager:
+                    # Register position for auto-sell management (REAL positions only)
+                    # Don't register mock positions - they're tracked separately in wallet_states
+                    if self.position_manager and not self.mock_trading:
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,

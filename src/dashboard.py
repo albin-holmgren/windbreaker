@@ -409,6 +409,34 @@ async def api_state(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return get_state()
 
+@app.post("/api/reset")
+async def api_reset(request: Request):
+    """Reset all wallet state files to fresh 1 SOL balance."""
+    if not check_auth(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    fresh_state = {
+        "starting_balance": 1.0,
+        "balance": 1.0,
+        "positions": {},
+        "entry_times": {},
+        "entry_sol": {},
+        "trades_history": [],
+        "last_updated": datetime.utcnow().isoformat() + "Z",
+        "pnl": 0
+    }
+    
+    reset_count = 0
+    for state_file in WALLET_STATE_FILES:
+        try:
+            with open(state_file, 'w') as f:
+                json.dump(fresh_state, f, indent=2)
+            reset_count += 1
+        except Exception:
+            pass
+    
+    return {"success": True, "reset_count": reset_count, "message": f"Reset {reset_count} wallet state files to 1 SOL"}
+
 def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
     """Run the dashboard server."""
     uvicorn.run(app, host=host, port=port)

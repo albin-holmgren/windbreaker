@@ -93,8 +93,8 @@ class PositionManager:
         wallet_keypair,
         rpc_client,
         max_positions: int = 3,
-        take_profit_pct: float = 50.0,      # Take profit at 50% gain (matches config)
-        stop_loss_pct: float = -35.0,       # Stop loss at -35% (matches mock trading)
+        take_profit_pct: float = 0,         # DISABLED - follow the trader
+        stop_loss_pct: float = -60.0,       # Stop loss at -60%
         time_limit_minutes: float = 0,      # 0 = disabled (follow trader)
         trailing_stop_pct: float = 0,       # 0 = disabled
         rug_abandon_sol: float = 0.005,     # Abandon if worth < 0.005 SOL
