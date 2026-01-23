@@ -477,17 +477,11 @@ class WebDashboard:
                 stats['trades'] = state.get('trades_history', [])[-20:]
                 stats['tracked_wallet'] = wallet_config['address']
             else:
-                # For real wallet, try on-chain first, fallback to state file
+                # For real wallet, fetch from on-chain via RPC
                 if is_real_wallet:
                     if self.rpc_client and self.wallet_keypair:
-                        try:
-                            stats = await self._fetch_real_wallet_stats()
-                            stats['tracked_wallet'] = wallet_config['address']
-                        except Exception as e:
-                            logger.warning("real_wallet_rpc_failed_using_state_file", error=str(e))
-                            # Fallback to real_state.json
-                            stats = self._load_json_stats('real_state.json')
-                            stats['tracked_wallet'] = wallet_config['address']
+                        stats = await self._fetch_real_wallet_stats()
+                        stats['tracked_wallet'] = wallet_config['address']
                     else:
                         # RPC not available - use real_state.json as fallback
                         logger.info("real_wallet_using_state_file", 
