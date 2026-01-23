@@ -31,11 +31,6 @@ WALLET_CONFIGS = {
         'name': 'Cupsey',
         'address': '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f',
         'state_file': 'mock_state_cupsey.json'
-    },
-    'jijo': {
-        'name': 'Jijo',
-        'address': '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk',
-        'state_file': 'mock_state_jijo.json'
     }
 }
 
@@ -83,9 +78,6 @@ DASHBOARD_HTML = '''
             </button>
             <button onclick="switchWallet('cupsey')" id="wallet-cupsey" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
                 Cupsey
-            </button>
-            <button onclick="switchWallet('jijo')" id="wallet-jijo" class="wallet-tab px-4 py-3 text-sm font-medium text-neutral-400">
-                Jijo
             </button>
         </div>
 
@@ -208,8 +200,7 @@ DASHBOARD_HTML = '''
         const walletConfigs = {
             'real': { name: 'Real', address: 'x1ULQweY5qNirmn9zUhyVM4kS7jRQYe9B2a4eHPXQA6', isReal: true },
             'cented': { name: 'Cented', address: 'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o' },
-            'cupsey': { name: 'Cupsey', address: '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f' },
-            'jijo': { name: 'Jijo', address: '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk' }
+            'cupsey': { name: 'Cupsey', address: '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f' }
         };
         
         function switchWallet(wallet) {
@@ -265,12 +256,15 @@ DASHBOARD_HTML = '''
         async function fetchData() {
             try {
                 const response = await fetch('/api/stats?wallet=' + currentWallet);
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
                 currentData = await response.json();
                 if (currentData.error) {
                     console.error('API error:', currentData.error);
-                    // Use defaults on error
+                    // Use defaults on error but still update UI
                     currentData = {
-                        balance: 0, starting_balance: 0, open_positions: 0,
+                        balance: 0, starting_balance: 1, open_positions: 0,
                         buys: 0, sells: 0, positions: {}, entry_sol: {}, entry_times: {},
                         trades: [], tracked_wallet: walletConfigs[currentWallet]?.address || ''
                     };
@@ -278,6 +272,13 @@ DASHBOARD_HTML = '''
                 updateUI(currentData);
             } catch (e) {
                 console.error('Failed to fetch data:', e);
+                // Still update UI with defaults so tab isn't blank
+                currentData = {
+                    balance: 0, starting_balance: 1, open_positions: 0,
+                    buys: 0, sells: 0, positions: {}, entry_sol: {}, entry_times: {},
+                    trades: [], tracked_wallet: walletConfigs[currentWallet]?.address || ''
+                };
+                updateUI(currentData);
             }
         }
         
@@ -476,29 +477,28 @@ class WebDashboard:
                 stats['trades'] = state.get('trades_history', [])[-20:]
                 stats['tracked_wallet'] = wallet_config['address']
             else:
-                stats = self._load_json_stats(wallet_config['state_file'])
-                stats['tracked_wallet'] = wallet_config['address']
-                
-                # For real wallet, fetch actual on-chain balance
-                if is_real_wallet and self.rpc_client and self.wallet_keypair:
-                    try:
-                        pubkey_attr = getattr(self.wallet_keypair, "pubkey", None)
-                        pubkey_obj = None
-                        if pubkey_attr:
-                            pubkey_obj = pubkey_attr() if callable(pubkey_attr) else pubkey_attr
-                        elif hasattr(self.wallet_keypair, "address"):
-                            from solders.pubkey import Pubkey
-                            pubkey_obj = Pubkey.from_string(self.wallet_keypair.address)
-                        
-                        if not pubkey_obj:
-                            raise ValueError("wallet pubkey unavailable")
-                        
-                        balance_lamports = await self.rpc_client.get_balance(pubkey_obj)
-                        balance_sol = balance_lamports / 1e9
-                        stats['balance'] = balance_sol
-                        stats['starting_balance'] = balance_sol  # For real wallet, current balance is the starting point
-                    except Exception as e:
-                        logger.warning("failed_to_fetch_real_balance", error=str(e))
+                # For real wallet, try on-chain first, fallback to state file
+                if is_real_wallet:
+                    if self.rpc_client and self.wallet_keypair:
+                        try:
+                            stats = await self._fetch_real_wallet_stats()
+                            stats['tracked_wallet'] = wallet_config['address']
+                        except Exception as e:
+                            logger.warning("real_wallet_rpc_failed_using_state_file", error=str(e))
+                            # Fallback to real_state.json
+                            stats = self._load_json_stats('real_state.json')
+                            stats['tracked_wallet'] = wallet_config['address']
+                    else:
+                        # RPC not available - use real_state.json as fallback
+                        logger.info("real_wallet_using_state_file", 
+                                   has_rpc=bool(self.rpc_client), 
+                                   has_wallet=bool(self.wallet_keypair))
+                        stats = self._load_json_stats('real_state.json')
+                        stats['tracked_wallet'] = wallet_config['address']
+                else:
+                    # For mock wallets, use state file
+                    stats = self._load_json_stats(wallet_config['state_file'])
+                    stats['tracked_wallet'] = wallet_config['address']
             
             return web.json_response(stats)
         except Exception as e:
@@ -591,6 +591,184 @@ class WebDashboard:
     async def handle_health(self, request):
         """Health check endpoint."""
         return web.json_response({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+    
+    async def _fetch_real_wallet_stats(self) -> Dict[str, Any]:
+        """Fetch ONLY actual on-chain data for the real wallet - NO state file data."""
+        from solders.pubkey import Pubkey
+        
+        # DO NOT use state file - it may have fake/incorrect data
+        # Only show what's actually on the blockchain
+        stats = {
+            'starting_balance': 0,
+            'balance': 0,
+            'open_positions': 0,
+            'buys': 0,
+            'sells': 0,
+            'realized_pnl': 0,
+            'total_return_pct': 0,
+            'positions': {},
+            'entry_sol': {},
+            'entry_times': {},
+            'trades': []
+        }
+        
+        try:
+            # Get wallet pubkey
+            pubkey_attr = getattr(self.wallet_keypair, "pubkey", None)
+            pubkey_obj = None
+            if pubkey_attr:
+                pubkey_obj = pubkey_attr() if callable(pubkey_attr) else pubkey_attr
+            elif hasattr(self.wallet_keypair, "address"):
+                pubkey_obj = Pubkey.from_string(self.wallet_keypair.address)
+            
+            if not pubkey_obj:
+                logger.warning("real_wallet_pubkey_unavailable")
+                return stats
+            
+            # Fetch SOL balance from on-chain
+            balance_lamports = await self.rpc_client.get_balance(pubkey_obj)
+            balance_sol = balance_lamports / 1e9
+            stats['balance'] = balance_sol
+            
+            # Fetch all token accounts (actual on-chain positions)
+            try:
+                token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                result = await self.rpc_client._request(
+                    "getTokenAccountsByOwner",
+                    [
+                        str(pubkey_obj),
+                        {"programId": str(token_program)},
+                        {"encoding": "jsonParsed"}
+                    ]
+                )
+                
+                if result and "value" in result:
+                    for account in result["value"]:
+                        try:
+                            account_data = account.get("account", {}).get("data", {})
+                            parsed = account_data.get("parsed", {}).get("info", {})
+                            mint = parsed.get("mint", "")
+                            token_amount = parsed.get("tokenAmount", {})
+                            amount = int(token_amount.get("amount", 0))
+                            
+                            # Only include tokens with balance > 0
+                            if amount > 0 and mint:
+                                stats['positions'][mint] = amount
+                        except Exception:
+                            continue
+                
+                stats['open_positions'] = len(stats['positions'])
+                
+            except Exception as e:
+                logger.warning("failed_to_fetch_token_accounts", error=str(e))
+            
+            # Fetch ACTUAL on-chain transaction history
+            try:
+                trades = await self._fetch_real_wallet_trades(str(pubkey_obj))
+                stats['trades'] = trades
+                stats['buys'] = len([t for t in trades if t.get('type') == 'buy'])
+                stats['sells'] = len([t for t in trades if t.get('type') == 'sell'])
+            except Exception as e:
+                logger.warning("failed_to_fetch_real_trades", error=str(e))
+            
+        except Exception as e:
+            logger.warning("failed_to_fetch_real_wallet_stats", error=str(e))
+        
+        return stats
+    
+    async def _fetch_real_wallet_trades(self, wallet_address: str) -> List[Dict[str, Any]]:
+        """Fetch recent swap transactions for the real wallet."""
+        trades = []
+        
+        try:
+            # Get recent transaction signatures
+            result = await self.rpc_client._request(
+                "getSignaturesForAddress",
+                [wallet_address, {"limit": 50}]
+            )
+            
+            if not result:
+                return trades
+            
+            # Known DEX program IDs
+            PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+            PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+            RAYDIUM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+            JUPITER_V6 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+            
+            dex_programs = {PUMP_FUN_PROGRAM, PUMP_AMM_PROGRAM, RAYDIUM_V4, JUPITER_V6}
+            
+            for sig_info in result[:20]:  # Check last 20 transactions
+                try:
+                    sig = sig_info.get('signature')
+                    if not sig or sig_info.get('err'):
+                        continue
+                    
+                    # Get transaction details
+                    tx_result = await self.rpc_client._request(
+                        "getTransaction",
+                        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                    )
+                    
+                    if not tx_result:
+                        continue
+                    
+                    # Check if it's a swap transaction
+                    account_keys = tx_result.get('transaction', {}).get('message', {}).get('accountKeys', [])
+                    key_strs = [str(k.get('pubkey', k)) if isinstance(k, dict) else str(k) for k in account_keys]
+                    
+                    is_swap = any(prog in key_strs for prog in dex_programs)
+                    if not is_swap:
+                        continue
+                    
+                    # Parse pre/post balances to determine buy/sell
+                    meta = tx_result.get('meta', {})
+                    pre_sol = meta.get('preBalances', [0])[0] / 1e9
+                    post_sol = meta.get('postBalances', [0])[0] / 1e9
+                    sol_diff = post_sol - pre_sol
+                    
+                    # Determine trade type and token
+                    trade_type = 'sell' if sol_diff > 0.001 else 'buy' if sol_diff < -0.001 else None
+                    if not trade_type:
+                        continue
+                    
+                    # Find the token involved
+                    token_mint = None
+                    pre_token = meta.get('preTokenBalances', [])
+                    post_token = meta.get('postTokenBalances', [])
+                    
+                    for tb in pre_token + post_token:
+                        if tb.get('owner') == wallet_address:
+                            token_mint = tb.get('mint')
+                            break
+                    
+                    if not token_mint:
+                        # Try to find from account keys (skip SOL and common programs)
+                        for key in key_strs:
+                            if len(key) > 40 and key not in dex_programs and 'Token' not in key and '1111' not in key:
+                                token_mint = key
+                                break
+                    
+                    block_time = tx_result.get('blockTime')
+                    timestamp = datetime.fromtimestamp(block_time).isoformat() if block_time else None
+                    
+                    trades.append({
+                        'type': trade_type,
+                        'token': token_mint[:8] if token_mint else 'unknown',
+                        'full_mint': token_mint,
+                        'sol': abs(sol_diff),
+                        'signature': sig[:16],
+                        'timestamp': timestamp,
+                        'real': True
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+        except Exception as e:
+            logger.warning("failed_to_parse_real_trades", error=str(e))
+        
+        return trades
     
     def _load_json_state(self, state_file: str = None) -> Dict[str, Any]:
         """Load state from JSON file."""

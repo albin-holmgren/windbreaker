@@ -26,12 +26,11 @@ logger = structlog.get_logger(__name__)
 WALLET_STATE_FILES = {
     'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o': 'mock_state_cented.json',  # Cented
     '2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f': 'mock_state_cupsey.json',  # Cupsey
-    '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk': 'mock_state_jijo.json',  # Jijo
 }
 
-# Jupiter API for swaps (lite-api, no auth required)
-JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
+# Jupiter API for swaps (lite-api is more reliable)
+JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
 
 # Pump.fun API for bonding curve trades
 PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
@@ -229,7 +228,7 @@ class CopyTrader:
         logger.info("mock_cleanup_loop_started")
         while self.running:
             try:
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(1)  # Check every 1 second - sell as close to Cupsey as possible
                 await self._cleanup_stale_mock_positions()
             except Exception as e:
                 logger.error("mock_cleanup_error", error=str(e))
@@ -361,8 +360,8 @@ class CopyTrader:
                         current_value = entry_sol * 0.02  # Assume 98% loss for dead tokens
                     
                     # CRITICAL: Check if trader has exited this position (missed sell detection)
-                    # Only check after holding for at least 2 minutes to avoid race conditions
-                    if not should_sell and hold_minutes > 2:
+                    # Check immediately (after 5 seconds) - Cupsey might hold for only 10 seconds!
+                    if not should_sell and hold_minutes > 0.08:
                         trader_still_holds = await self._check_trader_holds_token(wallet, mint)
                         if not trader_still_holds:
                             reason = f"trader_exited_position (missed sell - syncing with trader)"
@@ -462,6 +461,23 @@ class CopyTrader:
         
         # Save state for this wallet
         self._save_wallet_state(wallet)
+        
+        # CRITICAL: Also trigger real sell if we have real tokens!
+        if self.real_trading and self.position_manager and "trader_exited" in reason:
+            try:
+                # Check if we have real tokens for this mint
+                real_balance = await self._get_token_balance(mint)
+                if real_balance > 0:
+                    logger.warning(
+                        "triggering_real_sell_sync",
+                        token=mint[:8],
+                        real_balance=real_balance,
+                        reason="syncing with trader exit"
+                    )
+                    # Queue for immediate sell via position manager
+                    self.position_manager.queue_failed_sell(mint, real_balance)
+            except Exception as e:
+                logger.error("real_sell_sync_error", token=mint[:8], error=str(e))
     
     async def stop(self) -> None:
         """Stop the copy trader."""
@@ -598,32 +614,63 @@ class CopyTrader:
         for wallet in self.wallet_states:
             self._save_wallet_state(wallet)
     
-    def _log_real_trade_to_state(self, swap: 'ParsedSwap', trade_sol: float, trade_type: str, signature: str = None) -> None:
+    def _log_real_trade_to_state(self, swap: 'ParsedSwap', trade_sol: float, trade_type: str, signature: str = None, tokens_received: int = 0) -> None:
         """Log a real trade to the state file for dashboard display."""
         try:
-            # Use a separate real trades state file
-            real_state_file = Path('real_trades_state.json')
+            real_state_file = Path('real_state.json')
             
-            # Load existing state or create new
+            # Load existing state or create new with full structure
             if real_state_file.exists():
                 with open(real_state_file, 'r') as f:
                     state = json.load(f)
             else:
                 state = {
+                    'starting_balance': 0,
+                    'balance': 0,
+                    'positions': {},
+                    'entry_sol': {},
+                    'entry_times': {},
                     'trades_history': [],
                     'last_updated': datetime.now().isoformat()
                 }
             
+            # Ensure all required fields exist
+            state.setdefault('positions', {})
+            state.setdefault('entry_sol', {})
+            state.setdefault('entry_times', {})
+            state.setdefault('trades_history', [])
+            state.setdefault('balance', 0)
+            state.setdefault('starting_balance', 0)
+            
+            token_mint = swap.token_mint
+            
+            # Update positions based on trade type
+            if trade_type == 'buy':
+                # Add position
+                current_tokens = state['positions'].get(token_mint, 0)
+                state['positions'][token_mint] = current_tokens + tokens_received
+                state['entry_sol'][token_mint] = state['entry_sol'].get(token_mint, 0) + trade_sol
+                if token_mint not in state['entry_times']:
+                    state['entry_times'][token_mint] = datetime.now().isoformat()
+            elif trade_type == 'sell':
+                # Remove position
+                if token_mint in state['positions']:
+                    del state['positions'][token_mint]
+                if token_mint in state['entry_sol']:
+                    del state['entry_sol'][token_mint]
+                if token_mint in state['entry_times']:
+                    del state['entry_times'][token_mint]
+            
             # Add trade to history
-            trades = state.setdefault('trades_history', [])
+            trades = state['trades_history']
             trades.append({
                 'type': trade_type,
-                'token': swap.token_mint[:8],
-                'full_mint': swap.token_mint,
+                'token': token_mint[:8],
+                'full_mint': token_mint,
                 'sol': trade_sol,
                 'signature': signature[:16] if signature else None,
                 'timestamp': datetime.now().isoformat(),
-                'real': True  # Mark as real trade
+                'real': True
             })
             
             # Keep last 100 trades
@@ -634,7 +681,7 @@ class CopyTrader:
             with open(real_state_file, 'w') as f:
                 json.dump(state, f, indent=2)
             
-            logger.info("real_trade_logged", type=trade_type, token=swap.token_mint[:8], sol=f"{trade_sol:.4f}")
+            logger.info("real_trade_logged", type=trade_type, token=token_mint[:8], sol=f"{trade_sol:.4f}")
             
         except Exception as e:
             logger.warning("real_trade_log_error", error=str(e))
@@ -729,22 +776,32 @@ class CopyTrader:
                     mock_sold = True
             
             # Check if we have REAL position to sell (only if real trading enabled)
-            if self.position_manager and self.position_manager.has_position(swap.token_mint):
+            real_sold = False
+            if self.position_manager:
+                has_real_position = self.position_manager.has_position(swap.token_mint)
                 logger.info(
-                    "copying_trader_sell_real",
-                    token=swap.token_mint[:8] + "...",
-                    message="Trader sold, real selling!"
+                    "checking_real_position_for_sell",
+                    token=swap.token_mint[:8],
+                    has_position=has_real_position,
+                    tracked_positions=list(self.position_manager.positions.keys())[:5] if self.position_manager.positions else []
                 )
-                from .position_manager import ExitReason
-                result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
-                if result.success:
-                    self.stats.total_sol_received += result.sol_received
-                    logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
-                else:
-                    logger.warning("copied_sell_failed", error=result.error)
+                if has_real_position:
+                    logger.info(
+                        "copying_trader_sell_real",
+                        token=swap.token_mint[:8] + "...",
+                        message="Trader sold, real selling!"
+                    )
+                    from .position_manager import ExitReason
+                    result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
+                    if result.success:
+                        self.stats.total_sol_received += result.sol_received
+                        real_sold = True
+                        logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
+                    else:
+                        logger.warning("copied_sell_failed", error=result.error)
             
-            # If we sold anything, we're done
-            if mock_sold or (self.position_manager and self.position_manager.has_position(swap.token_mint)):
+            # If we sold anything (mock or real), we're done - don't try to buy
+            if mock_sold or real_sold:
                 return
         
         # Decide whether to copy buy
@@ -1251,29 +1308,60 @@ class CopyTrader:
             
             real_result = None
             mock_result = None
+            real_trade_sol = 0  # Track actual real trade amount for position manager
             require_real_success = self.sync_mock_with_real and should_execute_real and self.real_trading_enabled
 
             # Execute real trade first (only if real balance is sufficient)
             if should_execute_real and not real_balance_insufficient:
-                real_result = await self._execute_real_trade_with_fallbacks(
-                    swap=swap,
-                    trade_lamports=trade_lamports,
-                    trade_sol=trade_sol,
-                    is_pumpfun=is_pumpfun
-                )
+                # IMPORTANT: Recalculate trade size based on REAL balance
+                # Keep enough SOL reserved for selling all open positions
+                real_open_positions = len(self.position_manager.positions) if self.position_manager else 0
+                sell_reserve = 0.01 * (real_open_positions + 1)  # 0.01 SOL per position for sell fees
+                base_reserve = 0.02  # Base reserve for transaction fees
+                real_available = max(0, real_balance_sol - sell_reserve - base_reserve)
                 
-                if not real_result.success:
-                    if not self.mock_trading or require_real_success:
-                        return real_result
-                else:
-                    logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=trade_sol)
-                    # Log real trade to state file for dashboard display
-                    self._log_real_trade_to_state(
-                        swap=swap,
-                        trade_sol=trade_sol,
-                        trade_type="buy",
-                        signature=real_result.signature
+                # Size real trade based on real available balance
+                real_trade_sol = min(trade_sol, real_available, self.max_sol_per_trade)
+                real_trade_sol = round(real_trade_sol, 4)
+                
+                if real_trade_sol < self.min_sol_per_trade:
+                    logger.info(
+                        "real_trade_skipped_insufficient_after_reserve",
+                        token=swap.token_mint[:8],
+                        real_balance=f"{real_balance_sol:.4f}",
+                        real_available=f"{real_available:.4f}",
+                        sell_reserve=f"{sell_reserve:.4f}",
+                        min_required=f"{self.min_sol_per_trade}"
                     )
+                else:
+                    real_trade_lamports = int(real_trade_sol * 1e9)
+                    logger.info(
+                        "real_trade_sizing",
+                        real_balance=f"{real_balance_sol:.4f}",
+                        real_available=f"{real_available:.4f}",
+                        real_trade_sol=f"{real_trade_sol:.4f}",
+                        open_positions=real_open_positions
+                    )
+                    
+                    real_result = await self._execute_real_trade_with_fallbacks(
+                        swap=swap,
+                        trade_lamports=real_trade_lamports,
+                        trade_sol=real_trade_sol,
+                        is_pumpfun=is_pumpfun
+                    )
+                    
+                    if real_result and not real_result.success:
+                        if not self.mock_trading or require_real_success:
+                            return real_result
+                    elif real_result and real_result.success:
+                        logger.info("real_trade_executed", type="buy", token=swap.token_mint[:8], sol=real_trade_sol)
+                        # Log real trade to state file for dashboard display
+                        self._log_real_trade_to_state(
+                            swap=swap,
+                            trade_sol=real_trade_sol,
+                            trade_type="buy",
+                            signature=real_result.signature
+                        )
             elif should_execute_real and real_balance_insufficient:
                 logger.info(
                     "real_trade_skipped_low_balance",
@@ -1324,16 +1412,29 @@ class CopyTrader:
                     estimated_tokens = int(trade_lamports * 1000)  # Placeholder
                     
                     # Register position for auto-sell management (REAL positions only)
-                    # Don't register mock positions - they're tracked separately in wallet_states
-                    if self.position_manager and not self.mock_trading:
+                    # Add to position_manager when: real-only mode OR real+mock mode with successful real trade
+                    should_register_real_position = (
+                        self.position_manager and 
+                        (not self.mock_trading or (self.real_trading_enabled and real_result and real_result.success))
+                    )
+                    if should_register_real_position:
+                        # Use actual real trade amount if available, otherwise fall back to trade_sol
+                        actual_entry_sol = real_trade_sol if real_trade_sol > 0 else trade_sol
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
-                            entry_sol=trade_sol,
+                            entry_sol=actual_entry_sol,
                             token_amount=estimated_tokens,
-                            entry_signature=result.signature or "",
+                            entry_signature=real_result.signature if real_result else (result.signature or ""),
                             copied_from=swap.wallet,
                             dex="pump.fun" if is_pumpfun else swap.dex
+                        )
+                        logger.info(
+                            "real_position_registered",
+                            token=swap.token_mint[:8],
+                            entry_sol=f"{actual_entry_sol:.4f}",
+                            copied_from=swap.wallet[:8],
+                            total_positions=len(self.position_manager.positions)
                         )
                     
                     # Log the trade for analysis
@@ -1535,8 +1636,8 @@ class CopyTrader:
             # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 30%
             pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
-            # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
-            pools_to_try = ["pump", "pump-amm", "raydium"]
+            # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
+            pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
             last_error = None
             
             for pool in pools_to_try:

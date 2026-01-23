@@ -13,9 +13,9 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Jupiter API - using lite-api (public, no auth required)
-JUPITER_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = "https://lite-api.jup.ag/v6/swap"
+# Jupiter API - lite-api is more reliable
+JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
 
 # Pump.fun API for bonding curve trades
 PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
@@ -354,7 +354,7 @@ class PositionManager:
         
         # Fallback to PumpPortal - try multiple pools
         pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
-        pools_to_try = ["pump", "pump-amm", "raydium"]
+        pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
         last_error = None
         
         for pool in pools_to_try:
@@ -775,7 +775,7 @@ class PositionManager:
             pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
             # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
-            pools_to_try = ["pump", "pump-amm", "raydium"]
+            pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
             last_error = None
             
             for pool in pools_to_try:
