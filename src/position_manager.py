@@ -317,58 +317,76 @@ class PositionManager:
                 logger.error("retry_loop_error", error=str(e))
     
     async def _execute_direct_sell(self, token_mint: str, token_amount: int) -> SellResult:
-        """Execute a direct sell without position tracking."""
+        """Execute a direct sell without position tracking - tries Jupiter then PumpPortal."""
+        import base64
+        from solders.transaction import VersionedTransaction
+        
+        # First try Jupiter
         try:
-            # Get quote for selling
             quote = await self._get_quote(
                 input_mint=token_mint,
                 output_mint=NATIVE_SOL,
                 amount=token_amount
             )
             
-            if not quote:
-                return SellResult(success=False, error="no_quote")
-            
-            # Get swap transaction with HIGH priority fees
-            swap_data = {
-                "quoteResponse": quote,
-                "userPublicKey": str(self.wallet.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 500000  # Very high priority for retries
-            }
-            
-            async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
-                if resp.status != 200:
-                    error = await resp.text()
-                    return SellResult(success=False, error=f"swap_api: {error}")
-                swap_response = await resp.json()
-            
-            # Sign and send
-            import base64
-            from solders.transaction import VersionedTransaction
-            
-            swap_tx = swap_response.get("swapTransaction")
-            if not swap_tx:
-                return SellResult(success=False, error="no_swap_tx")
-            
-            tx_bytes = base64.b64decode(swap_tx)
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet])
-            
-            signature = await self.rpc.send_transaction(signed_tx)
-            
-            sol_received = int(quote.get("outAmount", 0)) / 1e9
-            
-            return SellResult(
-                success=True,
-                signature=signature,
-                sol_received=sol_received,
-                reason=ExitReason.COPIED_SELL
-            )
-            
+            if quote:
+                swap_data = {
+                    "quoteResponse": quote,
+                    "userPublicKey": str(self.wallet.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": 500000  # Very high priority for retries
+                }
+                
+                async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
+                    if resp.status == 200:
+                        swap_response = await resp.json()
+                        swap_tx = swap_response.get("swapTransaction")
+                        if swap_tx:
+                            tx_bytes = base64.b64decode(swap_tx)
+                            tx = VersionedTransaction.from_bytes(tx_bytes)
+                            signed_tx = VersionedTransaction(tx.message, [self.wallet])
+                            signature = await self.rpc.send_transaction(signed_tx)
+                            sol_received = int(quote.get("outAmount", 0)) / 1e9
+                            return SellResult(success=True, signature=signature, sol_received=sol_received, reason=ExitReason.COPIED_SELL)
         except Exception as e:
-            return SellResult(success=False, error=str(e))
+            logger.debug("direct_sell_jupiter_failed", token=token_mint[:8], error=str(e))
+        
+        # Fallback to PumpPortal - try multiple pools
+        pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
+        pools_to_try = ["pump", "pump-amm", "raydium"]
+        last_error = None
+        
+        for pool in pools_to_try:
+            try:
+                payload = {
+                    "publicKey": str(self.wallet.pubkey()),
+                    "action": "sell",
+                    "mint": token_mint,
+                    "denominatedInSol": "false",
+                    "amount": "100%",
+                    "slippage": pumpfun_slippage,
+                    "priorityFee": 0.005,
+                    "pool": pool
+                }
+                
+                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                    if resp.status != 200:
+                        last_error = await resp.text()
+                        continue
+                    tx_bytes = await resp.read()
+                
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx = VersionedTransaction(tx.message, [self.wallet])
+                signature = await self.rpc.send_transaction(signed_tx)
+                
+                logger.info("direct_sell_pumpfun_success", token=token_mint[:8], pool=pool)
+                return SellResult(success=True, signature=signature, sol_received=0, reason=ExitReason.COPIED_SELL)
+            except Exception as e:
+                last_error = str(e)
+                continue
+        
+        return SellResult(success=False, error=f"all_methods_failed: {last_error}")
     
     async def _monitor_loop(self) -> None:
         """Main loop to monitor positions and trigger sells."""
@@ -398,6 +416,20 @@ class PositionManager:
                 # Check market cap stop loss (if enabled)
                 if not exit_reason:
                     exit_reason = await self._check_mcap_stop_loss(position)
+                
+                # CRITICAL: Check if trader has exited (missed sell detection)
+                # Only check after holding for at least 2 minutes to avoid race conditions
+                if not exit_reason and position.age_minutes > 2:
+                    trader_exited = await self._check_trader_exited(position)
+                    if trader_exited:
+                        exit_reason = ExitReason.COPIED_SELL
+                        logger.warning(
+                            "missed_sell_detected_real",
+                            token=token_mint[:8],
+                            trader=position.copied_from[:8],
+                            age_minutes=f"{position.age_minutes:.1f}",
+                            message="Trader exited but we missed the sell - syncing now!"
+                        )
                 
                 if exit_reason:
                     positions_to_sell.append((token_mint, exit_reason))
@@ -551,6 +583,57 @@ class PositionManager:
         
         return None
     
+    async def _check_trader_exited(self, position: Position) -> bool:
+        """Check if the trader we copied has exited this position.
+        
+        CRITICAL for missed sell detection - if trader sold and we missed it,
+        we need to know so we can sync our position.
+        
+        Returns:
+            True if trader has exited (we should sell), False if they still hold
+        """
+        try:
+            trader_wallet = position.copied_from
+            token_mint = position.token_mint
+            
+            # Use getTokenAccountsByOwner RPC call to check trader's balance
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    trader_wallet,
+                    {"mint": token_mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if result and "value" in result:
+                accounts = result["value"]
+                if not accounts:
+                    # No token account = trader doesn't hold this token
+                    logger.debug("trader_no_token_account_real", trader=trader_wallet[:8], token=token_mint[:8])
+                    return True  # Trader exited
+                
+                # Check if balance is > 0
+                account_data = accounts[0].get("account", {}).get("data", {})
+                parsed = account_data.get("parsed", {}).get("info", {})
+                token_amount = parsed.get("tokenAmount", {})
+                amount = int(token_amount.get("amount", 0))
+                
+                if amount > 0:
+                    logger.debug("trader_still_holds_real", trader=trader_wallet[:8], token=token_mint[:8], amount=amount)
+                    return False  # Trader still holds
+                else:
+                    logger.debug("trader_exited_real", trader=trader_wallet[:8], token=token_mint[:8])
+                    return True  # Trader exited
+            
+            # If RPC call fails, assume trader still holds (safer - don't sell on error)
+            return False
+            
+        except Exception as e:
+            logger.debug("check_trader_exited_error", token=position.token_mint[:8], error=str(e))
+            # On error, assume trader still holds (safer)
+            return False
+    
     async def _sell_position(
         self, 
         token_mint: str, 
@@ -682,54 +765,67 @@ class PositionManager:
             return SellResult(success=False, error=str(e))
     
     async def _execute_pumpfun_sell(self, position: Position) -> SellResult:
-        """Execute a sell on Pump.fun's bonding curve."""
+        """Execute a sell via PumpPortal API - tries multiple pools."""
         try:
             import base64
             from solders.transaction import VersionedTransaction
             
             # Request transaction from PumpPortal - sell 100% of holdings
-            # Use high slippage for pump.fun (tokens move fast) - minimum 15%
-            pumpfun_slippage = max(self.config.slippage_bps / 100, 15)
+            # Use high slippage for pump.fun (tokens move fast) - minimum 30%
+            pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
-            payload = {
-                "publicKey": str(self.wallet.pubkey()),
-                "action": "sell",
-                "mint": position.token_mint,
-                "denominatedInSol": "false",
-                "amount": "100%",  # Sell all tokens
-                "slippage": pumpfun_slippage,
-                "priorityFee": 0.001,  # Higher priority for faster execution
-                "pool": "pump"
-            }
+            # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
+            pools_to_try = ["pump", "pump-amm", "raydium"]
+            last_error = None
             
-            logger.info(
-                "pumpfun_sell_request",
-                token=position.token_mint[:8]
-            )
-            
-            async with self.session.post(PUMPFUN_API, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    return SellResult(success=False, error=f"pumpfun_api: {error_text}")
+            for pool in pools_to_try:
+                payload = {
+                    "publicKey": str(self.wallet.pubkey()),
+                    "action": "sell",
+                    "mint": position.token_mint,
+                    "denominatedInSol": "false",
+                    "amount": "100%",  # Sell all tokens
+                    "slippage": pumpfun_slippage,
+                    "priorityFee": 0.005,  # Higher priority for faster execution
+                    "pool": pool
+                }
                 
-                tx_bytes = await resp.read()
+                logger.info(
+                    "pumpfun_sell_request",
+                    token=position.token_mint[:8],
+                    pool=pool
+                )
+                
+                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        last_error = f"{pool}: {error_text}"
+                        logger.debug("pumpfun_sell_pool_failed", pool=pool, status=resp.status, response=error_text[:100], token=position.token_mint[:8])
+                        continue  # Try next pool
+                    
+                    tx_bytes = await resp.read()
+                
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx = VersionedTransaction(tx.message, [self.wallet])
+                
+                signature = await self.rpc.send_transaction(signed_tx)
+                
+                logger.info(
+                    "pumpfun_sell_success",
+                    token=position.token_mint[:8],
+                    pool=pool,
+                    signature=str(signature)[:16] if signature else None
+                )
+                
+                return SellResult(
+                    success=True,
+                    signature=signature,
+                    sol_received=position.current_value_sol  # Estimate
+                )
             
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet])
-            
-            signature = await self.rpc.send_transaction(signed_tx)
-            
-            logger.info(
-                "pumpfun_sell_success",
-                token=position.token_mint[:8],
-                signature=str(signature)[:16] if signature else None
-            )
-            
-            return SellResult(
-                success=True,
-                signature=signature,
-                sol_received=position.current_value_sol  # Estimate
-            )
+            # All pools failed
+            logger.warning("pumpfun_sell_all_pools_failed", token=position.token_mint[:8], last_error=last_error)
+            return SellResult(success=False, error=f"pumpfun_api: {last_error}")
             
         except Exception as e:
             logger.error("pumpfun_sell_error", error=str(e))

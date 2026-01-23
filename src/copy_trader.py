@@ -330,28 +330,53 @@ class CopyTrader:
                     
                     # Rug detection checks - ALWAYS run to protect from unsellable tokens
                     # Even when trust_trader is on for buys, we still protect exits
-                    if not should_sell:
-                        if liquidity < MIN_LIQUIDITY_USD and liquidity > 0 and age_minutes > 3:
+                    if not should_sell and age_minutes > 3:
+                        # Check liquidity - $0 liquidity means can't sell!
+                        if liquidity == 0:
+                            reason = f"rug_detected_zero_liquidity (can't sell!)"
+                            should_sell = True
+                            current_value = entry_sol * 0.05  # Assume 95% loss - can't actually sell
+                            logger.info("rug_zero_liquidity", wallet=wallet[:8], token=mint[:8])
+                        elif liquidity < MIN_LIQUIDITY_USD:
                             reason = f"rug_detected_low_liquidity (${liquidity:,.0f} < ${MIN_LIQUIDITY_USD:,.0f})"
                             should_sell = True
                             current_value = entry_sol * 0.1  # Assume 90% loss
                             logger.info("rug_low_liquidity", wallet=wallet[:8], token=mint[:8], liquidity=f"${liquidity:,.0f}")
-                        elif market_cap < MIN_MARKET_CAP_USD and market_cap > 0 and age_minutes > 3:
-                            reason = f"rug_detected_low_mcap (${market_cap:,.0f} < ${MIN_MARKET_CAP_USD:,.0f})"
-                            should_sell = True
-                            current_value = entry_sol * 0.1
-                            logger.info("rug_low_mcap", wallet=wallet[:8], token=mint[:8], market_cap=f"${market_cap:,.0f}")
-                        elif market_cap == 0 and liquidity == 0 and age_minutes > 3:
+                        # Check market cap
+                        elif market_cap == 0:
                             reason = "rug_detected_not_on_dex"
                             should_sell = True
                             current_value = entry_sol * 0.05  # Assume 95% loss
                             logger.info("rug_not_on_dex", wallet=wallet[:8], token=mint[:8])
+                        elif market_cap < MIN_MARKET_CAP_USD:
+                            reason = f"rug_detected_low_mcap (${market_cap:,.0f} < ${MIN_MARKET_CAP_USD:,.0f})"
+                            should_sell = True
+                            current_value = entry_sol * 0.1
+                            logger.info("rug_low_mcap", wallet=wallet[:8], token=mint[:8], market_cap=f"${market_cap:,.0f}")
                     
                     # Stale position fallback: if held >4 hours and no price, force sell as dead
                     if not should_sell and hold_minutes > 240 and current_value == 0:
                         reason = f"stale_position_no_price (held {hold_minutes/60:.1f}h)"
                         should_sell = True
                         current_value = entry_sol * 0.02  # Assume 98% loss for dead tokens
+                    
+                    # CRITICAL: Check if trader has exited this position (missed sell detection)
+                    # Only check after holding for at least 2 minutes to avoid race conditions
+                    if not should_sell and hold_minutes > 2:
+                        trader_still_holds = await self._check_trader_holds_token(wallet, mint)
+                        if not trader_still_holds:
+                            reason = f"trader_exited_position (missed sell - syncing with trader)"
+                            should_sell = True
+                            # Use current value if available, otherwise estimate based on current mcap
+                            if current_value == 0:
+                                current_value = entry_sol * 0.5  # Conservative estimate
+                            logger.warning(
+                                "missed_sell_detected",
+                                wallet=wallet[:8],
+                                token=mint[:8],
+                                hold_minutes=f"{hold_minutes:.1f}",
+                                message="Trader exited but we missed the sell - syncing now!"
+                            )
                     
                     if should_sell and reason:
                         await self._auto_mock_sell(wallet, mint, tokens_held, entry_sol, current_value, reason)
@@ -907,10 +932,17 @@ class CopyTrader:
             # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
             is_pumpfun = swap.dex == "pump.fun"
-            
+
             # Get token info from DexScreener for ALL tokens (including pump.fun)
-            market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h = await self._get_token_info(swap.token_mint)
-            
+            (
+                market_cap,
+                age_minutes,
+                liquidity,
+                volume_24h,
+                price_change_1h,
+                txns_1h,
+            ) = await self._get_token_info(swap.token_mint)
+
             # Log the token info
             logger.info(
                 "token_info_fetched",
@@ -918,14 +950,15 @@ class CopyTrader:
                 dex=swap.dex,
                 market_cap=f"${market_cap:,.0f}",
                 age=f"{age_minutes:.1f}m",
-                liquidity=f"${liquidity:,.0f}"
+                liquidity=f"${liquidity:,.0f}",
             )
             
-            # Only skip filters if explicitly configured (trust_trader_pumpfun setting)
-            skip_filters = self.trust_trader_pumpfun
+            # trust_trader_pumpfun: skip TIMING filters (age, volume, txns, price change)
+            # but ALWAYS apply SAFETY filters (market cap, liquidity) to avoid buying into rugs
+            skip_timing_filters = self.trust_trader_pumpfun
             
-            # Check token age
-            if not skip_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
+            # Check token age (timing filter - can be skipped)
+            if not skip_timing_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
                 logger.info(
                     "skipping_new_token",
                     token=swap.token_mint[:8],
@@ -938,8 +971,12 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # Check market cap
-            if not skip_filters and self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
+            # SAFETY filters - apply unless token is brand new pump.fun (no DEX data yet)
+            # $0 mcap + $0 liquidity = not on DEX yet (early pump.fun) - trust trader if enabled
+            is_early_pumpfun = (market_cap == 0 and liquidity == 0 and skip_timing_filters)
+            
+            # Check market cap (SAFETY filter)
+            if not is_early_pumpfun and self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
                 logger.info(
                     "skipping_low_mcap",
                     token=swap.token_mint[:8],
@@ -952,8 +989,8 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # Check liquidity - CRITICAL for being able to sell!
-            if not skip_filters and self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
+            # Check liquidity - CRITICAL for being able to sell! (SAFETY filter)
+            if not is_early_pumpfun and self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
                 logger.info(
                     "skipping_low_liquidity",
                     token=swap.token_mint[:8],
@@ -966,8 +1003,8 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # Check 24h volume - indicates trading activity
-            if not skip_filters and self.min_volume_24h_usd > 0 and volume_24h < self.min_volume_24h_usd:
+            # Check 24h volume - indicates trading activity (timing filter - can be skipped)
+            if not skip_timing_filters and self.min_volume_24h_usd > 0 and volume_24h < self.min_volume_24h_usd:
                 logger.info(
                     "skipping_low_volume",
                     token=swap.token_mint[:8],
@@ -980,8 +1017,8 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # Check if token already pumped too much - avoid buying tops!
-            if not skip_filters and self.max_price_change_1h_pct > 0 and price_change_1h > self.max_price_change_1h_pct:
+            # Check if token already pumped too much - avoid buying tops! (timing filter - can be skipped)
+            if not skip_timing_filters and self.max_price_change_1h_pct > 0 and price_change_1h > self.max_price_change_1h_pct:
                 logger.info(
                     "skipping_already_pumped",
                     token=swap.token_mint[:8],
@@ -994,8 +1031,8 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # Check minimum transactions - ensure active trading
-            if not skip_filters and self.min_txns_1h > 0 and txns_1h < self.min_txns_1h:
+            # Check minimum transactions - ensure active trading (timing filter - can be skipped)
+            if not skip_timing_filters and self.min_txns_1h > 0 and txns_1h < self.min_txns_1h:
                 logger.info(
                     "skipping_low_activity",
                     token=swap.token_mint[:8],
@@ -1487,7 +1524,7 @@ class CopyTrader:
         is_buy: bool,
         sell_percentage: int = 100  # For sells: percentage of holdings to sell (100 = all)
     ) -> CopyTradeResult:
-        """Execute a swap on Pump.fun's bonding curve."""
+        """Execute a swap via PumpPortal API - tries multiple pools."""
         try:
             import base64
             from solders.transaction import VersionedTransaction
@@ -1498,62 +1535,74 @@ class CopyTrader:
             # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 30%
             pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
-            if is_buy:
-                payload = {
-                    "publicKey": str(self.wallet.pubkey()),
-                    "action": action,
-                    "mint": token_mint,
-                    "denominatedInSol": "true",
-                    "amount": sol_amount,
-                    "slippage": pumpfun_slippage,
-                    "priorityFee": 0.005,  # High priority for faster execution
-                    "pool": "pump"
-                }
-            else:
-                # For sells, use percentage of holdings
-                payload = {
-                    "publicKey": str(self.wallet.pubkey()),
-                    "action": action,
-                    "mint": token_mint,
-                    "denominatedInSol": "false",
-                    "amount": f"{sell_percentage}%",
-                    "slippage": pumpfun_slippage,
-                    "priorityFee": 0.005,
-                    "pool": "pump"
-                }
+            # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
+            pools_to_try = ["pump", "pump-amm", "raydium"]
+            last_error = None
             
-            logger.info(
-                "pumpfun_swap_request",
-                action=action,
-                token=token_mint[:8],
-                full_mint=token_mint,
-                sol=f"{sol_amount:.4f}"
-            )
-            
-            async with self.session.post(PUMPFUN_API, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning("pumpfun_api_error_detail", status=resp.status, response=error_text[:200], mint=token_mint)
-                    return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {error_text}")
+            for pool in pools_to_try:
+                if is_buy:
+                    payload = {
+                        "publicKey": str(self.wallet.pubkey()),
+                        "action": action,
+                        "mint": token_mint,
+                        "denominatedInSol": "true",
+                        "amount": sol_amount,
+                        "slippage": pumpfun_slippage,
+                        "priorityFee": 0.005,  # High priority for faster execution
+                        "pool": pool
+                    }
+                else:
+                    # For sells, use percentage of holdings
+                    payload = {
+                        "publicKey": str(self.wallet.pubkey()),
+                        "action": action,
+                        "mint": token_mint,
+                        "denominatedInSol": "false",
+                        "amount": f"{sell_percentage}%",
+                        "slippage": pumpfun_slippage,
+                        "priorityFee": 0.005,
+                        "pool": pool
+                    }
                 
-                # Response is the raw transaction bytes
-                tx_bytes = await resp.read()
+                logger.info(
+                    "pumpfun_swap_request",
+                    action=action,
+                    token=token_mint[:8],
+                    full_mint=token_mint,
+                    sol=f"{sol_amount:.4f}",
+                    pool=pool
+                )
+                
+                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        last_error = f"{pool}: {error_text}"
+                        logger.debug("pumpfun_pool_failed", pool=pool, status=resp.status, response=error_text[:100], mint=token_mint[:8])
+                        continue  # Try next pool
+                    
+                    # Response is the raw transaction bytes
+                    tx_bytes = await resp.read()
+                
+                # Deserialize and sign the transaction
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx = VersionedTransaction(tx.message, [self.wallet])
+                
+                # Send the transaction
+                signature = await self.rpc.send_transaction(signed_tx)
+                
+                logger.info(
+                    "pumpfun_swap_success",
+                    action=action,
+                    token=token_mint[:8],
+                    pool=pool,
+                    signature=str(signature)[:16] if signature else None
+                )
+                
+                return CopyTradeResult(success=True, signature=signature)
             
-            # Deserialize and sign the transaction
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet])
-            
-            # Send the transaction
-            signature = await self.rpc.send_transaction(signed_tx)
-            
-            logger.info(
-                "pumpfun_swap_success",
-                action=action,
-                token=token_mint[:8],
-                signature=str(signature)[:16] if signature else None
-            )
-            
-            return CopyTradeResult(success=True, signature=signature)
+            # All pools failed
+            logger.warning("pumpfun_all_pools_failed", token=token_mint[:8], last_error=last_error)
+            return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {last_error}")
             
         except Exception as e:
             logger.error("pumpfun_swap_error", error=str(e))
@@ -1748,6 +1797,55 @@ class CopyTrader:
         except Exception as e:
             logger.debug("get_token_balance_error", mint=mint[:8], error=str(e))
             return 0
+    
+    async def _check_trader_holds_token(self, trader_wallet: str, mint: str) -> bool:
+        """Check if the tracked trader still holds a specific token on-chain.
+        
+        This is CRITICAL for missed sell detection - if trader sold and we missed it,
+        we need to know so we can sync our position.
+        
+        Returns:
+            True if trader still holds the token, False if they've exited
+        """
+        try:
+            # Use getTokenAccountsByOwner RPC call to check trader's balance
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    trader_wallet,
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if result and "value" in result:
+                accounts = result["value"]
+                if not accounts:
+                    # No token account = trader doesn't hold this token
+                    logger.info("trader_exited_no_account", trader=trader_wallet[:8], token=mint[:8])
+                    return False
+                
+                # Check if balance is > 0
+                account_data = accounts[0].get("account", {}).get("data", {})
+                parsed = account_data.get("parsed", {}).get("info", {})
+                token_amount = parsed.get("tokenAmount", {})
+                amount = int(token_amount.get("amount", 0))
+                
+                if amount > 0:
+                    logger.debug("trader_still_holds", trader=trader_wallet[:8], token=mint[:8], amount=amount)
+                    return True
+                else:
+                    logger.info("trader_exited_zero_balance", trader=trader_wallet[:8], token=mint[:8])
+                    return False
+            else:
+                # RPC returned unexpected format - log it
+                logger.warning("trader_check_unexpected_result", trader=trader_wallet[:8], token=mint[:8], result=str(result)[:100])
+                return True
+            
+        except Exception as e:
+            logger.warning("check_trader_holds_error", trader=trader_wallet[:8], token=mint[:8], error=str(e))
+            # On error, assume trader still holds (safer)
+            return True
     
     async def _get_token_info(self, mint: str) -> tuple[float, float, float, float, float, int]:
         """Get market cap, token age, liquidity, volume, price change and txn count using DexScreener API.
