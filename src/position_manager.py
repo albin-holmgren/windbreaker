@@ -712,13 +712,25 @@ class PositionManager:
         try:
             import base64
             from solders.transaction import VersionedTransaction
+            from solders.pubkey import Pubkey
             
-            # Use Pump.fun API for pump.fun tokens
+            # ALWAYS fetch actual on-chain token balance before selling
+            actual_balance = await self._get_actual_token_balance(position.token_mint)
+            if actual_balance and actual_balance > 0:
+                logger.info(
+                    "using_actual_balance_for_sell",
+                    token=position.token_mint[:8],
+                    tracked=position.token_amount,
+                    actual=actual_balance
+                )
+                position.token_amount = actual_balance
+            
+            # Use Pump.fun API for pump.fun tokens (uses 100% so doesn't need exact amount)
             if position.dex == "pump.fun":
                 return await self._execute_pumpfun_sell(position)
             
             # Use Jupiter for other DEXes
-            # Get quote
+            # Get quote with ACTUAL balance
             quote = await self._get_quote(
                 input_mint=position.token_mint,
                 output_mint=NATIVE_SOL,
@@ -830,6 +842,43 @@ class PositionManager:
         except Exception as e:
             logger.error("pumpfun_sell_error", error=str(e))
             return SellResult(success=False, error=f"pumpfun_error: {str(e)}")
+    
+    async def _get_actual_token_balance(self, token_mint: str) -> Optional[int]:
+        """Fetch actual on-chain token balance for our wallet."""
+        try:
+            from solders.pubkey import Pubkey
+            
+            wallet_pubkey = self.wallet.pubkey()
+            token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            mint_pubkey = Pubkey.from_string(token_mint)
+            
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(wallet_pubkey),
+                    {"mint": str(mint_pubkey)},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if not result or "value" not in result or not result["value"]:
+                return None
+            
+            # Get balance from first token account
+            for account in result["value"]:
+                try:
+                    parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
+                    if amount > 0:
+                        return amount
+                except Exception:
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.debug("get_actual_balance_error", token=token_mint[:8], error=str(e))
+            return None
     
     async def _get_quote(
         self, 

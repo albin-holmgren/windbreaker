@@ -220,6 +220,12 @@ class CopyTrader:
         if self.mock_trading:
             asyncio.create_task(self._mock_position_cleanup_loop())
         
+        # Start trader position monitor - checks if trader exited positions we hold
+        asyncio.create_task(self._trader_position_monitor_loop())
+        
+        # Start failed sells retry loop - keeps trying until all sells succeed
+        asyncio.create_task(self._failed_sells_retry_loop())
+        
         # Start monitoring (this blocks forever)
         await self.monitor.start()
     
@@ -232,6 +238,290 @@ class CopyTrader:
                 await self._cleanup_stale_mock_positions()
             except Exception as e:
                 logger.error("mock_cleanup_error", error=str(e))
+    
+    async def _trader_position_monitor_loop(self) -> None:
+        """Monitor tracked wallets' actual holdings and sell when they exit positions.
+        
+        This is a BACKUP mechanism - if we miss a sell transaction, this will catch
+        when the trader no longer holds a token we have a position in.
+        """
+        logger.info("trader_position_monitor_started", wallets=len(self.target_wallets))
+        
+        # Collect ALL holdings from ALL tracked wallets
+        check_count = 0
+        
+        while self.running:
+            try:
+                await asyncio.sleep(1)  # Check every 1 second for fast sell detection
+                check_count += 1
+                
+                # Collect holdings from ALL tracked wallets
+                all_trader_holdings: Set[str] = set()
+                
+                for wallet in self.target_wallets:
+                    try:
+                        holdings = await self._fetch_wallet_token_holdings(wallet)
+                        if holdings:
+                            all_trader_holdings.update(holdings)
+                    except Exception as e:
+                        logger.debug("fetch_holdings_error", wallet=wallet[:8], error=str(e))
+                
+                # Get ALL our real positions (regardless of which wallet they came from)
+                our_real_positions: Set[str] = set()
+                if self.position_manager:
+                    our_real_positions = set(self.position_manager.positions.keys())
+                
+                # Get ALL our mock positions across all wallets
+                our_mock_positions: Dict[str, Set[str]] = {}  # wallet -> set of mints
+                if self.mock_trading:
+                    for wallet, state in self.wallet_states.items():
+                        mints = {mint for mint, amount in state.get('positions', {}).items() if amount > 0}
+                        if mints:
+                            our_mock_positions[wallet] = mints
+                
+                # Log status every 20 checks (~60 seconds)
+                if check_count % 20 == 0:
+                    logger.info(
+                        "position_monitor_status",
+                        our_real_positions=len(our_real_positions),
+                        our_mock_wallets=len(our_mock_positions),
+                        trader_holdings=len(all_trader_holdings),
+                        real_tokens=[m[:8] for m in list(our_real_positions)[:5]]
+                    )
+                
+                # Check REAL positions - if trader doesn't hold ANY of our tokens, sell
+                for mint in list(our_real_positions):
+                    if mint not in all_trader_holdings:
+                        logger.warning(
+                            "trader_exited_position_detected",
+                            token=mint[:8],
+                            our_real=True,
+                            trader_holdings_count=len(all_trader_holdings),
+                            action="triggering_sell"
+                        )
+                        
+                        # Trigger real sell with retries until success
+                        from .position_manager import ExitReason
+                        max_retries = 10
+                        retry_delay = 2
+                        
+                        for attempt in range(max_retries):
+                            result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
+                            if result.success:
+                                logger.info(
+                                    "real_sell_triggered_trader_exit",
+                                    token=mint[:8],
+                                    sol=f"{result.sol_received:.4f}",
+                                    attempt=attempt + 1
+                                )
+                                break
+                            else:
+                                logger.warning(
+                                    "real_sell_retry",
+                                    token=mint[:8],
+                                    attempt=attempt + 1,
+                                    max_retries=max_retries,
+                                    error=result.error
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay = min(retry_delay * 1.5, 10)
+                        else:
+                            logger.error(
+                                "real_sell_all_retries_failed",
+                                token=mint[:8],
+                                attempts=max_retries
+                            )
+                            if not hasattr(self, '_failed_sells'):
+                                self._failed_sells = set()
+                            self._failed_sells.add(mint)
+                
+                # Check MOCK positions for each wallet
+                for wallet, mints in our_mock_positions.items():
+                    for mint in list(mints):
+                        if mint not in all_trader_holdings:
+                            logger.warning(
+                                "trader_exited_mock_position",
+                                wallet=wallet[:8],
+                                token=mint[:8]
+                            )
+                            await self._trigger_exit_sell(wallet, mint, "trader_exited")
+                        
+            except Exception as e:
+                logger.error("trader_position_monitor_error", error=str(e))
+    
+    async def _failed_sells_retry_loop(self) -> None:
+        """Keep retrying failed sells until they succeed."""
+        self._failed_sells: Set[str] = set()
+        
+        while self.running:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if not self._failed_sells or not self.position_manager:
+                    continue
+                
+                # Copy set to avoid modification during iteration
+                mints_to_retry = list(self._failed_sells)
+                
+                for mint in mints_to_retry:
+                    # Check if we still have this position
+                    if not self.position_manager.has_position(mint):
+                        self._failed_sells.discard(mint)
+                        continue
+                    
+                    logger.info("retrying_failed_sell", token=mint[:8])
+                    
+                    from .position_manager import ExitReason
+                    result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
+                    
+                    if result.success:
+                        logger.info(
+                            "failed_sell_finally_succeeded",
+                            token=mint[:8],
+                            sol=f"{result.sol_received:.4f}"
+                        )
+                        self._failed_sells.discard(mint)
+                    else:
+                        logger.warning(
+                            "failed_sell_still_failing",
+                            token=mint[:8],
+                            error=result.error,
+                            next_retry="30s"
+                        )
+                    
+                    # Small delay between retries
+                    await asyncio.sleep(2)
+                    
+            except Exception as e:
+                logger.error("failed_sells_retry_error", error=str(e))
+    
+    async def _fetch_wallet_token_holdings(self, wallet: str) -> Optional[Set[str]]:
+        """Fetch all token mints that a wallet currently holds."""
+        try:
+            from solders.pubkey import Pubkey
+            
+            token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            wallet_pubkey = Pubkey.from_string(wallet)
+            
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(wallet_pubkey),
+                    {"programId": str(token_program)},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if not result or "value" not in result:
+                return None
+            
+            holdings = set()
+            for account in result["value"]:
+                try:
+                    parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    mint = parsed.get("mint", "")
+                    amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
+                    
+                    # Only include tokens with actual balance
+                    if amount > 0 and mint:
+                        holdings.add(mint)
+                except Exception:
+                    continue
+            
+            return holdings
+            
+        except Exception as e:
+            logger.debug("fetch_wallet_holdings_error", wallet=wallet[:8], error=str(e))
+            return None
+    
+    async def _trigger_exit_sell(self, wallet: str, mint: str, reason: str) -> None:
+        """Trigger a mock sell when trader exits a position."""
+        if wallet not in self.wallet_states:
+            return
+        
+        state = self.wallet_states[wallet]
+        positions = state.get('positions', {})
+        token_balance = positions.get(mint, 0)
+        
+        if token_balance <= 0:
+            return
+        
+        # Get current price to calculate SOL received
+        try:
+            market_cap, _, liquidity, _, _, _ = await self._get_token_info(mint)
+            
+            # Estimate token value (rough estimate based on position size)
+            entry_sol = state.get('entry_sol', {}).get(mint, 0.05)
+            
+            # If liquidity is very low, we likely can't sell - abandon position
+            if liquidity < 1000:
+                logger.warning(
+                    "mock_position_abandoned_no_liquidity",
+                    wallet=wallet[:8],
+                    token=mint[:8],
+                    liquidity=f"${liquidity:.0f}",
+                    entry_sol=f"{entry_sol:.4f}"
+                )
+                # Remove position without adding SOL back (total loss)
+                positions[mint] = 0
+                if mint in state.get('entry_sol', {}):
+                    del state['entry_sol'][mint]
+                if mint in state.get('entry_times', {}):
+                    del state['entry_times'][mint]
+                
+                # Log as abandoned trade
+                state.setdefault('trades_history', []).append({
+                    'type': 'abandoned',
+                    'token': mint[:8],
+                    'full_mint': mint,
+                    'sol': 0,
+                    'entry_sol': entry_sol,
+                    'pnl': -entry_sol,
+                    'reason': f'{reason}_no_liquidity',
+                    'timestamp': datetime.now().isoformat()
+                })
+                self._save_wallet_state(wallet)
+                return
+            
+            # Estimate current value - assume same ratio as entry for simplicity
+            # In reality this could be higher or lower
+            estimated_sol = entry_sol * 0.8  # Assume 20% loss on average when forced to sell
+            
+            # Update mock state
+            positions[mint] = 0
+            state['balance'] = state.get('balance', 1.0) + estimated_sol
+            pnl = estimated_sol - entry_sol
+            
+            if mint in state.get('entry_sol', {}):
+                del state['entry_sol'][mint]
+            if mint in state.get('entry_times', {}):
+                del state['entry_times'][mint]
+            
+            # Log the trade
+            state.setdefault('trades_history', []).append({
+                'type': 'auto_sell',
+                'token': mint[:8],
+                'full_mint': mint,
+                'sol': estimated_sol,
+                'entry_sol': entry_sol,
+                'pnl': pnl,
+                'reason': reason,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            logger.info(
+                "mock_auto_sell_trader_exit",
+                wallet=wallet[:8],
+                token=mint[:8],
+                sol_received=f"{estimated_sol:.4f}",
+                pnl=f"{pnl:.4f}",
+                new_balance=f"{state['balance']:.4f}"
+            )
+            
+            self._save_wallet_state(wallet)
+            
+        except Exception as e:
+            logger.error("trigger_exit_sell_error", wallet=wallet[:8], token=mint[:8], error=str(e))
     
     async def _cleanup_stale_mock_positions(self) -> None:
         """Check mock positions for rug protection and stop-loss.
