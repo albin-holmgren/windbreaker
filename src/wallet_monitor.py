@@ -223,8 +223,6 @@ class WalletMonitor:
                 if signature in self.seen_signatures.get(matched_wallet, set()):
                     return
                 
-                self.seen_signatures[matched_wallet].add(signature)
-                
                 logger.info(
                     "websocket_tx_detected",
                     wallet=matched_wallet[:8],
@@ -234,8 +232,24 @@ class WalletMonitor:
                 
                 # Only process successful transactions
                 if err is None:
-                    # Fetch full transaction details FAST
+                    # Small delay to ensure transaction is confirmed on RPC
+                    await asyncio.sleep(0.3)
+                    
+                    # Fetch full transaction details with retry
                     tx_data = await self._get_transaction(signature)
+                    if not tx_data:
+                        # Retry once after short delay
+                        await asyncio.sleep(0.5)
+                        tx_data = await self._get_transaction(signature)
+                    
+                    if not tx_data:
+                        # Don't add to seen - let polling pick it up as fallback
+                        logger.warning("ws_tx_fetch_failed", wallet=matched_wallet[:8], signature=signature[:16])
+                        return
+                    
+                    # Only mark as seen AFTER successful fetch
+                    self.seen_signatures[matched_wallet].add(signature)
+                    
                     if tx_data:
                         tx = WalletTransaction(
                             signature=signature,
