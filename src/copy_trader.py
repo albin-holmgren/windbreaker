@@ -268,9 +268,33 @@ class CopyTrader:
                         logger.debug("fetch_holdings_error", wallet=wallet[:8], error=str(e))
                 
                 # Get ALL our real positions (regardless of which wallet they came from)
+                # CRITICAL: Also fetch actual on-chain holdings to catch positions not in memory
                 our_real_positions: Set[str] = set()
                 if self.position_manager:
                     our_real_positions = set(self.position_manager.positions.keys())
+                
+                # Sync with actual on-chain holdings (backup for missed tracking)
+                if self.real_trading_enabled:
+                    try:
+                        our_wallet = str(self.wallet.pubkey())
+                        actual_holdings = await self._fetch_wallet_token_holdings(our_wallet)
+                        if actual_holdings:
+                            new_found = 0
+                            # Add any on-chain holdings not in position_manager
+                            for mint in actual_holdings:
+                                if mint not in our_real_positions:
+                                    our_real_positions.add(mint)
+                                    new_found += 1
+                            if new_found > 0:
+                                logger.info(
+                                    "synced_onchain_holdings",
+                                    wallet=our_wallet[:8],
+                                    found=len(actual_holdings),
+                                    new_added=new_found,
+                                    total_real=len(our_real_positions)
+                                )
+                    except Exception as e:
+                        logger.warning("fetch_our_holdings_error", error=str(e))
                 
                 # Get ALL our mock positions across all wallets
                 our_mock_positions: Dict[str, Set[str]] = {}  # wallet -> set of mints
@@ -306,15 +330,37 @@ class CopyTrader:
                         max_retries = 10
                         retry_delay = 2
                         
+                        # Check if position is tracked by position_manager
+                        in_position_manager = self.position_manager and mint in self.position_manager.positions
+                        
                         for attempt in range(max_retries):
-                            result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
+                            if in_position_manager:
+                                result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
+                            else:
+                                # Token is on-chain but not tracked - sell directly via pump.fun/jupiter
+                                logger.info("selling_untracked_token", token=mint[:8], attempt=attempt+1)
+                                # Try pump.fun first
+                                result = await self._execute_pumpfun_swap(
+                                    token_mint=mint,
+                                    sol_amount=0,  # Not used for sells
+                                    is_buy=False,
+                                    sell_percentage=100
+                                )
+                                # If pump.fun fails, try Jupiter
+                                if not result.success:
+                                    logger.info("pumpfun_sell_failed_trying_jupiter", token=mint[:8])
+                                    result = await self._sell_via_jupiter(mint)
+                            
                             if result.success:
                                 logger.info(
                                     "real_sell_triggered_trader_exit",
                                     token=mint[:8],
-                                    sol=f"{result.sol_received:.4f}",
-                                    attempt=attempt + 1
+                                    sol=f"{result.sol_received:.4f}" if hasattr(result, 'sol_received') and result.sol_received else "unknown",
+                                    attempt=attempt + 1,
+                                    was_tracked=in_position_manager
                                 )
+                                # Remove from our tracking
+                                our_real_positions.discard(mint)
                                 break
                             else:
                                 logger.warning(
@@ -2050,6 +2096,72 @@ class CopyTrader:
         except Exception as e:
             logger.error("pumpfun_swap_error", error=str(e))
             return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
+    
+    async def _sell_via_jupiter(self, token_mint: str) -> CopyTradeResult:
+        """Sell all tokens via Jupiter as fallback when pump.fun fails."""
+        try:
+            import base64
+            from solders.transaction import VersionedTransaction
+            from solders.pubkey import Pubkey
+            
+            # First get actual token balance
+            token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            wallet_pubkey = self.wallet.pubkey()
+            
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(wallet_pubkey),
+                    {"mint": token_mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if not result or "value" not in result or not result["value"]:
+                return CopyTradeResult(success=False, error="no_token_account")
+            
+            amount = int(result["value"][0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+            if amount == 0:
+                return CopyTradeResult(success=False, error="zero_balance")
+            
+            logger.info("jupiter_sell_attempt", token=token_mint[:8], amount=amount)
+            
+            # Get Jupiter quote
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={token_mint}&outputMint={NATIVE_SOL}&amount={amount}&slippageBps=5000"
+            async with self.session.get(quote_url) as resp:
+                if resp.status != 200:
+                    return CopyTradeResult(success=False, error=f"quote_failed: {await resp.text()}")
+                quote = await resp.json()
+            
+            out_sol = int(quote.get("outAmount", 0)) / 1e9
+            logger.info("jupiter_quote", token=token_mint[:8], out_sol=f"{out_sol:.6f}")
+            
+            # Get swap transaction
+            swap_payload = {
+                "quoteResponse": quote,
+                "userPublicKey": str(wallet_pubkey),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "auto"
+            }
+            async with self.session.post("https://quote-api.jup.ag/v6/swap", json=swap_payload) as resp:
+                if resp.status != 200:
+                    return CopyTradeResult(success=False, error=f"swap_failed: {await resp.text()}")
+                swap_data = await resp.json()
+            
+            # Sign and send
+            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signed_tx = VersionedTransaction(tx.message, [self.wallet])
+            
+            signature = await self.rpc.send_transaction(signed_tx)
+            
+            logger.info("jupiter_sell_success", token=token_mint[:8], sol=f"{out_sol:.6f}", signature=str(signature)[:16])
+            return CopyTradeResult(success=True, signature=signature, sol_received=out_sol)
+            
+        except Exception as e:
+            logger.error("jupiter_sell_error", token=token_mint[:8], error=str(e))
+            return CopyTradeResult(success=False, error=f"jupiter_error: {str(e)}")
     
     def _simulate_mock_buy(self, swap: 'ParsedSwap', trade_sol: float) -> 'CopyTradeResult':
         """Simulate a buy trade without executing on-chain."""

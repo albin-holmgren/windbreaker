@@ -448,6 +448,27 @@ class PositionManager:
     async def _update_position_value(self, position: Position) -> None:
         """Update the current value of a position."""
         try:
+            # CRITICAL: Fetch actual on-chain balance instead of using placeholder
+            actual_balance = await self._get_actual_token_balance(position.token_mint)
+            if actual_balance and actual_balance > 0:
+                if actual_balance != position.token_amount:
+                    logger.debug(
+                        "updating_token_amount",
+                        token=position.token_mint[:8],
+                        old=position.token_amount,
+                        new=actual_balance
+                    )
+                position.token_amount = actual_balance
+            elif actual_balance == 0:
+                # Token balance is 0 - position was already sold or rugged
+                logger.warning(
+                    "zero_balance_detected",
+                    token=position.token_mint[:8],
+                    message="Token balance is 0 on-chain"
+                )
+                position.current_value_sol = 0
+                return
+            
             # Get quote for selling our tokens
             quote = await self._get_quote(
                 input_mint=position.token_mint,
