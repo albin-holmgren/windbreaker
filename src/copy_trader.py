@@ -19,6 +19,7 @@ from .tx_parser import TransactionParser, ParsedSwap, SwapType
 from .config import Config
 from .position_manager import PositionManager
 from .trade_logger import trade_logger
+from .detection_logger import detection_logger
 
 logger = structlog.get_logger(__name__)
 
@@ -1231,10 +1232,15 @@ class CopyTrader:
                         trade_logger.log_sell(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
-                            sol_received=0,
-                            tokens_sold=real_balance,
+                            our_sol_received=swap.sol_value * 0.01,  # Estimate
+                            our_tokens_sold=real_balance,
                             our_signature=result.signature or "",
-                            trigger="copied_sell",
+                            copied_wallet=swap.wallet,
+                            their_sol=swap.sol_value,
+                            their_signature=swap.signature,
+                            delay_seconds=0,
+                            entry_sol=swap.sol_value * 0.01,  # Estimate
+                            exit_reason="copied_sell",
                             success=True
                         )
                         logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
@@ -1304,6 +1310,26 @@ class CopyTrader:
             # but ALWAYS apply SAFETY filters (market cap, liquidity) to avoid buying into rugs
             skip_timing_filters = self.trust_trader_pumpfun
             
+            # Helper to log detection with all market data
+            def log_skip(skip_reason: str):
+                detection_logger.log_detection(
+                    wallet=swap.wallet,
+                    trade_type="buy",
+                    token_mint=swap.token_mint,
+                    token_symbol=swap.token_symbol,
+                    dex=swap.dex,
+                    their_sol=swap.sol_value,
+                    their_signature=swap.signature,
+                    market_cap_usd=market_cap,
+                    liquidity_usd=liquidity,
+                    volume_24h_usd=volume_24h,
+                    age_minutes=age_minutes,
+                    price_change_1h=price_change_1h,
+                    txns_1h=txns_1h,
+                    copied=False,
+                    skip_reason=skip_reason
+                )
+            
             # Check token age (timing filter - can be skipped)
             if not skip_timing_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
                 logger.info(
@@ -1312,6 +1338,7 @@ class CopyTrader:
                     age=f"{age_minutes:.1f}m",
                     min_age=f"{self.min_token_age_minutes}m"
                 )
+                log_skip(f"token_too_new ({age_minutes:.1f}m < {self.min_token_age_minutes}m)")
                 return CopyTradeResult(
                     success=False,
                     error=f"token_too_new ({age_minutes:.1f}m < {self.min_token_age_minutes}m)",
@@ -1330,6 +1357,7 @@ class CopyTrader:
                     market_cap=f"${market_cap:,.0f}",
                     min_required=f"${self.min_market_cap_usd:,.0f}"
                 )
+                log_skip(f"market_cap_too_low (${market_cap:,.0f} < ${self.min_market_cap_usd:,.0f})")
                 return CopyTradeResult(
                     success=False,
                     error=f"market_cap_too_low (${market_cap:,.0f} < ${self.min_market_cap_usd:,.0f})",
@@ -1344,6 +1372,7 @@ class CopyTrader:
                     liquidity=f"${liquidity:,.0f}",
                     min_required=f"${self.min_liquidity_usd:,.0f}"
                 )
+                log_skip(f"liquidity_too_low (${liquidity:,.0f} < ${self.min_liquidity_usd:,.0f})")
                 return CopyTradeResult(
                     success=False,
                     error=f"liquidity_too_low (${liquidity:,.0f} < ${self.min_liquidity_usd:,.0f})",
@@ -1358,6 +1387,7 @@ class CopyTrader:
                     volume_24h=f"${volume_24h:,.0f}",
                     min_required=f"${self.min_volume_24h_usd:,.0f}"
                 )
+                log_skip(f"volume_too_low (${volume_24h:,.0f} < ${self.min_volume_24h_usd:,.0f})")
                 return CopyTradeResult(
                     success=False,
                     error=f"volume_too_low (${volume_24h:,.0f} < ${self.min_volume_24h_usd:,.0f})",
@@ -1372,6 +1402,7 @@ class CopyTrader:
                     price_change_1h=f"+{price_change_1h:.0f}%",
                     max_allowed=f"+{self.max_price_change_1h_pct:.0f}%"
                 )
+                log_skip(f"already_pumped (+{price_change_1h:.0f}% > +{self.max_price_change_1h_pct:.0f}%)")
                 return CopyTradeResult(
                     success=False,
                     error=f"already_pumped (+{price_change_1h:.0f}% > +{self.max_price_change_1h_pct:.0f}%)",
@@ -1386,6 +1417,7 @@ class CopyTrader:
                     txns_1h=txns_1h,
                     min_required=self.min_txns_1h
                 )
+                log_skip(f"low_activity ({txns_1h} txns < {self.min_txns_1h} min)")
                 return CopyTradeResult(
                     success=False,
                     error=f"low_activity ({txns_1h} txns < {self.min_txns_1h} min)",
@@ -1740,6 +1772,26 @@ class CopyTrader:
                         their_timestamp=None,
                         delay_seconds=(datetime.utcnow() - datetime.utcnow()).total_seconds(),  # TODO: track actual delay
                         success=True
+                    )
+                    
+                    # Log to detection logger for filter analysis
+                    detection_logger.log_detection(
+                        wallet=swap.wallet,
+                        trade_type="buy",
+                        token_mint=swap.token_mint,
+                        token_symbol=swap.token_symbol,
+                        dex=swap.dex,
+                        their_sol=swap.sol_value,
+                        their_signature=swap.signature,
+                        market_cap_usd=market_cap,
+                        liquidity_usd=liquidity,
+                        volume_24h_usd=volume_24h,
+                        age_minutes=age_minutes,
+                        price_change_1h=price_change_1h,
+                        txns_1h=txns_1h,
+                        copied=True,
+                        our_sol=trade_sol,
+                        our_signature=(real_result.signature if real_result else result.signature)
                     )
                 else:
                     self.stats.total_sol_received += trade_sol
