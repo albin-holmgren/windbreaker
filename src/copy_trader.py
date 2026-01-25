@@ -314,73 +314,118 @@ class CopyTrader:
                         real_tokens=[m[:8] for m in list(our_real_positions)[:5]]
                     )
                 
-                # Check REAL positions - if trader doesn't hold ANY of our tokens, sell
+                # Check REAL positions - if trader doesn't hold OR position value < $20 USD (rugged)
+                TRADER_RUG_THRESHOLD_USD = 20.0  # Sell if trader's position value drops below this
+                
                 for mint in list(our_real_positions):
+                    should_sell = False
+                    sell_reason = None
+                    trader_value_total = 0.0
+                    
                     if mint not in all_trader_holdings:
+                        # Trader completely exited - URGENT SELL
+                        should_sell = True
+                        sell_reason = "trader_exited"
                         logger.warning(
                             "trader_exited_position_detected",
                             token=mint[:8],
                             our_real=True,
                             trader_holdings_count=len(all_trader_holdings),
-                            action="triggering_sell"
+                            action="URGENT_SELL"
                         )
+                    else:
+                        # Trader still holds - check position value on EVERY iteration (critical!)
+                        for wallet in self.target_wallets:
+                            try:
+                                trader_value = await self._get_trader_position_value_usd(wallet, mint)
+                                if trader_value is not None:
+                                    trader_value_total += trader_value
+                            except Exception as e:
+                                logger.debug("trader_value_check_error", wallet=wallet[:8], token=mint[:8], error=str(e))
                         
-                        # Trigger real sell with retries until success
-                        from .position_manager import ExitReason
-                        max_retries = 10
-                        retry_delay = 2
-                        
-                        # Check if position is tracked by position_manager
-                        in_position_manager = self.position_manager and mint in self.position_manager.positions
-                        
-                        for attempt in range(max_retries):
-                            if in_position_manager:
-                                result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
-                            else:
-                                # Token is on-chain but not tracked - sell directly via pump.fun/jupiter
-                                logger.info("selling_untracked_token", token=mint[:8], attempt=attempt+1)
-                                # Try pump.fun first
-                                result = await self._execute_pumpfun_swap(
-                                    token_mint=mint,
-                                    sol_amount=0,  # Not used for sells
-                                    is_buy=False,
-                                    sell_percentage=100
-                                )
-                                # If pump.fun fails, try Jupiter
-                                if not result.success:
-                                    logger.info("pumpfun_sell_failed_trying_jupiter", token=mint[:8])
-                                    result = await self._sell_via_jupiter(mint)
-                            
-                            if result.success:
-                                logger.info(
-                                    "real_sell_triggered_trader_exit",
-                                    token=mint[:8],
-                                    sol=f"{result.sol_received:.4f}" if hasattr(result, 'sol_received') and result.sol_received else "unknown",
-                                    attempt=attempt + 1,
-                                    was_tracked=in_position_manager
-                                )
-                                # Remove from our tracking
-                                our_real_positions.discard(mint)
-                                break
-                            else:
-                                logger.warning(
-                                    "real_sell_retry",
-                                    token=mint[:8],
-                                    attempt=attempt + 1,
-                                    max_retries=max_retries,
-                                    error=result.error
-                                )
-                                await asyncio.sleep(retry_delay)
-                                retry_delay = min(retry_delay * 1.5, 10)
-                        else:
-                            logger.error(
-                                "real_sell_all_retries_failed",
+                        # Log every 5 checks for monitoring
+                        if check_count % 5 == 0:
+                            logger.info(
+                                "trader_position_value_check",
                                 token=mint[:8],
-                                attempts=max_retries
+                                trader_value_usd=f"${trader_value_total:.2f}",
+                                threshold=f"${TRADER_RUG_THRESHOLD_USD}"
                             )
-                            if not hasattr(self, '_failed_sells'):
-                                self._failed_sells = set()
-                            self._failed_sells.add(mint)
+                        
+                        # If trader's total position value < $20 USD, they've essentially rugged
+                        if trader_value_total < TRADER_RUG_THRESHOLD_USD:
+                            should_sell = True
+                            sell_reason = "trader_position_below_threshold"
+                            logger.warning(
+                                "trader_position_below_threshold",
+                                token=mint[:8],
+                                trader_value_usd=f"${trader_value_total:.2f}",
+                                threshold=f"${TRADER_RUG_THRESHOLD_USD}",
+                                action="URGENT_SELL"
+                            )
+                    
+                    if not should_sell:
+                        continue
+                        
+                    # Trigger real sell with retries until success
+                    from .position_manager import ExitReason
+                    exit_reason = ExitReason.COPIED_SELL if sell_reason == "trader_exited" else ExitReason.ABANDONED
+                    max_retries = 10
+                    retry_delay = 2
+                    
+                    # Check if position is tracked by position_manager
+                    in_position_manager = self.position_manager and mint in self.position_manager.positions
+                    
+                    for attempt in range(max_retries):
+                        if in_position_manager:
+                            result = await self.position_manager.trigger_sell(mint, exit_reason)
+                        else:
+                            # Token is on-chain but not tracked - sell directly via pump.fun/jupiter
+                            logger.info("selling_untracked_token", token=mint[:8], attempt=attempt+1, reason=sell_reason)
+                            # Try pump.fun first
+                            result = await self._execute_pumpfun_swap(
+                                token_mint=mint,
+                                sol_amount=0,  # Not used for sells
+                                is_buy=False,
+                                sell_percentage=100
+                            )
+                            # If pump.fun fails, try Jupiter
+                            if not result.success:
+                                logger.info("pumpfun_sell_failed_trying_jupiter", token=mint[:8])
+                                result = await self._sell_via_jupiter(mint)
+                        
+                        if result.success:
+                            logger.info(
+                                "real_sell_triggered",
+                                token=mint[:8],
+                                reason=sell_reason,
+                                sol=f"{result.sol_received:.4f}" if hasattr(result, 'sol_received') and result.sol_received else "unknown",
+                                attempt=attempt + 1,
+                                was_tracked=in_position_manager
+                            )
+                            # Remove from our tracking
+                            our_real_positions.discard(mint)
+                            break
+                        else:
+                            logger.warning(
+                                "real_sell_retry",
+                                token=mint[:8],
+                                attempt=attempt + 1,
+                                max_retries=max_retries,
+                                error=result.error
+                            )
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 1.5, 10)
+                    else:
+                        logger.error(
+                            "real_sell_all_retries_failed",
+                            token=mint[:8],
+                            reason=sell_reason,
+                            attempts=max_retries
+                        )
+                        if not hasattr(self, '_failed_sells'):
+                            self._failed_sells = set()
+                        self._failed_sells.add(mint)
                 
                 # Check MOCK positions for each wallet
                 for wallet, mints in our_mock_positions.items():
@@ -443,42 +488,111 @@ class CopyTrader:
                 logger.error("failed_sells_retry_error", error=str(e))
     
     async def _fetch_wallet_token_holdings(self, wallet: str) -> Optional[Set[str]]:
-        """Fetch all token mints that a wallet currently holds."""
+        """Fetch all token mints that a wallet currently holds (both SPL and Token-2022)."""
         try:
             from solders.pubkey import Pubkey
             
-            token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            # Query BOTH token programs (SPL Token and Token-2022)
+            token_programs = [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+            ]
             wallet_pubkey = Pubkey.from_string(wallet)
             
+            holdings = set()
+            
+            for program_id in token_programs:
+                try:
+                    result = await self.rpc._request(
+                        "getTokenAccountsByOwner",
+                        [
+                            str(wallet_pubkey),
+                            {"programId": program_id},
+                            {"encoding": "jsonParsed"}
+                        ]
+                    )
+                    
+                    if not result or "value" not in result:
+                        continue
+                    
+                    for account in result["value"]:
+                        try:
+                            parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                            mint = parsed.get("mint", "")
+                            amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
+                            
+                            # Only include tokens with actual balance
+                            if amount > 0 and mint:
+                                holdings.add(mint)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            
+            return holdings if holdings else None
+            
+        except Exception as e:
+            logger.debug("fetch_wallet_holdings_error", wallet=wallet[:8], error=str(e))
+            return None
+    
+    async def _get_trader_position_value_usd(self, wallet: str, mint: str) -> Optional[float]:
+        """Get the USD value of a trader's position in a specific token."""
+        try:
+            from solders.pubkey import Pubkey
+            
+            # Get trader's token balance
             result = await self.rpc._request(
                 "getTokenAccountsByOwner",
                 [
-                    str(wallet_pubkey),
-                    {"programId": str(token_program)},
+                    wallet,
+                    {"mint": mint},
                     {"encoding": "jsonParsed"}
                 ]
             )
             
-            if not result or "value" not in result:
-                return None
+            if not result or "value" not in result or not result["value"]:
+                return 0.0
             
-            holdings = set()
-            for account in result["value"]:
-                try:
-                    parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                    mint = parsed.get("mint", "")
-                    amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
-                    
-                    # Only include tokens with actual balance
-                    if amount > 0 and mint:
-                        holdings.add(mint)
-                except Exception:
-                    continue
+            token_amount = int(result["value"][0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+            decimals = int(result["value"][0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["decimals"])
             
-            return holdings
+            if token_amount == 0:
+                return 0.0
+            
+            # Get token price from DexScreener
+            market_cap, _, liquidity, _, _, _ = await self._get_token_info(mint)
+            
+            if market_cap <= 0:
+                return 0.0
+            
+            # Estimate position value: (token_amount / total_supply) * market_cap
+            # For simplicity, use liquidity as a proxy for sellable value
+            # A more accurate method would be to get a quote, but this is faster
+            token_amount_normalized = token_amount / (10 ** decimals)
+            
+            # Get total supply estimate from market cap and price
+            # Use DexScreener price data if available
+            try:
+                async with self.session.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                    timeout=5
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        pairs = data.get("pairs", [])
+                        if pairs:
+                            price_usd = float(pairs[0].get("priceUsd", 0) or 0)
+                            if price_usd > 0:
+                                position_value_usd = token_amount_normalized * price_usd
+                                return position_value_usd
+            except Exception:
+                pass
+            
+            # Fallback: estimate based on market cap ratio (rough estimate)
+            return 0.0
             
         except Exception as e:
-            logger.debug("fetch_wallet_holdings_error", wallet=wallet[:8], error=str(e))
+            logger.debug("get_trader_position_value_error", wallet=wallet[:8], mint=mint[:8], error=str(e))
             return None
     
     async def _trigger_exit_sell(self, wallet: str, mint: str, reason: str) -> None:
@@ -1116,10 +1230,26 @@ class CopyTrader:
             real_sold = False
             if self.position_manager:
                 has_real_position = self.position_manager.has_position(swap.token_mint)
+                
+                # FALLBACK: Check on-chain balance even if not in position_manager
+                # This catches tokens we bought but failed to register
+                onchain_balance = 0
+                if not has_real_position and not self.mock_trading:
+                    onchain_balance = await self._get_token_balance(swap.token_mint)
+                    if onchain_balance > 0:
+                        logger.info(
+                            "found_untracked_position",
+                            token=swap.token_mint[:8],
+                            onchain_balance=onchain_balance,
+                            message="Position not tracked but tokens found on-chain!"
+                        )
+                        has_real_position = True  # Force sell
+                
                 logger.info(
                     "checking_real_position_for_sell",
                     token=swap.token_mint[:8],
                     has_position=has_real_position,
+                    onchain_balance=onchain_balance,
                     tracked_positions=list(self.position_manager.positions.keys())[:5] if self.position_manager.positions else []
                 )
                 if has_real_position:
@@ -1129,13 +1259,24 @@ class CopyTrader:
                         message="Trader sold, real selling!"
                     )
                     from .position_manager import ExitReason
-                    result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
-                    if result.success:
-                        self.stats.total_sol_received += result.sol_received
-                        real_sold = True
-                        logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
+                    
+                    # If untracked, sell directly via copy_trader instead of position_manager
+                    if onchain_balance > 0 and not self.position_manager.has_position(swap.token_mint):
+                        logger.info("selling_untracked_position", token=swap.token_mint[:8], balance=onchain_balance)
+                        result = await self._execute_real_trade_with_fallbacks(swap, onchain_balance, 0, is_pumpfun=True)
+                        if result and result.success:
+                            real_sold = True
+                            logger.info("untracked_sell_success", token=swap.token_mint[:8])
+                        else:
+                            logger.warning("untracked_sell_failed", error=result.error if result else "no_result")
                     else:
-                        logger.warning("copied_sell_failed", error=result.error)
+                        result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
+                        if result.success:
+                            self.stats.total_sol_received += result.sol_received
+                            real_sold = True
+                            logger.info("copied_sell_success", sol_received=f"{result.sol_received:.4f}")
+                        else:
+                            logger.warning("copied_sell_failed", error=result.error)
             
             # If we sold anything (mock or real), we're done - don't try to buy
             if mock_sold or real_sold:
@@ -1195,6 +1336,12 @@ class CopyTrader:
     async def _execute_copy(self, swap: ParsedSwap) -> CopyTradeResult:
         """Execute a copy of the detected swap."""
         try:
+            # RACE CONDITION FIX: Block concurrent processing of same token for buys
+            # This prevents websocket + polling from both executing the same trade
+            if swap.is_buy and swap.token_mint in self.recent_copies:
+                logger.debug("blocking_concurrent_buy", token=swap.token_mint[:8])
+                return CopyTradeResult(success=False, error="already_processing", original_swap=swap)
+            
             # FAST PATH for sells - skip balance calculations, AGGRESSIVE RETRIES
             if not swap.is_buy:
                 # Check if we should execute real sell
@@ -1561,7 +1708,9 @@ class CopyTrader:
             # Use mock balance for sizing when mock trading is enabled
             # Real trade execution will be skipped if real balance is insufficient
             # This ensures mock trades proceed even when real balance is low
-            if self.mock_trading:
+            if should_execute_real:
+                balance_sol = real_balance_sol
+            elif self.mock_trading:
                 balance_sol = mock_balance_sol
             else:
                 balance_sol = real_balance_sol
@@ -1666,6 +1815,12 @@ class CopyTrader:
                 dex=swap.dex
             )
             
+            # RACE CONDITION FIX: Add to recent_copies BEFORE execution to prevent
+            # concurrent processing of the same token (websocket + polling can both trigger)
+            if swap.is_buy and swap.token_mint not in self.recent_copies:
+                self.recent_copies.add(swap.token_mint)
+                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 60))  # Block for 60s
+            
             # Buy: Use appropriate API based on DEX
             # Check if we should execute real trade (either real-only mode, or real+mock mode for specific wallet)
             should_execute_real = (
@@ -1682,11 +1837,21 @@ class CopyTrader:
             # Execute real trade first (only if real balance is sufficient)
             if should_execute_real and not real_balance_insufficient:
                 # IMPORTANT: Recalculate trade size based on REAL balance
-                # Keep enough SOL reserved for selling all open positions
+                # Keep enough SOL reserved for selling ALL open positions (including this new one)
                 real_open_positions = len(self.position_manager.positions) if self.position_manager else 0
-                sell_reserve = 0.01 * (real_open_positions + 1)  # 0.01 SOL per position for sell fees
-                base_reserve = 0.02  # Base reserve for transaction fees
+                # Reserve 0.05 SOL per position for sell fees (covers Raydium/Jupiter priority fees)
+                sell_reserve = 0.05 * (real_open_positions + 1)
+                base_reserve = 0.03  # Base reserve for rent and transaction fees
                 real_available = max(0, real_balance_sol - sell_reserve - base_reserve)
+                
+                logger.debug(
+                    "fee_reserve_calculation",
+                    real_balance=f"{real_balance_sol:.4f}",
+                    open_positions=real_open_positions,
+                    sell_reserve=f"{sell_reserve:.4f}",
+                    base_reserve=f"{base_reserve:.4f}",
+                    real_available=f"{real_available:.4f}"
+                )
                 
                 # Size real trade based on real available balance
                 real_trade_sol = min(trade_sol, real_available, self.max_sol_per_trade)
@@ -1941,6 +2106,39 @@ class CopyTrader:
             original_swap=swap
         )
     
+    async def _confirm_transaction(self, signature: str, max_retries: int = 10, delay: float = 0.5) -> bool:
+        """Confirm a transaction was finalized on-chain. Returns True if confirmed, False if failed/expired."""
+        for attempt in range(max_retries):
+            try:
+                result = await self.rpc._request(
+                    "getSignatureStatuses",
+                    [[str(signature)], {"searchTransactionHistory": True}]
+                )
+                
+                if result and "value" in result and result["value"]:
+                    status = result["value"][0]
+                    if status:
+                        # Check for error
+                        if status.get("err"):
+                            logger.warning("tx_confirmed_with_error", signature=str(signature)[:16], error=status.get("err"))
+                            return False
+                        
+                        # Check confirmation status
+                        conf_status = status.get("confirmationStatus", "")
+                        if conf_status in ["confirmed", "finalized"]:
+                            return True
+                
+                # Not confirmed yet, wait and retry
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.2, 2.0)  # Increase delay up to 2 seconds
+                
+            except Exception as e:
+                logger.debug("tx_confirm_check_error", signature=str(signature)[:16], error=str(e))
+                await asyncio.sleep(delay)
+        
+        logger.warning("tx_confirmation_timeout", signature=str(signature)[:16], attempts=max_retries)
+        return False
+    
     async def _execute_swap(
         self, 
         input_mint: str, 
@@ -2000,6 +2198,11 @@ class CopyTrader:
             
             # Send
             signature = await self.rpc.send_transaction(signed_tx)
+            
+            # CRITICAL: Confirm transaction actually succeeded on-chain
+            confirmed = await self._confirm_transaction(signature)
+            if not confirmed:
+                return CopyTradeResult(success=False, error=f"tx_not_confirmed: {signature[:16]}...", signature=signature)
             
             return CopyTradeResult(success=True, signature=signature)
             
@@ -2079,6 +2282,19 @@ class CopyTrader:
                 # Send the transaction
                 signature = await self.rpc.send_transaction(signed_tx)
                 
+                # CRITICAL: Confirm transaction actually succeeded on-chain
+                confirmed = await self._confirm_transaction(signature)
+                if not confirmed:
+                    logger.warning(
+                        "pumpfun_tx_not_confirmed",
+                        action=action,
+                        token=token_mint[:8],
+                        pool=pool,
+                        signature=str(signature)[:16] if signature else None
+                    )
+                    last_error = f"{pool}: tx_not_confirmed"
+                    continue  # Try next pool
+                
                 logger.info(
                     "pumpfun_swap_success",
                     action=action,
@@ -2126,38 +2342,18 @@ class CopyTrader:
             
             logger.info("jupiter_sell_attempt", token=token_mint[:8], amount=amount)
             
-            # Get Jupiter quote
-            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={token_mint}&outputMint={NATIVE_SOL}&amount={amount}&slippageBps=5000"
-            async with self.session.get(quote_url) as resp:
-                if resp.status != 200:
-                    return CopyTradeResult(success=False, error=f"quote_failed: {await resp.text()}")
-                quote = await resp.json()
-            
-            out_sol = int(quote.get("outAmount", 0)) / 1e9
-            logger.info("jupiter_quote", token=token_mint[:8], out_sol=f"{out_sol:.6f}")
-            
-            # Get swap transaction
-            swap_payload = {
-                "quoteResponse": quote,
-                "userPublicKey": str(wallet_pubkey),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
-            }
-            async with self.session.post("https://quote-api.jup.ag/v6/swap", json=swap_payload) as resp:
-                if resp.status != 200:
-                    return CopyTradeResult(success=False, error=f"swap_failed: {await resp.text()}")
-                swap_data = await resp.json()
-            
-            # Sign and send
-            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet])
-            
-            signature = await self.rpc.send_transaction(signed_tx)
-            
-            logger.info("jupiter_sell_success", token=token_mint[:8], sol=f"{out_sol:.6f}", signature=str(signature)[:16])
-            return CopyTradeResult(success=True, signature=signature, sol_received=out_sol)
+            # Use the same Jupiter swap path as _execute_swap (uses lite-api.jup.ag)
+            # This avoids DNS issues with quote-api.jup.ag on some servers.
+            result = await self._execute_swap(
+                input_mint=token_mint,
+                output_mint=NATIVE_SOL,
+                amount=amount,
+                slippage_bps=5000
+            )
+
+            if result.success:
+                logger.info("jupiter_sell_success", token=token_mint[:8], signature=str(result.signature)[:16] if result.signature else None)
+            return result
             
         except Exception as e:
             logger.error("jupiter_sell_error", token=token_mint[:8], error=str(e))
@@ -2299,7 +2495,10 @@ class CopyTrader:
         )
     
     async def _get_token_balance(self, mint: str, wallet: str = None) -> int:
-        """Get token balance for our wallet by finding the associated token account."""
+        """Get token balance for our wallet by finding the associated token account.
+        
+        Checks BOTH SPL Token and Token-2022 programs to handle all pump.fun tokens.
+        """
         if self.mock_trading:
             if wallet:
                 state = self._get_wallet_state(wallet)
@@ -2312,41 +2511,42 @@ class CopyTrader:
             return 0
         
         try:
-            from solders.pubkey import Pubkey
-            
-            # SPL Token Program ID
-            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-            
-            # Get all token accounts for our wallet
             wallet_pubkey = self.wallet.pubkey()
             
-            # Use getTokenAccountsByOwner RPC call
-            result = await self.rpc._request(
-                "getTokenAccountsByOwner",
-                [
-                    str(wallet_pubkey),
-                    {"mint": mint},
-                    {"encoding": "jsonParsed"}
-                ]
-            )
+            # Try BOTH token programs - pump.fun uses Token-2022
+            token_programs = [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+            ]
             
-            if result and "value" in result:
-                accounts = result["value"]
-                if not accounts:
-                    return 0
-                # Get the token amount from the first account
-                account_data = accounts[0].get("account", {}).get("data", {})
-                parsed = account_data.get("parsed", {}).get("info", {})
-                token_amount = parsed.get("tokenAmount", {})
-                amount = int(token_amount.get("amount", 0))
+            for program_id in token_programs:
+                # Use getTokenAccountsByOwner RPC call with mint filter
+                result = await self.rpc._request(
+                    "getTokenAccountsByOwner",
+                    [
+                        str(wallet_pubkey),
+                        {"mint": mint},
+                        {"encoding": "jsonParsed", "programId": program_id}
+                    ]
+                )
                 
-                if amount > 0:
-                    logger.info(
-                        "token_balance_found",
-                        token=mint[:8],
-                        amount=amount
-                    )
-                return amount
+                if result and "value" in result:
+                    accounts = result["value"]
+                    if accounts:
+                        # Get the token amount from the first account
+                        account_data = accounts[0].get("account", {}).get("data", {})
+                        parsed = account_data.get("parsed", {}).get("info", {})
+                        token_amount = parsed.get("tokenAmount", {})
+                        amount = int(token_amount.get("amount", 0))
+                        
+                        if amount > 0:
+                            logger.info(
+                                "token_balance_found",
+                                token=mint[:8],
+                                amount=amount,
+                                program="token-2022" if "Tokenz" in program_id else "spl-token"
+                            )
+                            return amount
             
             return 0
         except Exception as e:

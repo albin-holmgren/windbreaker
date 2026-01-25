@@ -5,6 +5,8 @@ Implements take-profit, stop-loss, and time-based exits.
 
 import asyncio
 import aiohttp
+import json
+import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -131,17 +133,21 @@ class PositionManager:
         self.total_profit_sol = 0.0
         self.total_loss_sol = 0.0
     
-    async def start(self) -> None:
+    async def start(self, state_file: str = "real_state.json") -> None:
         """Start the position manager."""
         self.session = aiohttp.ClientSession()
         self.running = True
+        
+        # CRITICAL: Load positions from state file to survive restarts
+        loaded_count = self._load_positions_from_state(state_file)
         
         logger.info(
             "position_manager_started",
             max_positions=self.max_positions,
             take_profit=f"{self.take_profit_pct}%",
             stop_loss=f"{self.stop_loss_pct}%",
-            time_limit=f"{self.time_limit_minutes}min"
+            time_limit=f"{self.time_limit_minutes}min",
+            loaded_positions=loaded_count
         )
         
         # Start monitoring loop
@@ -149,6 +155,75 @@ class PositionManager:
         
         # Start failed sells retry loop
         asyncio.create_task(self._retry_failed_sells_loop())
+    
+    def _load_positions_from_state(self, state_file: str) -> int:
+        """Load positions from real_state.json to survive restarts.
+        
+        CRITICAL: Without this, bot restarts clear all positions and
+        mcap stop loss / other protections never run.
+        """
+        try:
+            if not os.path.exists(state_file):
+                return 0
+            
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            positions_data = state.get("positions", {})
+            entry_times = state.get("entry_times", {})
+            entry_sol = state.get("entry_sol", {})
+            
+            loaded = 0
+            for token_mint, balance in positions_data.items():
+                # Skip tokens with 0 balance (already sold)
+                if balance == 0:
+                    continue
+                
+                # Skip if already tracked
+                if token_mint in self.positions:
+                    continue
+                
+                # Get entry time, default to now if missing
+                entry_time_str = entry_times.get(token_mint)
+                if entry_time_str:
+                    try:
+                        entry_time = datetime.fromisoformat(entry_time_str)
+                    except:
+                        entry_time = datetime.utcnow()
+                else:
+                    entry_time = datetime.utcnow()
+                
+                # Get entry SOL amount
+                entry_amount = entry_sol.get(token_mint, 0.03)  # Default to 0.03
+                
+                position = Position(
+                    token_mint=token_mint,
+                    token_symbol=token_mint[:8],
+                    entry_sol=entry_amount,
+                    token_amount=0,  # Will be updated on first check
+                    entry_time=entry_time,
+                    entry_signature="loaded_from_state",
+                    copied_from="unknown",  # Not stored in state
+                    dex="unknown",
+                    current_value_sol=entry_amount,
+                    highest_value_sol=entry_amount
+                )
+                
+                self.positions[token_mint] = position
+                loaded += 1
+                
+                logger.info(
+                    "position_loaded_from_state",
+                    token=token_mint[:8],
+                    entry_sol=f"{entry_amount:.4f}",
+                    age_minutes=f"{position.age_minutes:.1f}"
+                )
+            
+            return loaded
+            
+        except Exception as e:
+            logger.warning("failed_to_load_positions", error=str(e))
+            return 0
     
     async def stop(self) -> None:
         """Stop the position manager."""
@@ -665,6 +740,20 @@ class PositionManager:
         if not position:
             return SellResult(success=False, error="position_not_found")
         
+        # CRITICAL: Check actual on-chain balance before trying to sell
+        # This prevents infinite sell loops when we don't actually hold the token
+        actual_balance = await self._get_actual_token_balance(token_mint)
+        if actual_balance == 0:
+            logger.warning(
+                "skip_sell_zero_balance",
+                token=token_mint[:8],
+                reason=reason.value,
+                message="Removing position - we don't hold any tokens"
+            )
+            # Remove from tracking since we don't have any tokens
+            del self.positions[token_mint]
+            return SellResult(success=False, error="zero_balance_on_chain")
+        
         # If abandoned, just remove from tracking (don't try to sell)
         if reason == ExitReason.ABANDONED:
             logger.info(
@@ -748,9 +837,17 @@ class PositionManager:
             
             # Use Pump.fun API for pump.fun tokens (uses 100% so doesn't need exact amount)
             if position.dex == "pump.fun":
-                return await self._execute_pumpfun_sell(position)
+                result = await self._execute_pumpfun_sell(position)
+                if result.success:
+                    return result
+                # Pump.fun failed - fall back to Jupiter
+                logger.info(
+                    "pumpfun_sell_failed_trying_jupiter",
+                    token=position.token_mint[:8],
+                    error=result.error
+                )
             
-            # Use Jupiter for other DEXes
+            # Use Jupiter for other DEXes or as fallback
             # Get quote with ACTUAL balance
             quote = await self._get_quote(
                 input_mint=position.token_mint,
