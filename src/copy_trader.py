@@ -1307,6 +1307,31 @@ class CopyTrader:
             dex=swap.dex
         )
         
+        # Record ALL detected trades (buys AND sells) to cupsey_trades for profitability analysis
+        if self.telemetry:
+            try:
+                # Fetch market snapshot for sell recording (to get price)
+                snapshot = None
+                if swap.is_sell:
+                    snapshot = await self.telemetry.fetch_market_snapshot(swap.token_mint, "sell_detection")
+                
+                await self.telemetry.record_cupsey_trade(
+                    signature=swap.signature,
+                    wallet=swap.wallet,
+                    trade_type=swap.swap_type.value,
+                    token_mint=swap.token_mint,
+                    sol_amount=Decimal(str(swap.sol_value)),
+                    token_amount=None,
+                    dex=swap.dex,
+                    block_time=getattr(swap, 'block_time', None),
+                    slot=getattr(swap, 'slot', None),
+                    market_snapshot=snapshot,
+                    copied=None,  # Will be updated later for buys
+                    skip_reason=None
+                )
+            except Exception as e:
+                logger.debug("cupsey_trade_record_error", error=str(e))
+        
         # If trader sells a token we hold, copy the sell!
         if swap.is_sell:
             # Check if we have MOCK position to sell
@@ -1604,6 +1629,15 @@ class CopyTrader:
                 price_change_1h,
                 txns_1h,
             ) = await self._get_token_info(swap.token_mint)
+
+            # FALLBACK: If DexScreener returns $0 mcap for pump.fun tokens, try pump.fun API
+            if is_pumpfun and market_cap == 0:
+                pf_mcap, pf_age = await self._get_pumpfun_token_info(swap.token_mint)
+                if pf_mcap > 0:
+                    market_cap = pf_mcap
+                    logger.info("pumpfun_fallback_mcap", token=swap.token_mint[:8], mcap=f"${pf_mcap:,.0f}")
+                if pf_age > 0 and age_minutes == 0:
+                    age_minutes = pf_age
 
             # Log the token info
             logger.info(
