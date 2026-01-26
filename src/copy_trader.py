@@ -10,7 +10,7 @@ import os
 import time
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import structlog
 
@@ -20,6 +20,12 @@ from .config import Config
 from .position_manager import PositionManager
 from .trade_logger import trade_logger
 from .detection_logger import detection_logger
+from .trade_telemetry import (
+    TradeTelemetry, TradeRecord, MarketSnapshot, ExecutionDetails, 
+    TokenRiskData, init_telemetry, get_telemetry
+)
+from decimal import Decimal
+import uuid
 
 logger = structlog.get_logger(__name__)
 
@@ -145,6 +151,9 @@ class CopyTrader:
         # Position manager for auto-sell
         self.position_manager: Optional[PositionManager] = None
         
+        # Trade telemetry for comprehensive tracking
+        self.telemetry: Optional[TradeTelemetry] = None
+        
         # Mock trading support - now per-wallet
         self.mock_trading = self.config.mock_trading
         # Real trading can run alongside mock (for actual execution while still tracking mock stats)
@@ -176,6 +185,10 @@ class CopyTrader:
         """Start the copy trader."""
         self.session = aiohttp.ClientSession()
         self.running = True
+        
+        # Initialize trade telemetry
+        self.telemetry = await init_telemetry()
+        logger.info("telemetry_initialized")
         
         # Create position manager for real trading (either standalone or alongside mock)
         if not self.mock_trading or self.real_trading_enabled:
@@ -1503,7 +1516,7 @@ class CopyTrader:
             # but ALWAYS apply SAFETY filters (market cap, liquidity) to avoid buying into rugs
             skip_timing_filters = self.trust_trader_pumpfun
             
-            # Helper to log detection with all market data
+            # Helper to log detection with all market data and record telemetry
             def log_skip(skip_reason: str):
                 detection_logger.log_detection(
                     wallet=swap.wallet,
@@ -1522,6 +1535,22 @@ class CopyTrader:
                     copied=False,
                     skip_reason=skip_reason
                 )
+                # Record comprehensive telemetry for skipped trade
+                if self.telemetry:
+                    correlation_id = str(uuid.uuid4())
+                    asyncio.create_task(self._record_trade_telemetry(
+                        swap=swap,
+                        correlation_id=correlation_id,
+                        status="skipped",
+                        market_cap=market_cap,
+                        liquidity=liquidity,
+                        volume_24h=volume_24h,
+                        price_change_1h=price_change_1h,
+                        txns_1h=txns_1h,
+                        age_minutes=age_minutes,
+                        skip_reason=skip_reason,
+                        error_message=skip_reason
+                    ))
             
             # Check token age (timing filter - can be skipped)
             if not skip_timing_filters and self.min_token_age_minutes > 0 and age_minutes < self.min_token_age_minutes:
@@ -1953,6 +1982,8 @@ class CopyTrader:
                     if should_register_real_position:
                         # Use actual real trade amount if available, otherwise fall back to trade_sol
                         actual_entry_sol = real_trade_sol if real_trade_sol > 0 else trade_sol
+                        # Generate correlation_id for linking entry to exit in telemetry
+                        position_correlation_id = str(uuid.uuid4())
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
@@ -1960,7 +1991,8 @@ class CopyTrader:
                             token_amount=estimated_tokens,
                             entry_signature=real_result.signature if real_result else (result.signature or ""),
                             copied_from=swap.wallet,
-                            dex="pump.fun" if is_pumpfun else swap.dex
+                            dex="pump.fun" if is_pumpfun else swap.dex,
+                            correlation_id=position_correlation_id
                         )
                         logger.info(
                             "real_position_registered",
@@ -2004,6 +2036,31 @@ class CopyTrader:
                         our_sol=trade_sol,
                         our_signature=(real_result.signature if real_result else result.signature)
                     )
+                    
+                    # Record comprehensive telemetry for executed trade
+                    correlation_id = str(uuid.uuid4())
+                    asyncio.create_task(self._record_trade_telemetry(
+                        swap=swap,
+                        correlation_id=correlation_id,
+                        status="executed",
+                        market_cap=market_cap,
+                        liquidity=liquidity,
+                        volume_24h=volume_24h,
+                        price_change_1h=price_change_1h,
+                        txns_1h=txns_1h,
+                        age_minutes=age_minutes,
+                        our_sol_amount=trade_sol,
+                        our_signature=(real_result.signature if real_result else result.signature),
+                        entry_reason="copied_buy",
+                        filters_passed={
+                            "market_cap": market_cap,
+                            "liquidity": liquidity,
+                            "volume_24h": volume_24h,
+                            "price_change_1h": price_change_1h,
+                            "txns_1h": txns_1h,
+                            "age_minutes": age_minutes
+                        }
+                    ))
                 else:
                     self.stats.total_sol_received += trade_sol
             
@@ -2105,6 +2162,139 @@ class CopyTrader:
             error=last_error or "all_routes_failed",
             original_swap=swap
         )
+    
+    async def _record_trade_telemetry(
+        self,
+        swap: ParsedSwap,
+        correlation_id: str,
+        status: str,
+        market_cap: float = 0,
+        liquidity: float = 0,
+        volume_24h: float = 0,
+        price_change_1h: float = 0,
+        txns_1h: int = 0,
+        age_minutes: float = 0,
+        our_sol_amount: float = 0,
+        our_signature: Optional[str] = None,
+        entry_reason: Optional[str] = None,
+        skip_reason: Optional[str] = None,
+        error_message: Optional[str] = None,
+        filters_passed: Optional[Dict] = None,
+        execution_details: Optional[ExecutionDetails] = None
+    ):
+        """Record comprehensive trade telemetry to database."""
+        if not self.telemetry:
+            return
+        
+        try:
+            # Fetch comprehensive market snapshot
+            market_snapshot = await self.telemetry.fetch_market_snapshot(
+                swap.token_mint, 
+                "entry" if status == "executed" else "detection"
+            )
+            
+            # Create trade record
+            trade = TradeRecord(
+                correlation_id=correlation_id,
+                token_mint=swap.token_mint,
+                token_symbol=swap.token_symbol,
+                trader_wallet=swap.wallet,
+                bot_wallet=str(self.wallet.pubkey()),
+                trade_type=swap.swap_type.value,
+                status=status,
+                detected_at=datetime.now(timezone.utc),
+                their_signature=swap.signature,
+                their_sol_amount=Decimal(str(swap.sol_value)),
+                their_dex=swap.dex,
+                our_sol_amount=Decimal(str(our_sol_amount)) if our_sol_amount else None,
+                our_signature=our_signature,
+                entry_reason=entry_reason,
+                filters_passed=filters_passed,
+                skip_reason=skip_reason,
+                error_message=error_message
+            )
+            
+            # Add market snapshot
+            trade.market_snapshots.append(market_snapshot)
+            
+            # Add execution details if provided
+            if execution_details:
+                trade.execution_details.append(execution_details)
+            
+            # Fetch token risk data for executed trades
+            if status == "executed":
+                trade.token_risk = await self.telemetry.fetch_token_risk_data(swap.token_mint)
+            
+            # Record to database
+            await self.telemetry.record_trade(trade)
+            
+            # Also record Cupsey trade detection
+            await self.telemetry.record_cupsey_trade(
+                signature=swap.signature,
+                wallet=swap.wallet,
+                trade_type=swap.swap_type.value,
+                token_mint=swap.token_mint,
+                sol_amount=Decimal(str(swap.sol_value)),
+                token_amount=None,
+                dex=swap.dex,
+                block_time=None,
+                slot=None,
+                market_snapshot=market_snapshot,
+                copied=(status == "executed"),
+                skip_reason=skip_reason
+            )
+            
+            # Record skipped trade if applicable
+            if status == "skipped" and skip_reason:
+                await self.telemetry.record_skipped_trade(
+                    correlation_id=correlation_id,
+                    token_mint=swap.token_mint,
+                    trader_wallet=swap.wallet,
+                    their_signature=swap.signature,
+                    their_sol_amount=Decimal(str(swap.sol_value)),
+                    their_dex=swap.dex,
+                    skip_reason=skip_reason,
+                    skip_category=self._categorize_skip_reason(skip_reason),
+                    market_snapshot=market_snapshot,
+                    filter_thresholds={
+                        "min_mcap": self.min_market_cap_usd,
+                        "min_liquidity": self.min_liquidity_usd,
+                        "min_volume": self.min_volume_24h_usd,
+                        "min_age": self.min_token_age_minutes,
+                        "max_pump": self.max_price_change_1h_pct if hasattr(self, 'max_price_change_1h_pct') else 0
+                    },
+                    error_code=error_message[:64] if error_message else None,
+                    error_message=error_message
+                )
+                
+        except Exception as e:
+            logger.error("telemetry_record_error", error=str(e), token=swap.token_mint[:8])
+    
+    def _categorize_skip_reason(self, reason: str) -> str:
+        """Categorize skip reason for analytics."""
+        reason_lower = reason.lower()
+        if "market_cap" in reason_lower or "mcap" in reason_lower:
+            return "filter_mcap"
+        elif "liquidity" in reason_lower:
+            return "filter_liquidity"
+        elif "volume" in reason_lower:
+            return "filter_volume"
+        elif "age" in reason_lower or "new" in reason_lower:
+            return "filter_age"
+        elif "pump" in reason_lower:
+            return "filter_pump"
+        elif "holder" in reason_lower or "top10" in reason_lower:
+            return "filter_holders"
+        elif "creator" in reason_lower:
+            return "filter_creator"
+        elif "recent" in reason_lower or "cooldown" in reason_lower:
+            return "concurrency"
+        elif "balance" in reason_lower or "insufficient" in reason_lower:
+            return "insufficient_balance"
+        elif "position" in reason_lower:
+            return "max_positions"
+        else:
+            return "other"
     
     async def _confirm_transaction(self, signature: str, max_retries: int = 10, delay: float = 0.5) -> bool:
         """Confirm a transaction was finalized on-chain. Returns True if confirmed, False if failed/expired."""

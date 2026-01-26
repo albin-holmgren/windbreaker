@@ -7,11 +7,15 @@ import asyncio
 import aiohttp
 import json
 import os
+import uuid
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 import structlog
+
+from .trade_telemetry import get_telemetry
 
 logger = structlog.get_logger(__name__)
 
@@ -47,6 +51,7 @@ class Position:
     entry_signature: str
     copied_from: str          # Wallet we copied
     dex: str = "jupiter"      # DEX used for buy (pump.fun, raydium, jupiter)
+    correlation_id: str = ""  # Links entry to exit in telemetry
     
     # Tracking
     current_value_sol: float = 0.0
@@ -255,7 +260,8 @@ class PositionManager:
         entry_signature: str,
         copied_from: str,
         token_symbol: Optional[str] = None,
-        dex: str = "jupiter"
+        dex: str = "jupiter",
+        correlation_id: Optional[str] = None
     ) -> Position:
         """Add a new position."""
         position = Position(
@@ -267,6 +273,7 @@ class PositionManager:
             entry_signature=entry_signature,
             copied_from=copied_from,
             dex=dex,
+            correlation_id=correlation_id or str(uuid.uuid4()),
             current_value_sol=entry_sol,
             highest_value_sol=entry_sol
         )
@@ -804,6 +811,30 @@ class PositionManager:
                     pnl=f"{pnl_sol:.4f}",
                     signature=result.signature[:16] if result.signature else "none"
                 )
+                
+                # Record exit telemetry
+                try:
+                    telemetry = get_telemetry()
+                    if telemetry:
+                        time_in_trade = int((datetime.now(timezone.utc) - position.entry_time.replace(tzinfo=timezone.utc)).total_seconds()) if position.entry_time else 0
+                        pnl_pct = (pnl_sol / position.entry_sol * 100) if position.entry_sol > 0 else 0
+                        
+                        # Use correlation_id if available, otherwise generate new one
+                        correlation_id = getattr(position, 'correlation_id', None) or str(uuid.uuid4())
+                        
+                        asyncio.create_task(telemetry.update_trade_exit(
+                            correlation_id=correlation_id,
+                            exit_reason=reason.value,
+                            exit_signature=result.signature or "",
+                            sol_received=Decimal(str(result.sol_received)),
+                            pnl_sol=Decimal(str(pnl_sol)),
+                            pnl_pct=Decimal(str(pnl_pct)),
+                            exit_mcap=Decimal(str(position.current_value_sol * 1000000)) if position.current_value_sol else None,
+                            time_in_trade_sec=time_in_trade,
+                            cupsey_still_holding=None  # Would need to check trader holdings
+                        ))
+                except Exception as e:
+                    logger.debug("exit_telemetry_error", error=str(e))
             else:
                 logger.warning(
                     "sell_failed",
