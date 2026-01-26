@@ -96,7 +96,7 @@ class CopyTrader:
         
         # State
         self.stats = TradeStats()
-        self.recent_copies: Set[str] = set()  # Track recently copied tokens
+        self.recent_copies_by_wallet: Dict[str, Set[str]] = {}  # Track recently copied tokens (per followed wallet)
         self.running = False
         
         # Settings from config
@@ -157,6 +157,12 @@ class CopyTrader:
         
         # Mock trading support - now per-wallet
         self.mock_trading = self.config.mock_trading
+        raw_shadow_wallets = os.getenv('SHADOW_WALLETS', '').strip()
+        self.shadow_wallets: Optional[Set[str]] = None
+        if raw_shadow_wallets:
+            self.shadow_wallets = {w.strip() for w in raw_shadow_wallets.split(',') if w.strip()}
+            if not self.shadow_wallets:
+                self.shadow_wallets = None
         # Real trading can run alongside mock (for actual execution while still tracking mock stats)
         self.real_trading_enabled = os.getenv('REAL_TRADING_ENABLED', 'false').lower() == 'true'
         self.real_trading_wallet = os.getenv('REAL_TRADING_FOLLOW', '')  # Which wallet to copy for real trades
@@ -181,6 +187,18 @@ class CopyTrader:
                 total_open_positions=total_positions,
                 rug_detection="liquidity/mcap based"
             )
+
+    def _is_shadow_wallet(self, wallet: str) -> bool:
+        if not self.mock_trading:
+            return False
+        if self.shadow_wallets is None:
+            return True
+        return wallet in self.shadow_wallets
+
+    def _get_recent_copies(self, wallet: str) -> Set[str]:
+        if wallet not in self.recent_copies_by_wallet:
+            self.recent_copies_by_wallet[wallet] = set()
+        return self.recent_copies_by_wallet[wallet]
         
     async def start(self) -> None:
         """Start the copy trader."""
@@ -314,6 +332,8 @@ class CopyTrader:
                 our_mock_positions: Dict[str, Set[str]] = {}  # wallet -> set of mints
                 if self.mock_trading:
                     for wallet, state in self.wallet_states.items():
+                        if not self._is_shadow_wallet(wallet):
+                            continue
                         mints = {mint for mint, amount in state.get('positions', {}).items() if amount > 0}
                         if mints:
                             our_mock_positions[wallet] = mints
@@ -614,7 +634,7 @@ class CopyTrader:
         if wallet not in self.wallet_states:
             return
         
-        state = self.wallet_states[wallet]
+        state = self._get_wallet_state(wallet)
         positions = state.get('positions', {})
         token_balance = positions.get(mint, 0)
         
@@ -643,6 +663,7 @@ class CopyTrader:
                     del state['entry_sol'][mint]
                 if mint in state.get('entry_times', {}):
                     del state['entry_times'][mint]
+                correlation_id = state.get('correlation_ids', {}).pop(mint, None)
                 
                 # Log as abandoned trade
                 state.setdefault('trades_history', []).append({
@@ -656,6 +677,23 @@ class CopyTrader:
                     'timestamp': datetime.now().isoformat()
                 })
                 self._save_wallet_state(wallet)
+
+                if self.telemetry and correlation_id and entry_sol > 0:
+                    try:
+                        pnl_sol = Decimal(str(-entry_sol))
+                        asyncio.create_task(self.telemetry.update_trade_exit(
+                            correlation_id=correlation_id,
+                            exit_reason=f"{reason}_no_liquidity",
+                            exit_signature=f"MOCK_ABANDON_{mint[:8]}",
+                            sol_received=Decimal('0'),
+                            pnl_sol=pnl_sol,
+                            pnl_pct=Decimal('-100'),
+                            exit_mcap=Decimal(str(market_cap)) if market_cap else None,
+                            time_in_trade_sec=None,
+                            cupsey_still_holding=None
+                        ))
+                    except Exception as e:
+                        logger.error("telemetry_mock_exit_error", error=str(e), token=mint[:8])
                 return
             
             # Estimate current value - assume same ratio as entry for simplicity
@@ -671,6 +709,7 @@ class CopyTrader:
                 del state['entry_sol'][mint]
             if mint in state.get('entry_times', {}):
                 del state['entry_times'][mint]
+            correlation_id = state.get('correlation_ids', {}).pop(mint, None)
             
             # Log the trade
             state.setdefault('trades_history', []).append({
@@ -694,6 +733,25 @@ class CopyTrader:
             )
             
             self._save_wallet_state(wallet)
+
+            if self.telemetry and correlation_id and entry_sol > 0:
+                try:
+                    pnl_sol = Decimal(str(pnl))
+                    entry_sol_dec = Decimal(str(entry_sol))
+                    pnl_pct = (pnl_sol / entry_sol_dec * Decimal('100')) if entry_sol_dec > 0 else Decimal('0')
+                    asyncio.create_task(self.telemetry.update_trade_exit(
+                        correlation_id=correlation_id,
+                        exit_reason=reason,
+                        exit_signature=f"MOCK_AUTO_SELL_{mint[:8]}",
+                        sol_received=Decimal(str(estimated_sol)),
+                        pnl_sol=pnl_sol,
+                        pnl_pct=pnl_pct,
+                        exit_mcap=Decimal(str(market_cap)) if market_cap else None,
+                        time_in_trade_sec=None,
+                        cupsey_still_holding=None
+                    ))
+                except Exception as e:
+                    logger.error("telemetry_mock_exit_error", error=str(e), token=mint[:8])
             
         except Exception as e:
             logger.error("trigger_exit_sell_error", wallet=wallet[:8], token=mint[:8], error=str(e))
@@ -718,6 +776,8 @@ class CopyTrader:
         
         # Iterate over all tracked wallets
         for wallet, state in self.wallet_states.items():
+            if not self._is_shadow_wallet(wallet):
+                continue
             positions = state.get('positions', {})
             entry_sol_map = state.get('entry_sol', {})
             
@@ -895,6 +955,7 @@ class CopyTrader:
         positions[mint] = 0
         state.get('entry_times', {}).pop(mint, None)
         state.get('entry_sol', {}).pop(mint, None)
+        correlation_id = state.get('correlation_ids', {}).pop(mint, None)
         
         logger.warning(
             "mock_auto_sell",
@@ -926,9 +987,28 @@ class CopyTrader:
         
         # Save state for this wallet
         self._save_wallet_state(wallet)
+
+        if self.telemetry and correlation_id and entry_sol > 0:
+            try:
+                pnl_sol = Decimal(str(pnl))
+                entry_sol_dec = Decimal(str(entry_sol))
+                pnl_pct = (pnl_sol / entry_sol_dec * Decimal('100')) if entry_sol_dec > 0 else Decimal('0')
+                asyncio.create_task(self.telemetry.update_trade_exit(
+                    correlation_id=correlation_id,
+                    exit_reason=reason,
+                    exit_signature=f"MOCK_AUTO_SELL_{mint[:8]}",
+                    sol_received=Decimal(str(sol_received)),
+                    pnl_sol=pnl_sol,
+                    pnl_pct=pnl_pct,
+                    exit_mcap=Decimal(str(market_cap)) if 'market_cap' in locals() and market_cap else None,
+                    time_in_trade_sec=int(hold_seconds),
+                    cupsey_still_holding=None
+                ))
+            except Exception as e:
+                logger.error("telemetry_mock_exit_error", error=str(e), token=mint[:8])
         
         # CRITICAL: Also trigger real sell if we have real tokens!
-        if self.real_trading and self.position_manager and "trader_exited" in reason:
+        if self.real_trading_enabled and self.position_manager and "trader_exited" in reason:
             try:
                 # Check if we have real tokens for this mint
                 real_balance = await self._get_token_balance(mint)
@@ -967,6 +1047,8 @@ class CopyTrader:
     def _load_all_wallet_states(self) -> None:
         """Load persisted mock trading state for all tracked wallets."""
         for wallet in self.target_wallets:
+            if self.shadow_wallets is not None and wallet not in self.shadow_wallets:
+                continue
             state_file = WALLET_STATE_FILES.get(wallet, f'mock_state_{wallet[:8]}.json')
             try:
                 if Path(state_file).exists():
@@ -996,6 +1078,7 @@ class CopyTrader:
             'balance': self.config.mock_balance_sol,
             'starting_balance': self.config.mock_balance_sol,
             'positions': {},
+            'correlation_ids': {},
             'entry_times': {},
             'entry_sol': {},
             'trades_history': [],
@@ -1054,6 +1137,7 @@ class CopyTrader:
         """Get state for a specific wallet, creating if needed."""
         if wallet not in self.wallet_states:
             self.wallet_states[wallet] = self._get_default_wallet_state()
+        self.wallet_states[wallet].setdefault('correlation_ids', {})
         return self.wallet_states[wallet]
     
     def _save_wallet_state(self, wallet: str) -> None:
@@ -1227,7 +1311,7 @@ class CopyTrader:
         if swap.is_sell:
             # Check if we have MOCK position to sell
             mock_sold = False
-            if self.mock_trading:
+            if self._is_shadow_wallet(swap.wallet):
                 state = self._get_wallet_state(swap.wallet)
                 mock_balance = state.get('positions', {}).get(swap.token_mint, 0)
                 if mock_balance > 0:
@@ -1342,7 +1426,7 @@ class CopyTrader:
             return False, f"below_min_sol ({swap.sol_value:.4f} < {self.min_sol_per_trade})"
         
         # Don't RE-BUY the same token too frequently (but always allow sells)
-        if swap.is_buy and swap.token_mint in self.recent_copies:
+        if swap.is_buy and swap.token_mint in self._get_recent_copies(swap.wallet):
             return False, "recently_copied"
         
         return True, "ok"
@@ -1352,7 +1436,7 @@ class CopyTrader:
         try:
             # RACE CONDITION FIX: Block concurrent processing of same token for buys
             # This prevents websocket + polling from both executing the same trade
-            if swap.is_buy and swap.token_mint in self.recent_copies:
+            if swap.is_buy and swap.token_mint in self._get_recent_copies(swap.wallet):
                 logger.debug("blocking_concurrent_buy", token=swap.token_mint[:8])
                 return CopyTradeResult(success=False, error="already_processing", original_swap=swap)
             
@@ -1376,7 +1460,7 @@ class CopyTrader:
                 
                 # Get mock balance for mock trading
                 mock_balance = 0
-                if self.mock_trading:
+                if self._is_shadow_wallet(swap.wallet):
                     state = self._get_wallet_state(swap.wallet)
                     mock_balance = state.get('positions', {}).get(swap.token_mint, 0)
                 
@@ -1412,7 +1496,7 @@ class CopyTrader:
                 is_pumpfun_sell = swap.dex == "pump.fun"
                 
                 # Execute mock sell if we have mock balance
-                if self.mock_trading and mock_balance > 0:
+                if self._is_shadow_wallet(swap.wallet) and mock_balance > 0:
                     mock_result = self._simulate_mock_sell(swap, mock_balance)
                     if not should_execute_real or real_balance == 0:
                         return mock_result
@@ -1743,7 +1827,7 @@ class CopyTrader:
             
             # Get mock balance for mock trading
             mock_balance_sol = 0
-            if self.mock_trading:
+            if self._is_shadow_wallet(swap.wallet):
                 wallet_state = self._get_wallet_state(swap.wallet)
                 mock_balance_sol = wallet_state.get('balance', 1.0)
             
@@ -1767,7 +1851,7 @@ class CopyTrader:
             real_balance_insufficient = should_execute_real and real_balance_sol < 0.03
             
             # Calculate fee reserve needed for existing + new positions
-            if self.mock_trading:
+            if self._is_shadow_wallet(swap.wallet):
                 wallet_state = self._get_wallet_state(swap.wallet)
                 current_positions = len([p for p in wallet_state.get('positions', {}).values() if p > 0])
             else:
@@ -1868,9 +1952,9 @@ class CopyTrader:
             
             # RACE CONDITION FIX: Add to recent_copies BEFORE execution to prevent
             # concurrent processing of the same token (websocket + polling can both trigger)
-            if swap.is_buy and swap.token_mint not in self.recent_copies:
-                self.recent_copies.add(swap.token_mint)
-                asyncio.create_task(self._clear_recent_copy(swap.token_mint, 60))  # Block for 60s
+            if swap.is_buy and swap.token_mint not in self._get_recent_copies(swap.wallet):
+                self._get_recent_copies(swap.wallet).add(swap.token_mint)
+                asyncio.create_task(self._clear_recent_copy(swap.wallet, swap.token_mint, 60))  # Block for 60s
             
             # Buy: Use appropriate API based on DEX
             # Check if we should execute real trade (either real-only mode, or real+mock mode for specific wallet)
@@ -1981,8 +2065,8 @@ class CopyTrader:
                 (real_result and real_result.success) or
                 real_balance_insufficient  # Allow mock even when real skipped due to low balance
             )
-            if allow_mock_execution:
-                mock_result = self._simulate_mock_buy(swap, trade_sol)
+            if allow_mock_execution and self._is_shadow_wallet(swap.wallet):
+                mock_result = self._simulate_mock_buy(swap, trade_sol, correlation_id=correlation_id)
             elif self.mock_trading and require_real_success:
                 logger.warning(
                     "mock_trade_skipped_due_to_real_failure",
@@ -1995,7 +2079,7 @@ class CopyTrader:
                 )
             
             # Determine which result to return for downstream logic
-            if self.mock_trading:
+            if self._is_shadow_wallet(swap.wallet):
                 result = mock_result
             else:
                 result = real_result
@@ -2004,8 +2088,8 @@ class CopyTrader:
                 # For BUYS: Track to avoid rapid re-buying (30 sec cooldown)
                 # For SELLS: Don't track - allow multiple sell attempts
                 if swap.is_buy:
-                    self.recent_copies.add(swap.token_mint)
-                    asyncio.create_task(self._clear_recent_copy(swap.token_mint, 30))
+                    self._get_recent_copies(swap.wallet).add(swap.token_mint)
+                    asyncio.create_task(self._clear_recent_copy(swap.wallet, swap.token_mint, 30))
                 
                 if swap.is_buy:
                     self.stats.total_sol_spent += trade_sol
@@ -2915,11 +2999,12 @@ class CopyTrader:
             logger.error("jupiter_sell_error", token=token_mint[:8], error=str(e))
             return CopyTradeResult(success=False, error=f"jupiter_error: {str(e)}")
     
-    def _simulate_mock_buy(self, swap: 'ParsedSwap', trade_sol: float) -> 'CopyTradeResult':
+    def _simulate_mock_buy(self, swap: 'ParsedSwap', trade_sol: float, *, correlation_id: Optional[str] = None) -> 'CopyTradeResult':
         """Simulate a buy trade without executing on-chain."""
         # Get wallet-specific state
         wallet = swap.wallet
         state = self._get_wallet_state(wallet)
+        state.setdefault('correlation_ids', {})
         
         # Estimate token amount received (use swap data as reference)
         if swap.sol_value > 0 and swap.token_amount > 0:
@@ -2941,6 +3026,8 @@ class CopyTrader:
         if swap.token_mint not in entry_times:
             entry_times[swap.token_mint] = time.time()
             entry_sol[swap.token_mint] = trade_sol
+            if correlation_id:
+                state['correlation_ids'][swap.token_mint] = correlation_id
         else:
             entry_sol[swap.token_mint] = entry_sol.get(swap.token_mint, 0) + trade_sol
         
@@ -2980,6 +3067,7 @@ class CopyTrader:
         # Get wallet-specific state
         wallet = swap.wallet
         state = self._get_wallet_state(wallet)
+        state.setdefault('correlation_ids', {})
         
         # Estimate SOL received based on trader's price per token
         # IMPORTANT: Cap at trader's ratio to avoid unrealistic gains from having more tokens
@@ -3014,6 +3102,7 @@ class CopyTrader:
         positions[swap.token_mint] = 0
         state.get('entry_times', {}).pop(swap.token_mint, None)
         state.get('entry_sol', {}).pop(swap.token_mint, None)
+        correlation_id = state.get('correlation_ids', {}).pop(swap.token_mint, None)
         
         logger.info(
             "mock_sell",
@@ -3055,16 +3144,9 @@ class CopyTrader:
         
         Checks BOTH SPL Token and Token-2022 programs to handle all pump.fun tokens.
         """
-        if self.mock_trading:
-            if wallet:
-                state = self._get_wallet_state(wallet)
-                return state.get('positions', {}).get(mint, 0)
-            # Fallback: check all wallets for this token
-            for ws in self.wallet_states.values():
-                tokens = ws.get('positions', {}).get(mint, 0)
-                if tokens > 0:
-                    return tokens
-            return 0
+        if self.mock_trading and wallet and self._is_shadow_wallet(wallet):
+            state = self._get_wallet_state(wallet)
+            return state.get('positions', {}).get(mint, 0)
         
         try:
             wallet_pubkey = self.wallet.pubkey()
@@ -3379,10 +3461,10 @@ class CopyTrader:
             logger.debug("creator_check_error", mint=mint[:8], error=str(e))
             return False
     
-    async def _clear_recent_copy(self, token_mint: str, delay: int) -> None:
-        """Remove token from recent copies after delay."""
+    async def _clear_recent_copy(self, wallet: str, token_mint: str, delay: int) -> None:
+        """Remove token from a wallet's recent copies after delay."""
         await asyncio.sleep(delay)
-        self.recent_copies.discard(token_mint)
+        self._get_recent_copies(wallet).discard(token_mint)
     
     def _format_stats(self) -> Dict:
         """Format stats for logging."""
