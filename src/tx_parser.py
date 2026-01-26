@@ -6,6 +6,7 @@ Identifies buys/sells on Pump.fun, Jupiter, Raydium, etc.
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime, timezone
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -42,6 +43,8 @@ class ParsedSwap:
     dex: str                  # pump.fun, jupiter, raydium
     signature: str
     wallet: str
+    block_time: Optional[datetime] = None
+    slot: Optional[int] = None
     
     @property
     def sol_value(self) -> float:
@@ -115,21 +118,37 @@ class TransactionParser:
             # Check for Pump.fun swap
             swap = self._parse_pump_fun(tx_data, wallet, account_keys)
             if swap:
+                block_time_unix = tx_data.get("blockTime")
+                if block_time_unix:
+                    swap.block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                swap.slot = tx_data.get("slot")
                 return swap
             
             # Check for Jupiter swap
             swap = self._parse_jupiter(tx_data, wallet, account_keys, meta)
             if swap:
+                block_time_unix = tx_data.get("blockTime")
+                if block_time_unix:
+                    swap.block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                swap.slot = tx_data.get("slot")
                 return swap
             
             # Check for Raydium swap
             swap = self._parse_raydium(tx_data, wallet, account_keys, meta)
             if swap:
+                block_time_unix = tx_data.get("blockTime")
+                if block_time_unix:
+                    swap.block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                swap.slot = tx_data.get("slot")
                 return swap
             
             # Fallback: detect from balance changes
             swap = self._parse_from_balance_changes(tx_data, wallet, meta)
             if swap:
+                block_time_unix = tx_data.get("blockTime")
+                if block_time_unix:
+                    swap.block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                swap.slot = tx_data.get("slot")
                 return swap
             
             return None

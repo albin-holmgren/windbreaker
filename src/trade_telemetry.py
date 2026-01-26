@@ -534,7 +534,15 @@ class TradeTelemetry:
                         detected_at, market_cap_usd, liquidity_usd, price_usd,
                         copied, skip_reason
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                    ON CONFLICT (signature) DO NOTHING
+                    ON CONFLICT (signature) DO UPDATE SET
+                        copied = (cupsey_trades.copied OR EXCLUDED.copied),
+                        skip_reason = COALESCE(EXCLUDED.skip_reason, cupsey_trades.skip_reason),
+                        dex = COALESCE(EXCLUDED.dex, cupsey_trades.dex),
+                        block_time = COALESCE(EXCLUDED.block_time, cupsey_trades.block_time),
+                        slot = COALESCE(EXCLUDED.slot, cupsey_trades.slot),
+                        market_cap_usd = COALESCE(EXCLUDED.market_cap_usd, cupsey_trades.market_cap_usd),
+                        liquidity_usd = COALESCE(EXCLUDED.liquidity_usd, cupsey_trades.liquidity_usd),
+                        price_usd = COALESCE(EXCLUDED.price_usd, cupsey_trades.price_usd)
                 """,
                     correlation_id, signature, wallet, trade_type, token_mint,
                     sol_amount, token_amount, dex, block_time, slot,
@@ -889,6 +897,16 @@ class TradeTelemetry:
                         correlation_id=correlation_id[:8],
                         token=token_mint[:8],
                         reason=skip_reason)
+
+            detected_price_usd = market_snapshot.price_usd if market_snapshot else None
+            detected_price_sol = market_snapshot.price_sol if market_snapshot else None
+            if detected_price_usd and detected_price_sol:
+                asyncio.create_task(self.schedule_skipped_trade_followups(
+                    correlation_id=correlation_id,
+                    token_mint=token_mint,
+                    detected_price_usd=detected_price_usd,
+                    detected_price_sol=detected_price_sol
+                ))
                         
         except Exception as e:
             logger.error("skipped_trade_record_error", error=str(e))
@@ -947,16 +965,20 @@ class TradeTelemetry:
         token_mint: str,
         exit_price_usd: Decimal,
         exit_price_sol: Decimal,
-        entry_price_sol: Decimal
+        entry_price_sol: Decimal,
+        position_size_sol: Optional[Decimal] = None,
+        entry_price_usd: Optional[Decimal] = None
     ):
         """Schedule follow-up snapshots after a trade closes."""
         followup_minutes = [1, 3, 5, 10, 30, 60]
         
         async def run_followups():
             exit_at = datetime.now(timezone.utc)
+            prev_minutes = 0
             
             for minutes in followup_minutes:
-                await asyncio.sleep(minutes * 60)
+                await asyncio.sleep((minutes - prev_minutes) * 60)
+                prev_minutes = minutes
                 
                 try:
                     # Fetch current market data
@@ -970,17 +992,21 @@ class TradeTelemetry:
                         continue
                     
                     # Calculate counterfactuals
-                    current_price = snapshot.price_sol or Decimal("0")
-                    pnl_if_held_sol = current_price - entry_price_sol if current_price else None
-                    pnl_if_held_pct = (
-                        ((current_price - entry_price_sol) / entry_price_sol * 100)
-                        if current_price and entry_price_sol else None
-                    )
-                    price_change_since_exit = (
-                        ((current_price - exit_price_sol) / exit_price_sol * 100)
-                        if current_price and exit_price_sol else None
-                    )
-                    price_recovered = current_price > exit_price_sol if current_price else None
+                    current_price_sol = snapshot.price_sol
+                    pnl_if_held_pct = None
+                    pnl_if_held_sol = None
+                    if current_price_sol and entry_price_sol and entry_price_sol > 0:
+                        pnl_if_held_pct = ((current_price_sol / entry_price_sol) - 1) * 100
+                        if position_size_sol is not None:
+                            pnl_if_held_sol = position_size_sol * ((current_price_sol / entry_price_sol) - 1)
+
+                    price_change_since_exit = None
+                    if current_price_sol and exit_price_sol and exit_price_sol > 0:
+                        price_change_since_exit = ((current_price_sol / exit_price_sol) - 1) * 100
+
+                    price_recovered = None
+                    if current_price_sol and exit_price_sol and exit_price_sol > 0:
+                        price_recovered = current_price_sol > exit_price_sol
                     
                     async with self.pool.acquire() as conn:
                         await conn.execute("""
@@ -1017,6 +1043,88 @@ class TradeTelemetry:
         task = asyncio.create_task(run_followups())
         self._follow_up_tasks[trade_id] = task
 
+    async def schedule_skipped_trade_followups(
+        self,
+        correlation_id: str,
+        token_mint: str,
+        detected_price_usd: Decimal,
+        detected_price_sol: Decimal
+    ) -> None:
+        followup_minutes = [1, 3, 5, 10, 30, 60]
+
+        async def run_followups():
+            detected_at = datetime.now(timezone.utc)
+            prev_minutes = 0
+
+            for minutes in followup_minutes:
+                await asyncio.sleep((minutes - prev_minutes) * 60)
+                prev_minutes = minutes
+
+                try:
+                    snapshot = await self.fetch_market_snapshot(
+                        token_mint,
+                        f"skipped_follow_up_{minutes}m",
+                        minutes_after_event=minutes
+                    )
+
+                    if not self.pool:
+                        continue
+
+                    current_price_sol = snapshot.price_sol
+                    pnl_if_held_pct = None
+                    if current_price_sol and detected_price_sol and detected_price_sol > 0:
+                        pnl_if_held_pct = ((current_price_sol / detected_price_sol) - 1) * 100
+
+                    price_change_since_exit = None
+                    if current_price_sol and detected_price_sol and detected_price_sol > 0:
+                        price_change_since_exit = ((current_price_sol / detected_price_sol) - 1) * 100
+
+                    async with self.pool.acquire() as conn:
+                        await conn.execute("""
+                            INSERT INTO post_trade_followups (
+                                trade_id, correlation_id, token_mint,
+                                exit_price_usd, exit_price_sol, exit_at,
+                                followup_minutes, followup_at,
+                                price_usd, price_sol, market_cap_usd, liquidity_usd,
+                                pnl_if_held_pct, pnl_if_held_sol,
+                                price_change_since_exit_pct, price_recovered
+                            ) VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, $13, NULL)
+                        """,
+                            correlation_id, token_mint,
+                            detected_price_usd, detected_price_sol, detected_at,
+                            minutes, datetime.now(timezone.utc),
+                            snapshot.price_usd, snapshot.price_sol,
+                            snapshot.market_cap_usd, snapshot.liquidity_usd,
+                            pnl_if_held_pct,
+                            price_change_since_exit
+                        )
+
+                        if minutes == 60 and snapshot.price_usd and detected_price_usd and detected_price_usd > 0:
+                            pct_1h = ((snapshot.price_usd / detected_price_usd) - 1) * 100
+                            await conn.execute("""
+                                UPDATE skipped_trades
+                                SET price_1h_later = $1,
+                                    price_change_1h_later_pct = $2,
+                                    would_have_profited = ($2 > 0)
+                                WHERE correlation_id = $3
+                            """,
+                                snapshot.price_usd,
+                                pct_1h,
+                                correlation_id
+                            )
+
+                except Exception as e:
+                    logger.error(
+                        "skipped_followup_error",
+                        correlation_id=correlation_id[:8],
+                        minutes=minutes,
+                        error=str(e)
+                    )
+
+        task_key = f"skipped:{correlation_id}"
+        task = asyncio.create_task(run_followups())
+        self._follow_up_tasks[task_key] = task
+
     async def update_trade_exit(
         self,
         correlation_id: str,
@@ -1047,7 +1155,7 @@ class TradeTelemetry:
                 
                 trade_id = row["id"]
                 token_mint = row["token_mint"]
-                entry_sol = row["our_sol_amount"] or Decimal("0")
+                position_size_sol = row["our_sol_amount"]
                 
                 # Update trade
                 await conn.execute("""
@@ -1086,11 +1194,27 @@ class TradeTelemetry:
                 
                 # Schedule post-trade follow-ups
                 if exit_snapshot.price_usd and exit_snapshot.price_sol:
-                    await self.schedule_post_trade_followups(
-                        str(trade_id), correlation_id, token_mint,
-                        exit_snapshot.price_usd, exit_snapshot.price_sol,
-                        entry_sol
+                    entry_snapshot = await conn.fetchrow(
+                        """
+                        SELECT price_usd, price_sol
+                        FROM market_snapshots
+                        WHERE trade_id = $1 AND snapshot_type = 'entry'
+                        ORDER BY snapshot_at DESC
+                        LIMIT 1
+                        """,
+                        trade_id
                     )
+
+                    entry_price_sol = (entry_snapshot["price_sol"] if entry_snapshot else None)
+                    entry_price_usd = (entry_snapshot["price_usd"] if entry_snapshot else None)
+                    if entry_price_sol and entry_price_sol > 0:
+                        await self.schedule_post_trade_followups(
+                            str(trade_id), correlation_id, token_mint,
+                            exit_snapshot.price_usd, exit_snapshot.price_sol,
+                            entry_price_sol,
+                            position_size_sol=position_size_sol,
+                            entry_price_usd=entry_price_usd
+                        )
                 
                 logger.info("trade_exit_recorded",
                            trade_id=str(trade_id)[:8],
