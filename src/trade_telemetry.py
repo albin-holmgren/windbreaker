@@ -746,6 +746,94 @@ class TradeTelemetry:
             logger.error("trade_record_error", error=str(e), token=trade.token_mint[:8])
             return None
 
+    async def record_execution_details(
+        self,
+        correlation_id: str,
+        exec_detail: ExecutionDetails,
+        trade_id: Optional[str] = None
+    ) -> None:
+        if not self.pool:
+            return
+
+        try:
+            async with self.pool.acquire() as conn:
+                resolved_trade_id = trade_id
+                if not resolved_trade_id:
+                    row = await conn.fetchrow(
+                        "SELECT id FROM trades WHERE correlation_id = $1 ORDER BY detected_at DESC LIMIT 1",
+                        correlation_id
+                    )
+                    if row:
+                        resolved_trade_id = str(row["id"])
+
+                await conn.execute(
+                    """
+                    INSERT INTO execution_details (
+                        trade_id, correlation_id, executor, execution_type,
+                        signature, slot, block_time, program_ids, dex_used,
+                        pumpfun_bonding_curve, pumpfun_coin_id, pumpfun_pool_type,
+                        raydium_pool_id, raydium_amm_id, jupiter_route,
+                        jupiter_route_hops, jupiter_dexes_used, jupiter_quote_in,
+                        jupiter_quote_out, jupiter_price_impact_pct,
+                        jupiter_route_score, jupiter_no_route_reason,
+                        requested_in_amount, requested_out_min, slippage_bps_configured,
+                        actual_in_amount, actual_out_amount, effective_price,
+                        realized_slippage_bps, price_impact_realized_pct,
+                        priority_fee_lamports, compute_units_used, tx_fee_lamports,
+                        total_cost_sol, submit_at, confirm_at, send_to_confirm_ms,
+                        attempt_number, total_retries, errors, final_status
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                        $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35,
+                        $36, $37, $38, $39, $40, $41
+                    )
+                    """,
+                    uuid.UUID(resolved_trade_id) if resolved_trade_id else None,
+                    correlation_id,
+                    exec_detail.executor,
+                    exec_detail.execution_type,
+                    exec_detail.signature,
+                    exec_detail.slot,
+                    exec_detail.block_time,
+                    json.dumps(exec_detail.program_ids) if exec_detail.program_ids else None,
+                    exec_detail.dex_used,
+                    exec_detail.pumpfun_bonding_curve,
+                    exec_detail.pumpfun_coin_id,
+                    exec_detail.pumpfun_pool_type,
+                    exec_detail.raydium_pool_id,
+                    exec_detail.raydium_amm_id,
+                    json.dumps(exec_detail.jupiter_route) if exec_detail.jupiter_route else None,
+                    exec_detail.jupiter_route_hops,
+                    json.dumps(exec_detail.jupiter_dexes_used) if exec_detail.jupiter_dexes_used else None,
+                    exec_detail.jupiter_quote_in,
+                    exec_detail.jupiter_quote_out,
+                    exec_detail.jupiter_price_impact_pct,
+                    exec_detail.jupiter_route_score,
+                    exec_detail.jupiter_no_route_reason,
+                    exec_detail.requested_in_amount,
+                    exec_detail.requested_out_min,
+                    exec_detail.slippage_bps_configured,
+                    exec_detail.actual_in_amount,
+                    exec_detail.actual_out_amount,
+                    exec_detail.effective_price,
+                    exec_detail.realized_slippage_bps,
+                    exec_detail.price_impact_realized_pct,
+                    exec_detail.priority_fee_lamports,
+                    exec_detail.compute_units_used,
+                    exec_detail.tx_fee_lamports,
+                    exec_detail.total_cost_sol,
+                    exec_detail.submit_at,
+                    exec_detail.confirm_at,
+                    exec_detail.send_to_confirm_ms,
+                    exec_detail.attempt_number,
+                    exec_detail.total_retries,
+                    json.dumps(exec_detail.errors) if exec_detail.errors else None,
+                    exec_detail.final_status
+                )
+        except Exception as e:
+            logger.error("execution_details_record_error", error=str(e))
+
     async def record_skipped_trade(
         self,
         correlation_id: str,

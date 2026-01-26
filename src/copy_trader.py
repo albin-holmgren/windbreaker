@@ -55,6 +55,7 @@ class CopyTradeResult:
     original_swap: Optional[ParsedSwap] = None
     our_sol_amount: int = 0
     mock: bool = False
+    execution_details: Optional[ExecutionDetails] = None
     
 
 @dataclass
@@ -1357,6 +1358,15 @@ class CopyTrader:
             
             # FAST PATH for sells - skip balance calculations, AGGRESSIVE RETRIES
             if not swap.is_buy:
+                # Correlation ID for sell-side telemetry (prefer the existing position correlation_id)
+                correlation_id = None
+                if self.position_manager:
+                    position = self.position_manager.get_position(swap.token_mint)
+                    if position and getattr(position, "correlation_id", None):
+                        correlation_id = position.correlation_id
+                if not correlation_id:
+                    correlation_id = str(uuid.uuid4())
+
                 # Check if we should execute real sell
                 should_execute_real = (
                     not self.mock_trading or 
@@ -1423,17 +1433,26 @@ class CopyTrader:
                         result = await self._execute_pumpfun_swap(
                             token_mint=swap.token_mint,
                             sol_amount=estimated_sol,
-                            is_buy=False
+                            is_buy=False,
+                            correlation_id=correlation_id,
+                            attempt_number=attempt + 1
                         )
                     else:
                         # Use Jupiter for Raydium/other DEXes
                         result = await self._execute_swap(
                             input_mint=swap.token_mint,
                             output_mint=NATIVE_SOL,
-                            amount=real_balance
+                            amount=real_balance,
+                            correlation_id=correlation_id,
+                            attempt_number=attempt + 1
                         )
                     
                     if result.success:
+                        if self.telemetry and result.execution_details:
+                            asyncio.create_task(self.telemetry.record_execution_details(
+                                correlation_id=correlation_id,
+                                exec_detail=result.execution_details
+                            ))
                         self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
                         trade_logger.log_sell(
                             token_mint=swap.token_mint,
@@ -1843,6 +1862,9 @@ class CopyTrader:
                 their_sol=f"{swap.sol_value:.4f}",
                 dex=swap.dex
             )
+
+            # Correlation ID links detection -> our execution -> position exit telemetry
+            correlation_id = str(uuid.uuid4())
             
             # RACE CONDITION FIX: Add to recent_copies BEFORE execution to prevent
             # concurrent processing of the same token (websocket + polling can both trigger)
@@ -1909,10 +1931,29 @@ class CopyTrader:
                         swap=swap,
                         trade_lamports=real_trade_lamports,
                         trade_sol=real_trade_sol,
-                        is_pumpfun=is_pumpfun
+                        is_pumpfun=is_pumpfun,
+                        correlation_id=correlation_id
                     )
                     
                     if real_result and not real_result.success:
+                        # Record failed trade telemetry (so we can analyze missed executions)
+                        if self.telemetry:
+                            asyncio.create_task(self._record_trade_telemetry(
+                                swap=swap,
+                                correlation_id=correlation_id,
+                                status="failed",
+                                market_cap=market_cap,
+                                liquidity=liquidity,
+                                volume_24h=volume_24h,
+                                price_change_1h=price_change_1h,
+                                txns_1h=txns_1h,
+                                age_minutes=age_minutes,
+                                our_sol_amount=real_trade_sol,
+                                our_signature=real_result.signature if real_result else None,
+                                entry_reason="copied_buy",
+                                error_message=real_result.error if real_result else "real_trade_failed",
+                                execution_details=real_result.execution_details if real_result else None
+                            ))
                         if not self.mock_trading or require_real_success:
                             return real_result
                     elif real_result and real_result.success:
@@ -1982,8 +2023,6 @@ class CopyTrader:
                     if should_register_real_position:
                         # Use actual real trade amount if available, otherwise fall back to trade_sol
                         actual_entry_sol = real_trade_sol if real_trade_sol > 0 else trade_sol
-                        # Generate correlation_id for linking entry to exit in telemetry
-                        position_correlation_id = str(uuid.uuid4())
                         self.position_manager.add_position(
                             token_mint=swap.token_mint,
                             token_symbol=swap.token_symbol,
@@ -1992,7 +2031,7 @@ class CopyTrader:
                             entry_signature=real_result.signature if real_result else (result.signature or ""),
                             copied_from=swap.wallet,
                             dex="pump.fun" if is_pumpfun else swap.dex,
-                            correlation_id=position_correlation_id
+                            correlation_id=correlation_id
                         )
                         logger.info(
                             "real_position_registered",
@@ -2038,7 +2077,6 @@ class CopyTrader:
                     )
                     
                     # Record comprehensive telemetry for executed trade
-                    correlation_id = str(uuid.uuid4())
                     asyncio.create_task(self._record_trade_telemetry(
                         swap=swap,
                         correlation_id=correlation_id,
@@ -2052,6 +2090,7 @@ class CopyTrader:
                         our_sol_amount=trade_sol,
                         our_signature=(real_result.signature if real_result else result.signature),
                         entry_reason="copied_buy",
+                        execution_details=(real_result.execution_details if real_result else result.execution_details),
                         filters_passed={
                             "market_cap": market_cap,
                             "liquidity": liquidity,
@@ -2080,15 +2119,20 @@ class CopyTrader:
         swap: ParsedSwap,
         trade_lamports: int,
         trade_sol: float,
-        is_pumpfun: bool
+        is_pumpfun: bool,
+        correlation_id: Optional[str] = None
     ) -> CopyTradeResult:
         """Execute real trade with slippage steps and pump.fun fallback."""
         # Try pump.fun first if detected as pump.fun token
+        attempt_counter = 0
         if is_pumpfun:
+            attempt_counter += 1
             result = await self._execute_pumpfun_swap(
                 token_mint=swap.token_mint,
                 sol_amount=trade_sol,
-                is_buy=True
+                is_buy=True,
+                correlation_id=correlation_id,
+                attempt_number=attempt_counter
             )
             if result.success:
                 return result
@@ -2101,6 +2145,7 @@ class CopyTrader:
         # Try Jupiter with increasing slippage steps
         last_error = None
         for slippage in self.slippage_steps_bps:
+            attempt_counter += 1
             logger.debug(
                 "trying_jupiter_slippage",
                 token=swap.token_mint[:8],
@@ -2112,7 +2157,9 @@ class CopyTrader:
                 input_mint=NATIVE_SOL,
                 output_mint=swap.token_mint,
                 amount=trade_lamports,
-                slippage_bps=slippage
+                slippage_bps=slippage,
+                correlation_id=correlation_id,
+                attempt_number=attempt_counter
             )
             if result.success:
                 return result
@@ -2132,10 +2179,13 @@ class CopyTrader:
                 sol=f"{trade_sol:.4f}",
                 last_error=last_error
             )
+            attempt_counter += 1
             fallback_result = await self._execute_pumpfun_swap(
                 token_mint=swap.token_mint,
                 sol_amount=trade_sol,
-                is_buy=True
+                is_buy=True,
+                correlation_id=correlation_id,
+                attempt_number=attempt_counter
             )
             if fallback_result.success:
                 logger.info(
@@ -2336,16 +2386,24 @@ class CopyTrader:
         amount: int,
         *,
         slippage_bps: Optional[int] = None,
-        priority_fee_lamports: Optional[int] = None
+        priority_fee_lamports: Optional[int] = None,
+        correlation_id: Optional[str] = None,
+        attempt_number: int = 1
     ) -> CopyTradeResult:
         """Execute a swap via Jupiter."""
+        submit_at = datetime.now(timezone.utc)
+        effective_slippage_bps = slippage_bps if slippage_bps is not None else self.config.slippage_bps
+        effective_priority_fee = int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
+        exec_type = "buy" if input_mint == NATIVE_SOL else "sell"
+        token_mint = output_mint if input_mint == NATIVE_SOL else input_mint
+
         try:
             # Get quote with expanded routing options
             quote_params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": str(slippage_bps if slippage_bps is not None else self.config.slippage_bps),
+                "slippageBps": str(effective_slippage_bps),
                 "onlyDirectRoutes": "false",
                 "asLegacyTransaction": "false"
             }
@@ -2353,27 +2411,91 @@ class CopyTrader:
             async with self.session.get(JUPITER_QUOTE_API, params=quote_params) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
+                    if self.telemetry and correlation_id:
+                        asyncio.create_task(self.telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=token_mint,
+                            execution_type=exec_type,
+                            method="jupiter_quote",
+                            error_code=f"http_{resp.status}",
+                            error_message=error_text,
+                            error_category="api_error",
+                            attempt_number=attempt_number,
+                            requested_amount=Decimal(str(amount)),
+                            slippage_bps=effective_slippage_bps,
+                            priority_fee=effective_priority_fee
+                        ))
                     return CopyTradeResult(success=False, error=f"quote_failed: {error_text}")
                 quote = await resp.json()
-            
+
+            if not quote or (isinstance(quote, dict) and (quote.get("error") or quote.get("errorCode"))):
+                error_text = str(quote.get("error") or quote.get("errorCode") or "no_quote") if isinstance(quote, dict) else "no_quote"
+                if self.telemetry and correlation_id:
+                    asyncio.create_task(self.telemetry.record_failed_execution(
+                        trade_id=None,
+                        correlation_id=correlation_id,
+                        token_mint=token_mint,
+                        execution_type=exec_type,
+                        method="jupiter_quote",
+                        error_code="quote_error",
+                        error_message=error_text,
+                        error_category="no_route",
+                        attempt_number=attempt_number,
+                        requested_amount=Decimal(str(amount)),
+                        slippage_bps=effective_slippage_bps,
+                        priority_fee=effective_priority_fee
+                    ))
+                return CopyTradeResult(success=False, error=f"quote_failed: {error_text}")
+
             # Get swap transaction with HIGH priority fees for fast execution
             swap_data = {
                 "quoteResponse": quote,
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
+                "prioritizationFeeLamports": effective_priority_fee
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
+                    if self.telemetry and correlation_id:
+                        asyncio.create_task(self.telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=token_mint,
+                            execution_type=exec_type,
+                            method="jupiter_swap",
+                            error_code=f"http_{resp.status}",
+                            error_message=error_text,
+                            error_category="api_error",
+                            attempt_number=attempt_number,
+                            requested_amount=Decimal(str(amount)),
+                            slippage_bps=effective_slippage_bps,
+                            priority_fee=effective_priority_fee
+                        ))
                     return CopyTradeResult(success=False, error=f"swap_failed: {error_text}")
                 swap_response = await resp.json()
             
             # Sign and send transaction
             swap_tx_base64 = swap_response.get("swapTransaction")
             if not swap_tx_base64:
+                if self.telemetry and correlation_id:
+                    asyncio.create_task(self.telemetry.record_failed_execution(
+                        trade_id=None,
+                        correlation_id=correlation_id,
+                        token_mint=token_mint,
+                        execution_type=exec_type,
+                        method="jupiter_swap",
+                        error_code="no_swap_transaction",
+                        error_message=str(swap_response)[:5000],
+                        error_category="api_error",
+                        attempt_number=attempt_number,
+                        requested_amount=Decimal(str(amount)),
+                        slippage_bps=effective_slippage_bps,
+                        priority_fee=effective_priority_fee
+                    ))
                 return CopyTradeResult(success=False, error="no_swap_transaction")
             
             # Decode, sign, and send
@@ -2392,11 +2514,140 @@ class CopyTrader:
             # CRITICAL: Confirm transaction actually succeeded on-chain
             confirmed = await self._confirm_transaction(signature)
             if not confirmed:
-                return CopyTradeResult(success=False, error=f"tx_not_confirmed: {signature[:16]}...", signature=signature)
-            
-            return CopyTradeResult(success=True, signature=signature)
+                if self.telemetry and correlation_id:
+                    asyncio.create_task(self.telemetry.record_failed_execution(
+                        trade_id=None,
+                        correlation_id=correlation_id,
+                        token_mint=token_mint,
+                        execution_type=exec_type,
+                        method="jupiter_confirm",
+                        error_code="tx_not_confirmed",
+                        error_message=str(signature)[:64],
+                        error_category="tx_error",
+                        attempt_number=attempt_number,
+                        requested_amount=Decimal(str(amount)),
+                        slippage_bps=effective_slippage_bps,
+                        priority_fee=effective_priority_fee
+                    ))
+
+                exec_detail = ExecutionDetails(
+                    executor="bot",
+                    execution_type=exec_type,
+                    signature=str(signature),
+                    dex_used="jupiter",
+                    jupiter_route=quote,
+                    jupiter_route_hops=len(quote.get("routePlan", [])) if isinstance(quote.get("routePlan"), list) else None,
+                    jupiter_dexes_used=[
+                        (hop.get("swapInfo", {}) or {}).get("label")
+                        for hop in (quote.get("routePlan") or [])
+                        if isinstance(hop, dict) and (hop.get("swapInfo", {}) or {}).get("label")
+                    ] if isinstance(quote.get("routePlan"), list) else None,
+                    jupiter_quote_in=Decimal(str(quote.get("inAmount"))) if quote.get("inAmount") is not None else None,
+                    jupiter_quote_out=Decimal(str(quote.get("outAmount"))) if quote.get("outAmount") is not None else None,
+                    jupiter_price_impact_pct=Decimal(str(quote.get("priceImpactPct"))) if quote.get("priceImpactPct") is not None else None,
+                    requested_in_amount=Decimal(str(amount)),
+                    requested_out_min=Decimal(str(quote.get("otherAmountThreshold"))) if quote.get("otherAmountThreshold") is not None else None,
+                    slippage_bps_configured=effective_slippage_bps,
+                    priority_fee_lamports=effective_priority_fee,
+                    submit_at=submit_at,
+                    confirm_at=datetime.now(timezone.utc),
+                    send_to_confirm_ms=int((datetime.now(timezone.utc) - submit_at).total_seconds() * 1000),
+                    attempt_number=attempt_number,
+                    total_retries=max(0, attempt_number - 1),
+                    errors=["tx_not_confirmed"],
+                    final_status="failed"
+                )
+
+                return CopyTradeResult(success=False, error=f"tx_not_confirmed: {signature[:16]}...", signature=signature, execution_details=exec_detail)
+
+            confirm_at = datetime.now(timezone.utc)
+
+            tx_fee_lamports = None
+            compute_units_used = None
+            slot = None
+            block_time = None
+            program_ids = None
+            try:
+                tx_info = await self.rpc.get_transaction(str(signature))
+                if tx_info:
+                    slot = tx_info.get("slot")
+                    block_time_unix = tx_info.get("blockTime")
+                    if block_time_unix:
+                        block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                    meta = tx_info.get("meta") or {}
+                    tx_fee_lamports = meta.get("fee")
+                    compute_units_used = meta.get("computeUnitsConsumed")
+
+                    instructions = ((tx_info.get("transaction") or {}).get("message") or {}).get("instructions")
+                    if isinstance(instructions, list):
+                        program_ids = [
+                            ix.get("programId")
+                            for ix in instructions
+                            if isinstance(ix, dict) and ix.get("programId")
+                        ] or None
+            except Exception:
+                pass
+
+            route_plan = quote.get("routePlan") if isinstance(quote, dict) else None
+            dexes_used = None
+            if isinstance(route_plan, list):
+                dexes_used = []
+                for hop in route_plan:
+                    if not isinstance(hop, dict):
+                        continue
+                    swap_info = hop.get("swapInfo") or {}
+                    label = swap_info.get("label")
+                    if label:
+                        dexes_used.append(label)
+                dexes_used = dexes_used or None
+
+            exec_detail = ExecutionDetails(
+                executor="bot",
+                execution_type=exec_type,
+                signature=str(signature),
+                slot=slot,
+                block_time=block_time,
+                program_ids=program_ids,
+                dex_used="jupiter",
+                jupiter_route=quote,
+                jupiter_route_hops=len(route_plan) if isinstance(route_plan, list) else None,
+                jupiter_dexes_used=dexes_used,
+                jupiter_quote_in=Decimal(str(quote.get("inAmount"))) if isinstance(quote, dict) and quote.get("inAmount") is not None else None,
+                jupiter_quote_out=Decimal(str(quote.get("outAmount"))) if isinstance(quote, dict) and quote.get("outAmount") is not None else None,
+                jupiter_price_impact_pct=Decimal(str(quote.get("priceImpactPct"))) if isinstance(quote, dict) and quote.get("priceImpactPct") is not None else None,
+                requested_in_amount=Decimal(str(amount)),
+                requested_out_min=Decimal(str(quote.get("otherAmountThreshold"))) if isinstance(quote, dict) and quote.get("otherAmountThreshold") is not None else None,
+                slippage_bps_configured=effective_slippage_bps,
+                priority_fee_lamports=effective_priority_fee,
+                compute_units_used=compute_units_used,
+                tx_fee_lamports=tx_fee_lamports,
+                total_cost_sol=Decimal(str((tx_fee_lamports or 0) / 1e9)) if tx_fee_lamports is not None else None,
+                submit_at=submit_at,
+                confirm_at=confirm_at,
+                send_to_confirm_ms=int((confirm_at - submit_at).total_seconds() * 1000),
+                attempt_number=attempt_number,
+                total_retries=max(0, attempt_number - 1),
+                final_status="success"
+            )
+
+            return CopyTradeResult(success=True, signature=signature, execution_details=exec_detail)
             
         except Exception as e:
+            if self.telemetry and correlation_id:
+                asyncio.create_task(self.telemetry.record_failed_execution(
+                    trade_id=None,
+                    correlation_id=correlation_id,
+                    token_mint=token_mint,
+                    execution_type=exec_type,
+                    method="jupiter_exception",
+                    error_code="exception",
+                    error_message=str(e),
+                    error_category="exception",
+                    attempt_number=attempt_number,
+                    requested_amount=Decimal(str(amount)),
+                    slippage_bps=effective_slippage_bps,
+                    priority_fee=effective_priority_fee
+                ))
             return CopyTradeResult(success=False, error=str(e))
     
     async def _execute_pumpfun_swap(
@@ -2404,9 +2655,13 @@ class CopyTrader:
         token_mint: str,
         sol_amount: float,
         is_buy: bool,
-        sell_percentage: int = 100  # For sells: percentage of holdings to sell (100 = all)
+        sell_percentage: int = 100,  # For sells: percentage of holdings to sell (100 = all)
+        *,
+        correlation_id: Optional[str] = None,
+        attempt_number: int = 1
     ) -> CopyTradeResult:
         """Execute a swap via PumpPortal API - tries multiple pools."""
+        submit_at = datetime.now(timezone.utc)
         try:
             import base64
             from solders.transaction import VersionedTransaction
@@ -2460,6 +2715,21 @@ class CopyTrader:
                         error_text = await resp.text()
                         last_error = f"{pool}: {error_text}"
                         logger.debug("pumpfun_pool_failed", pool=pool, status=resp.status, response=error_text[:100], mint=token_mint[:8])
+                        if self.telemetry and correlation_id:
+                            asyncio.create_task(self.telemetry.record_failed_execution(
+                                trade_id=None,
+                                correlation_id=correlation_id,
+                                token_mint=token_mint,
+                                execution_type="buy" if is_buy else "sell",
+                                method=f"pumpfun_{action}",
+                                error_code=f"http_{resp.status}",
+                                error_message=last_error,
+                                error_category="api_error",
+                                attempt_number=attempt_number,
+                                requested_amount=Decimal(str(sol_amount)) if is_buy else None,
+                                slippage_bps=int(pumpfun_slippage * 100),
+                                priority_fee=int(0.005 * 1e9)
+                            ))
                         continue  # Try next pool
                     
                     # Response is the raw transaction bytes
@@ -2483,6 +2753,21 @@ class CopyTrader:
                         signature=str(signature)[:16] if signature else None
                     )
                     last_error = f"{pool}: tx_not_confirmed"
+                    if self.telemetry and correlation_id:
+                        asyncio.create_task(self.telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=token_mint,
+                            execution_type="buy" if is_buy else "sell",
+                            method=f"pumpfun_{action}",
+                            error_code="tx_not_confirmed",
+                            error_message=last_error,
+                            error_category="tx_error",
+                            attempt_number=attempt_number,
+                            requested_amount=Decimal(str(sol_amount)) if is_buy else None,
+                            slippage_bps=int(pumpfun_slippage * 100),
+                            priority_fee=int(0.005 * 1e9)
+                        ))
                     continue  # Try next pool
                 
                 logger.info(
@@ -2492,15 +2777,96 @@ class CopyTrader:
                     pool=pool,
                     signature=str(signature)[:16] if signature else None
                 )
-                
-                return CopyTradeResult(success=True, signature=signature)
+
+                confirm_at = datetime.now(timezone.utc)
+
+                tx_fee_lamports = None
+                compute_units_used = None
+                slot = None
+                block_time = None
+                program_ids = None
+                try:
+                    tx_info = await self.rpc.get_transaction(str(signature))
+                    if tx_info:
+                        slot = tx_info.get("slot")
+                        block_time_unix = tx_info.get("blockTime")
+                        if block_time_unix:
+                            block_time = datetime.fromtimestamp(block_time_unix, tz=timezone.utc)
+                        meta = tx_info.get("meta") or {}
+                        tx_fee_lamports = meta.get("fee")
+                        compute_units_used = meta.get("computeUnitsConsumed")
+
+                        instructions = ((tx_info.get("transaction") or {}).get("message") or {}).get("instructions")
+                        if isinstance(instructions, list):
+                            program_ids = [
+                                ix.get("programId")
+                                for ix in instructions
+                                if isinstance(ix, dict) and ix.get("programId")
+                            ] or None
+                except Exception:
+                    pass
+
+                exec_detail = ExecutionDetails(
+                    executor="bot",
+                    execution_type="buy" if is_buy else "sell",
+                    signature=str(signature),
+                    slot=slot,
+                    block_time=block_time,
+                    program_ids=program_ids,
+                    dex_used="pump.fun",
+                    pumpfun_pool_type=pool,
+                    requested_in_amount=Decimal(str(sol_amount)) if is_buy else None,
+                    slippage_bps_configured=int(pumpfun_slippage * 100),
+                    priority_fee_lamports=int(0.005 * 1e9),
+                    compute_units_used=compute_units_used,
+                    tx_fee_lamports=tx_fee_lamports,
+                    total_cost_sol=Decimal(str((tx_fee_lamports or 0) / 1e9)) if tx_fee_lamports is not None else None,
+                    submit_at=submit_at,
+                    confirm_at=confirm_at,
+                    send_to_confirm_ms=int((confirm_at - submit_at).total_seconds() * 1000),
+                    attempt_number=attempt_number,
+                    total_retries=max(0, attempt_number - 1),
+                    final_status="success"
+                )
+
+                return CopyTradeResult(success=True, signature=signature, execution_details=exec_detail)
             
             # All pools failed
             logger.warning("pumpfun_all_pools_failed", token=token_mint[:8], last_error=last_error)
+            if self.telemetry and correlation_id:
+                asyncio.create_task(self.telemetry.record_failed_execution(
+                    trade_id=None,
+                    correlation_id=correlation_id,
+                    token_mint=token_mint,
+                    execution_type="buy" if is_buy else "sell",
+                    method=f"pumpfun_{action}",
+                    error_code="all_pools_failed",
+                    error_message=str(last_error)[:5000] if last_error else "all_pools_failed",
+                    error_category="no_route",
+                    attempt_number=attempt_number,
+                    requested_amount=Decimal(str(sol_amount)) if is_buy else None,
+                    slippage_bps=int(pumpfun_slippage * 100),
+                    priority_fee=int(0.005 * 1e9)
+                ))
             return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {last_error}")
             
         except Exception as e:
             logger.error("pumpfun_swap_error", error=str(e))
+            if self.telemetry and correlation_id:
+                asyncio.create_task(self.telemetry.record_failed_execution(
+                    trade_id=None,
+                    correlation_id=correlation_id,
+                    token_mint=token_mint,
+                    execution_type="buy" if is_buy else "sell",
+                    method=f"pumpfun_{'buy' if is_buy else 'sell'}",
+                    error_code="exception",
+                    error_message=str(e),
+                    error_category="exception",
+                    attempt_number=attempt_number,
+                    requested_amount=Decimal(str(sol_amount)) if is_buy else None,
+                    slippage_bps=int(pumpfun_slippage * 100) if 'pumpfun_slippage' in locals() else None,
+                    priority_fee=int(0.005 * 1e9)
+                ))
             return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
     
     async def _sell_via_jupiter(self, token_mint: str) -> CopyTradeResult:
