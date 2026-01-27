@@ -2533,7 +2533,12 @@ class CopyTrader:
             effective_slippage_bps = max(slippage_bps or self.config.slippage_bps, 5000)  # Min 50% for sells
         else:
             effective_slippage_bps = slippage_bps if slippage_bps is not None else self.config.slippage_bps
-        effective_priority_fee = int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
+        
+        # Dynamic priority fee escalation: start low, increase on retries
+        # attempt 1: base fee, attempt 2: 2x, attempt 3: 4x, etc.
+        base_priority_fee = int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
+        fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x base fee
+        effective_priority_fee = int(base_priority_fee * fee_multiplier)
 
         try:
             # Get quote with expanded routing options
@@ -2815,8 +2820,14 @@ class CopyTrader:
             action = "buy" if is_buy else "sell"
             
             # Request transaction from PumpPortal
-            # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 30%
-            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
+            # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 50% for sells
+            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50 if not is_buy else 30)
+            
+            # Dynamic priority fee escalation: start low, increase on retries
+            base_fee_buy = 0.0005   # Start at 0.0005 SOL for buys
+            base_fee_sell = 0.0002  # Start at 0.0002 SOL for sells
+            fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x
+            priority_fee = (base_fee_buy if is_buy else base_fee_sell) * fee_multiplier
             
             # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
             pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
@@ -2831,7 +2842,7 @@ class CopyTrader:
                         "denominatedInSol": "true",
                         "amount": sol_amount,
                         "slippage": pumpfun_slippage,
-                        "priorityFee": 0.001,  # Reduced from 0.005 to save SOL
+                        "priorityFee": priority_fee,
                         "pool": pool
                     }
                 else:
@@ -2843,7 +2854,7 @@ class CopyTrader:
                         "denominatedInSol": "false",
                         "amount": f"{sell_percentage}%",
                         "slippage": pumpfun_slippage,
-                        "priorityFee": 0.0005,  # Low fee for sells to avoid burning SOL on failures
+                        "priorityFee": priority_fee,
                         "pool": pool
                     }
                 
@@ -2908,7 +2919,7 @@ class CopyTrader:
                             attempt_number=attempt_number,
                             requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
+                            priority_fee=int(priority_fee * 1e9)
                         ))
                     continue  # Try next pool
                 
@@ -2943,7 +2954,7 @@ class CopyTrader:
                             attempt_number=attempt_number,
                             requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
+                            priority_fee=int(priority_fee * 1e9)
                         ))
                     continue  # Try next pool
                 
@@ -2994,7 +3005,7 @@ class CopyTrader:
                     pumpfun_pool_type=pool,
                     requested_in_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps_configured=int(pumpfun_slippage * 100),
-                    priority_fee_lamports=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9),
+                    priority_fee_lamports=int(priority_fee * 1e9),
                     compute_units_used=compute_units_used,
                     tx_fee_lamports=tx_fee_lamports,
                     total_cost_sol=Decimal(str((tx_fee_lamports or 0) / 1e9)) if tx_fee_lamports is not None else None,
@@ -3023,7 +3034,7 @@ class CopyTrader:
                     attempt_number=attempt_number,
                     requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps=int(pumpfun_slippage * 100),
-                    priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
+                    priority_fee=int(priority_fee * 1e9)
                 ))
             return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {last_error}")
             
@@ -3042,7 +3053,7 @@ class CopyTrader:
                     attempt_number=attempt_number,
                     requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps=int(pumpfun_slippage * 100) if 'pumpfun_slippage' in locals() else None,
-                    priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
+                    priority_fee=int(priority_fee * 1e9) if 'priority_fee' in locals() else None
                 ))
             return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
     
