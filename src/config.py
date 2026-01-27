@@ -124,7 +124,7 @@ def load_config(env_file: str = '.env') -> Config:
         min_profit_pct=float(os.getenv('MIN_PROFIT_PCT', '0.5')),
         trade_amount_usd=float(os.getenv('TRADE_AMOUNT_USD', '10')),
         trade_balance_pct=float(os.getenv('TRADE_BALANCE_PCT', '80')),  # 80% of balance
-        fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.08')),  # Reserve 0.08 SOL base for fees
+        fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.01')),  # Reserve 0.01 SOL base for rent
         slippage_bps=int(os.getenv('SLIPPAGE_BPS', '50')),
         slippage_steps_bps=os.getenv('SLIPPAGE_STEPS_BPS', '50,100,200'),
         jupiter_priority_fee_lamports=int(os.getenv('JUPITER_PRIORITY_FEE_LAMPORTS', '500000')),
@@ -148,7 +148,7 @@ def load_config(env_file: str = '.env') -> Config:
         copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '300')),  # Poll every 300ms (WebSocket is primary, this is fallback)
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
-        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.05')),  # 0.05 SOL per position for exit fees (covers Raydium/Jupiter priority fees)
+        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.02')),  # 0.02 SOL per position for exit fees
         min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
         min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Require token to be at least 15 minutes old
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)

@@ -518,7 +518,7 @@ class PositionManager:
                 ))
         
         # Fallback to PumpPortal - try multiple pools
-        pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
+        pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50)
         pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
         last_error = None
         
@@ -531,7 +531,7 @@ class PositionManager:
                     "denominatedInSol": "false",
                     "amount": "100%",
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.005,
+                    "priorityFee": 0.0005,
                     "pool": pool
                 }
                 
@@ -579,13 +579,13 @@ class PositionManager:
                             error_category="api_error",
                             attempt_number=1,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.005 * 1e9)
+                            priority_fee=int(0.0005 * 1e9)
                         ))
                     continue
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
                 
                 logger.info("direct_sell_pumpfun_success", token=token_mint[:8], pool=pool)
                 if telemetry and correlation_id:
@@ -596,7 +596,7 @@ class PositionManager:
                         dex_used="pump.fun",
                         pumpfun_pool_type=pool,
                         slippage_bps_configured=int(pumpfun_slippage * 100),
-                        priority_fee_lamports=int(0.005 * 1e9),
+                        priority_fee_lamports=int(0.0005 * 1e9),
                         final_status="submitted"
                     )
                     asyncio.create_task(telemetry.record_execution_details(
@@ -618,7 +618,7 @@ class PositionManager:
                         error_category="exception",
                         attempt_number=1,
                         slippage_bps=int(pumpfun_slippage * 100),
-                        priority_fee=int(0.005 * 1e9)
+                        priority_fee=int(0.0005 * 1e9)
                     ))
                 continue
         
@@ -1279,8 +1279,8 @@ class PositionManager:
             from solders.transaction import VersionedTransaction
             
             # Request transaction from PumpPortal - sell 100% of holdings
-            # Use high slippage for pump.fun (tokens move fast) - minimum 30%
-            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
+            # Use very high slippage for pump.fun sells (tokens move fast) - minimum 50%
+            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50)
             
             # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
             pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
@@ -1294,7 +1294,7 @@ class PositionManager:
                     "denominatedInSol": "false",
                     "amount": "100%",  # Sell all tokens
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.005,  # Higher priority for faster execution
+                    "priorityFee": 0.0005,  # Reduced from 0.005 to save SOL on failures
                     "pool": pool
                 }
                 
@@ -1355,7 +1355,7 @@ class PositionManager:
                             error_category="api_error",
                             attempt_number=attempt_number,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.005 * 1e9)
+                            priority_fee=int(0.0005 * 1e9)
                         ))
                     continue  # Try next pool
                 
@@ -1363,7 +1363,8 @@ class PositionManager:
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
                 
                 submit_at = datetime.now(timezone.utc)
-                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
+                # Use preflight to avoid burning fees on failed txs
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
                 
                 logger.info(
                     "pumpfun_sell_success",
@@ -1379,7 +1380,7 @@ class PositionManager:
                         token_mint=position.token_mint,
                         pool=pool,
                         slippage_bps_configured=int(pumpfun_slippage * 100),
-                        priority_fee_lamports=int(0.005 * 1e9),
+                        priority_fee_lamports=int(0.0005 * 1e9),
                         submit_at=submit_at,
                         attempt_number=attempt_number
                     ))
@@ -1404,7 +1405,7 @@ class PositionManager:
                     error_category="no_route",
                     attempt_number=attempt_number,
                     slippage_bps=int(pumpfun_slippage * 100),
-                    priority_fee=int(0.005 * 1e9)
+                    priority_fee=int(0.0005 * 1e9)
                 ))
             return SellResult(success=False, error=f"pumpfun_api: {last_error}")
             
@@ -1422,7 +1423,7 @@ class PositionManager:
                     error_category="exception",
                     attempt_number=attempt_number,
                     slippage_bps=int(pumpfun_slippage * 100) if 'pumpfun_slippage' in locals() else None,
-                    priority_fee=int(0.005 * 1e9)
+                    priority_fee=int(0.0005 * 1e9)
                 ))
             return SellResult(success=False, error=f"pumpfun_error: {str(e)}")
 

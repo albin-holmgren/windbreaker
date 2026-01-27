@@ -766,7 +766,8 @@ class CopyTrader:
         Trust trader = follow their buys without filters
         Rug protection = always exit before token becomes unsellable
         """
-        STOP_LOSS_PCT = -60.0
+        STOP_LOSS_PCT = float(os.getenv('STOP_LOSS_PCT', '-60'))
+        TIME_LIMIT_MINUTES = float(os.getenv('TIME_LIMIT_MINUTES', '0'))
         RUG_DROP_PCT = float(os.getenv('RUG_DROP_PCT', '-80'))
         
         # ALWAYS use rug detection for EXITS - protect from holding unsellable tokens
@@ -851,6 +852,12 @@ class CopyTrader:
                             hold_minutes = (datetime.now(entry_dt.tzinfo) - entry_dt).total_seconds() / 60
                         except:
                             pass
+                    
+                    if not should_sell and TIME_LIMIT_MINUTES > 0 and hold_minutes >= TIME_LIMIT_MINUTES:
+                        reason = f"time_limit_triggered (held {hold_minutes:.1f}m >= {TIME_LIMIT_MINUTES:.1f}m)"
+                        should_sell = True
+                        if current_value == 0 and entry_sol > 0:
+                            current_value = entry_sol * 0.5
                     
                     # Rug detection checks - ALWAYS run to protect from unsellable tokens
                     # Even when trust_trader is on for buys, we still protect exits
@@ -1889,7 +1896,7 @@ class CopyTrader:
                 balance_sol = real_balance_sol
             
             # Track if real balance is too low (will skip real execution but allow mock)
-            real_balance_insufficient = should_execute_real and real_balance_sol < 0.03
+            real_balance_insufficient = should_execute_real and real_balance_sol < 0.01
             
             # Calculate fee reserve needed for existing + new positions
             if self._is_shadow_wallet(swap.wallet):
@@ -2015,9 +2022,9 @@ class CopyTrader:
                 # IMPORTANT: Recalculate trade size based on REAL balance
                 # Keep enough SOL reserved for selling ALL open positions (including this new one)
                 real_open_positions = len(self.position_manager.positions) if self.position_manager else 0
-                # Reserve 0.05 SOL per position for sell fees (covers Raydium/Jupiter priority fees)
-                sell_reserve = 0.05 * (real_open_positions + 1)
-                base_reserve = 0.03  # Base reserve for rent and transaction fees
+                # Reserve 0.02 SOL per position for sell fees (priority fees are typically <0.01)
+                sell_reserve = 0.02 * (real_open_positions + 1)
+                base_reserve = 0.01  # Minimal base reserve for rent
                 real_available = max(0, real_balance_sol - sell_reserve - base_reserve)
                 
                 logger.debug(
@@ -2642,7 +2649,7 @@ class CopyTrader:
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
             # Send
-            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=(exec_type == "sell"))
+            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
             
             # CRITICAL: Confirm transaction actually succeeded on-chain
             confirmed = await self._confirm_transaction(signature)
@@ -2818,7 +2825,7 @@ class CopyTrader:
                         "denominatedInSol": "true",
                         "amount": sol_amount,
                         "slippage": pumpfun_slippage,
-                        "priorityFee": 0.005,  # High priority for faster execution
+                        "priorityFee": 0.001,  # Reduced from 0.005 to save SOL
                         "pool": pool
                     }
                 else:
@@ -2830,7 +2837,7 @@ class CopyTrader:
                         "denominatedInSol": "false",
                         "amount": f"{sell_percentage}%",
                         "slippage": pumpfun_slippage,
-                        "priorityFee": 0.005,
+                        "priorityFee": 0.0005,  # Low fee for sells to avoid burning SOL on failures
                         "pool": pool
                     }
                 
@@ -2895,7 +2902,7 @@ class CopyTrader:
                             attempt_number=attempt_number,
                             requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.005 * 1e9)
+                            priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
                         ))
                     continue  # Try next pool
                 
@@ -2904,7 +2911,7 @@ class CopyTrader:
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
                 
                 # Send the transaction
-                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=(not is_buy))
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
                 
                 # CRITICAL: Confirm transaction actually succeeded on-chain
                 confirmed = await self._confirm_transaction(signature)
@@ -2930,7 +2937,7 @@ class CopyTrader:
                             attempt_number=attempt_number,
                             requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.005 * 1e9)
+                            priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
                         ))
                     continue  # Try next pool
                 
@@ -2981,7 +2988,7 @@ class CopyTrader:
                     pumpfun_pool_type=pool,
                     requested_in_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps_configured=int(pumpfun_slippage * 100),
-                    priority_fee_lamports=int(0.005 * 1e9),
+                    priority_fee_lamports=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9),
                     compute_units_used=compute_units_used,
                     tx_fee_lamports=tx_fee_lamports,
                     total_cost_sol=Decimal(str((tx_fee_lamports or 0) / 1e9)) if tx_fee_lamports is not None else None,
@@ -3010,7 +3017,7 @@ class CopyTrader:
                     attempt_number=attempt_number,
                     requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps=int(pumpfun_slippage * 100),
-                    priority_fee=int(0.005 * 1e9)
+                    priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
                 ))
             return CopyTradeResult(success=False, error=f"pumpfun_api_failed: {last_error}")
             
@@ -3029,7 +3036,7 @@ class CopyTrader:
                     attempt_number=attempt_number,
                     requested_amount=Decimal(str(sol_amount)) if is_buy else None,
                     slippage_bps=int(pumpfun_slippage * 100) if 'pumpfun_slippage' in locals() else None,
-                    priority_fee=int(0.005 * 1e9)
+                    priority_fee=int(0.001 * 1e9) if is_buy else int(0.0005 * 1e9)
                 ))
             return CopyTradeResult(success=False, error=f"pumpfun_error: {str(e)}")
     

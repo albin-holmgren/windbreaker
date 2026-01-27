@@ -428,8 +428,8 @@ class TradeTelemetry:
         except Exception as e:
             snapshot.data_missing_reason = f"dexscreener_error: {str(e)}"
         
-        # If DexScreener failed, try Pump.fun for pump tokens
-        if not snapshot.data_source and "pump" in token_mint.lower():
+        # If DexScreener failed (or returned 0 mcap), try Pump.fun
+        if (not snapshot.data_source) or (snapshot.market_cap_usd is not None and snapshot.market_cap_usd == 0):
             try:
                 async with self.session.get(
                     f"https://frontend-api.pump.fun/coins/{token_mint}",
@@ -892,7 +892,67 @@ class TradeTelemetry:
                     filter_thresholds.get("max_pump") if filter_thresholds else None,
                     error_code, error_message
                 )
-                
+
+                if market_snapshot:
+                    await conn.execute(
+                        """
+                        DELETE FROM market_snapshots
+                        WHERE trade_id IS NULL
+                          AND correlation_id = $1
+                          AND snapshot_type = 'skipped_detection'
+                        """,
+                        correlation_id,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO market_snapshots (
+                            trade_id, correlation_id, token_mint, snapshot_type,
+                            snapshot_at, minutes_after_event, data_source,
+                            data_missing_reason, price_usd, price_sol,
+                            market_cap_usd, fully_diluted_valuation, liquidity_usd,
+                            volume_5m_usd, volume_1h_usd, volume_24h_usd,
+                            txns_5m_buys, txns_5m_sells, txns_1h_buys, txns_1h_sells,
+                            txns_24h_buys, txns_24h_sells, price_change_m5_pct,
+                            price_change_h1_pct, price_change_h6_pct, price_change_h24_pct,
+                            token_age_minutes, pair_age_minutes, pair_address, pair_dex
+                        ) VALUES (
+                            NULL, $1, $2, 'skipped_detection',
+                            $3, $4, $5, $6, $7, $8,
+                            $9, $10, $11, $12, $13, $14,
+                            $15, $16, $17, $18, $19, $20, $21,
+                            $22, $23, $24, $25, $26, $27, $28
+                        )
+                        """,
+                        correlation_id,
+                        token_mint,
+                        market_snapshot.snapshot_at,
+                        market_snapshot.minutes_after_event,
+                        market_snapshot.data_source,
+                        market_snapshot.data_missing_reason,
+                        market_snapshot.price_usd,
+                        market_snapshot.price_sol,
+                        market_snapshot.market_cap_usd,
+                        market_snapshot.fully_diluted_valuation,
+                        market_snapshot.liquidity_usd,
+                        market_snapshot.volume_5m_usd,
+                        market_snapshot.volume_1h_usd,
+                        market_snapshot.volume_24h_usd,
+                        market_snapshot.txns_5m_buys,
+                        market_snapshot.txns_5m_sells,
+                        market_snapshot.txns_1h_buys,
+                        market_snapshot.txns_1h_sells,
+                        market_snapshot.txns_24h_buys,
+                        market_snapshot.txns_24h_sells,
+                        market_snapshot.price_change_m5_pct,
+                        market_snapshot.price_change_h1_pct,
+                        market_snapshot.price_change_h6_pct,
+                        market_snapshot.price_change_h24_pct,
+                        market_snapshot.token_age_minutes,
+                        market_snapshot.pair_age_minutes,
+                        market_snapshot.pair_address,
+                        market_snapshot.pair_dex,
+                    )
+            
             logger.debug("skipped_trade_recorded",
                         correlation_id=correlation_id[:8],
                         token=token_mint[:8],
@@ -900,12 +960,12 @@ class TradeTelemetry:
 
             detected_price_usd = market_snapshot.price_usd if market_snapshot else None
             detected_price_sol = market_snapshot.price_sol if market_snapshot else None
-            if detected_price_usd and detected_price_sol:
+            if detected_price_usd and detected_price_usd > 0:
                 asyncio.create_task(self.schedule_skipped_trade_followups(
                     correlation_id=correlation_id,
                     token_mint=token_mint,
                     detected_price_usd=detected_price_usd,
-                    detected_price_sol=detected_price_sol
+                    detected_price_sol=detected_price_sol or Decimal("0")
                 ))
                         
         except Exception as e:
@@ -1105,7 +1165,7 @@ class TradeTelemetry:
                                 UPDATE skipped_trades
                                 SET price_1h_later = $1,
                                     price_change_1h_later_pct = $2,
-                                    would_have_profited = ($2 > 0)
+                                    would_have_profited = ($2 > 0::numeric)
                                 WHERE correlation_id = $3
                             """,
                                 snapshot.price_usd,
