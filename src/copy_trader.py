@@ -2524,10 +2524,16 @@ class CopyTrader:
     ) -> CopyTradeResult:
         """Execute a swap via Jupiter."""
         submit_at = datetime.now(timezone.utc)
-        effective_slippage_bps = slippage_bps if slippage_bps is not None else self.config.slippage_bps
-        effective_priority_fee = int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
         exec_type = "buy" if input_mint == NATIVE_SOL else "sell"
         token_mint = output_mint if input_mint == NATIVE_SOL else input_mint
+        
+        # CRITICAL: Use high slippage for sells (memecoins move fast)
+        # Sells need at least 50% slippage to avoid failed txs that burn fees
+        if exec_type == "sell":
+            effective_slippage_bps = max(slippage_bps or self.config.slippage_bps, 5000)  # Min 50% for sells
+        else:
+            effective_slippage_bps = slippage_bps if slippage_bps is not None else self.config.slippage_bps
+        effective_priority_fee = int(priority_fee_lamports if priority_fee_lamports is not None else self.jupiter_priority_fee_lamports)
 
         try:
             # Get quote with expanded routing options

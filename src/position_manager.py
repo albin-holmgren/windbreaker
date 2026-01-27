@@ -436,7 +436,7 @@ class PositionManager:
                             tx_bytes = base64.b64decode(swap_tx)
                             tx = VersionedTransaction.from_bytes(tx_bytes)
                             signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
+                            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
                             sol_received = int(quote.get("outAmount", 0)) / 1e9
 
                             if telemetry and correlation_id:
@@ -456,7 +456,7 @@ class PositionManager:
                                     jupiter_quote_out=Decimal(str(quote.get("outAmount"))) if quote.get("outAmount") is not None else None,
                                     jupiter_price_impact_pct=Decimal(str(quote.get("priceImpactPct"))) if quote.get("priceImpactPct") is not None else None,
                                     requested_in_amount=Decimal(str(token_amount)),
-                                    slippage_bps_configured=self.config.slippage_bps,
+                                    slippage_bps_configured=5000,  # 50% min for sells
                                     priority_fee_lamports=500000,
                                     final_status="submitted"
                                 )
@@ -1565,11 +1565,15 @@ class PositionManager:
     ) -> Optional[Dict]:
         """Get a Jupiter quote."""
         try:
+            # CRITICAL: Use high slippage for sells (memecoins move fast)
+            is_sell = output_mint == NATIVE_SOL
+            slippage = max(self.config.slippage_bps, 5000) if is_sell else self.config.slippage_bps
+            
             params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": str(self.config.slippage_bps)
+                "slippageBps": str(slippage)
             }
             
             async with self.session.get(JUPITER_QUOTE_API, params=params, timeout=aiohttp.ClientTimeout(total=6)) as resp:
