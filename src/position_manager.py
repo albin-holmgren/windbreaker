@@ -518,7 +518,7 @@ class PositionManager:
                 ))
         
         # Fallback to PumpPortal - try multiple pools
-        pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
+        pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
         pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
         last_error = None
         
@@ -535,29 +535,53 @@ class PositionManager:
                     "pool": pool
                 }
                 
+                tx_bytes = None
+                status_code = None
+                error_text = None
                 async with self.session.post(
                     PUMPFUN_API,
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=6)
                 ) as resp:
-                    if resp.status != 200:
-                        last_error = await resp.text()
-                        if telemetry and correlation_id:
-                            asyncio.create_task(telemetry.record_failed_execution(
-                                trade_id=None,
-                                correlation_id=correlation_id,
-                                token_mint=token_mint,
-                                execution_type="sell",
-                                method="pumpfun_sell",
-                                error_code=f"{pool}_http_{resp.status}",
-                                error_message=last_error,
-                                error_category="api_error",
-                                attempt_number=1,
-                                slippage_bps=int(pumpfun_slippage * 100),
-                                priority_fee=int(0.005 * 1e9)
-                            ))
-                        continue
-                    tx_bytes = await resp.read()
+                    status_code = resp.status
+                    if resp.status == 200:
+                        tx_bytes = await resp.read()
+                    else:
+                        error_text = await resp.text()
+
+                if tx_bytes is None and status_code == 400:
+                    try:
+                        async with self.session.post(
+                            PUMPFUN_API,
+                            data=payload,
+                            timeout=aiohttp.ClientTimeout(total=6)
+                        ) as resp2:
+                            status_code = resp2.status
+                            if resp2.status == 200:
+                                tx_bytes = await resp2.read()
+                            else:
+                                error_text2 = await resp2.text()
+                                error_text = f"{error_text} | form: {error_text2}" if error_text else error_text2
+                    except Exception as e:
+                        error_text = f"{error_text} | form_exception: {e}" if error_text else f"form_exception: {e}"
+
+                if tx_bytes is None:
+                    last_error = error_text or "unknown_error"
+                    if telemetry and correlation_id:
+                        asyncio.create_task(telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=token_mint,
+                            execution_type="sell",
+                            method="pumpfun_sell",
+                            error_code=f"{pool}_http_{status_code or 'unknown'}",
+                            error_message=str(last_error),
+                            error_category="api_error",
+                            attempt_number=1,
+                            slippage_bps=int(pumpfun_slippage * 100),
+                            priority_fee=int(0.005 * 1e9)
+                        ))
+                    continue
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
@@ -1256,7 +1280,7 @@ class PositionManager:
             
             # Request transaction from PumpPortal - sell 100% of holdings
             # Use high slippage for pump.fun (tokens move fast) - minimum 30%
-            pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
+            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
             
             # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
             pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
@@ -1280,32 +1304,60 @@ class PositionManager:
                     pool=pool
                 )
                 
+                tx_bytes = None
+                status_code = None
+                error_text = None
                 async with self.session.post(
                     PUMPFUN_API,
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=6)
                 ) as resp:
-                    if resp.status != 200:
+                    status_code = resp.status
+                    if resp.status == 200:
+                        tx_bytes = await resp.read()
+                    else:
                         error_text = await resp.text()
-                        last_error = f"{pool}: {error_text}"
-                        logger.debug("pumpfun_sell_pool_failed", pool=pool, status=resp.status, response=error_text[:100], token=position.token_mint[:8])
-                        if telemetry and correlation_id:
-                            asyncio.create_task(telemetry.record_failed_execution(
-                                trade_id=None,
-                                correlation_id=correlation_id,
-                                token_mint=position.token_mint,
-                                execution_type="sell",
-                                method="pumpfun_sell",
-                                error_code=f"{pool}_http_{resp.status}",
-                                error_message=error_text,
-                                error_category="api_error",
-                                attempt_number=attempt_number,
-                                slippage_bps=int(pumpfun_slippage * 100),
-                                priority_fee=int(0.005 * 1e9)
-                            ))
-                        continue  # Try next pool
-                    
-                    tx_bytes = await resp.read()
+
+                if tx_bytes is None and status_code == 400:
+                    try:
+                        async with self.session.post(
+                            PUMPFUN_API,
+                            data=payload,
+                            timeout=aiohttp.ClientTimeout(total=6)
+                        ) as resp2:
+                            status_code = resp2.status
+                            if resp2.status == 200:
+                                tx_bytes = await resp2.read()
+                            else:
+                                error_text2 = await resp2.text()
+                                error_text = f"{error_text} | form: {error_text2}" if error_text else error_text2
+                    except Exception as e:
+                        error_text = f"{error_text} | form_exception: {e}" if error_text else f"form_exception: {e}"
+
+                if tx_bytes is None:
+                    last_error = f"{pool}: {error_text or 'unknown_error'}"
+                    logger.debug(
+                        "pumpfun_sell_pool_failed",
+                        pool=pool,
+                        status=status_code,
+                        response=str(error_text or "")[:100],
+                        token=position.token_mint[:8]
+                    )
+                    if telemetry and correlation_id:
+                        asyncio.create_task(telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=position.token_mint,
+                            execution_type="sell",
+                            method="pumpfun_sell",
+                            error_code=f"{pool}_http_{status_code or 'unknown'}",
+                            error_message=str(error_text or "")[:5000],
+                            error_category="api_error",
+                            attempt_number=attempt_number,
+                            slippage_bps=int(pumpfun_slippage * 100),
+                            priority_fee=int(0.005 * 1e9)
+                        ))
+                    continue  # Try next pool
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])

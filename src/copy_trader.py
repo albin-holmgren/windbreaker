@@ -2803,7 +2803,7 @@ class CopyTrader:
             
             # Request transaction from PumpPortal
             # Use VERY high slippage for pump.fun (tokens move extremely fast) - minimum 30%
-            pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
+            pumpfun_slippage = max(int(self.config.slippage_bps / 100), 30)
             
             # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
             pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
@@ -2843,34 +2843,61 @@ class CopyTrader:
                     pool=pool
                 )
                 
+                tx_bytes = None
+                status_code = None
+                error_text = None
                 async with self.session.post(
                     PUMPFUN_API,
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=6)
                 ) as resp:
-                    if resp.status != 200:
+                    status_code = resp.status
+                    if resp.status == 200:
+                        tx_bytes = await resp.read()
+                    else:
                         error_text = await resp.text()
-                        last_error = f"{pool}: {error_text}"
-                        logger.debug("pumpfun_pool_failed", pool=pool, status=resp.status, response=error_text[:100], mint=token_mint[:8])
-                        if self.telemetry and correlation_id:
-                            asyncio.create_task(self.telemetry.record_failed_execution(
-                                trade_id=None,
-                                correlation_id=correlation_id,
-                                token_mint=token_mint,
-                                execution_type="buy" if is_buy else "sell",
-                                method=f"pumpfun_{action}",
-                                error_code=f"http_{resp.status}",
-                                error_message=last_error,
-                                error_category="api_error",
-                                attempt_number=attempt_number,
-                                requested_amount=Decimal(str(sol_amount)) if is_buy else None,
-                                slippage_bps=int(pumpfun_slippage * 100),
-                                priority_fee=int(0.005 * 1e9)
-                            ))
-                        continue  # Try next pool
-                    
-                    # Response is the raw transaction bytes
-                    tx_bytes = await resp.read()
+
+                if tx_bytes is None and status_code == 400:
+                    try:
+                        async with self.session.post(
+                            PUMPFUN_API,
+                            data=payload,
+                            timeout=aiohttp.ClientTimeout(total=6)
+                        ) as resp2:
+                            status_code = resp2.status
+                            if resp2.status == 200:
+                                tx_bytes = await resp2.read()
+                            else:
+                                error_text2 = await resp2.text()
+                                error_text = f"{error_text} | form: {error_text2}" if error_text else error_text2
+                    except Exception as e:
+                        error_text = f"{error_text} | form_exception: {e}" if error_text else f"form_exception: {e}"
+
+                if tx_bytes is None:
+                    last_error = f"{pool}: {error_text or 'unknown_error'}"
+                    logger.debug(
+                        "pumpfun_pool_failed",
+                        pool=pool,
+                        status=status_code,
+                        response=str(error_text or "")[:100],
+                        mint=token_mint[:8]
+                    )
+                    if self.telemetry and correlation_id:
+                        asyncio.create_task(self.telemetry.record_failed_execution(
+                            trade_id=None,
+                            correlation_id=correlation_id,
+                            token_mint=token_mint,
+                            execution_type="buy" if is_buy else "sell",
+                            method=f"pumpfun_{action}",
+                            error_code=f"http_{status_code or 'unknown'}",
+                            error_message=last_error,
+                            error_category="api_error",
+                            attempt_number=attempt_number,
+                            requested_amount=Decimal(str(sol_amount)) if is_buy else None,
+                            slippage_bps=int(pumpfun_slippage * 100),
+                            priority_fee=int(0.005 * 1e9)
+                        ))
+                    continue  # Try next pool
                 
                 # Deserialize and sign the transaction
                 tx = VersionedTransaction.from_bytes(tx_bytes)
