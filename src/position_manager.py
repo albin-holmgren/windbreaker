@@ -424,7 +424,11 @@ class PositionManager:
                     "prioritizationFeeLamports": 500000  # Very high priority for retries
                 }
                 
-                async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
+                async with self.session.post(
+                    JUPITER_SWAP_API,
+                    json=swap_data,
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
                     if resp.status == 200:
                         swap_response = await resp.json()
                         swap_tx = swap_response.get("swapTransaction")
@@ -432,7 +436,7 @@ class PositionManager:
                             tx_bytes = base64.b64decode(swap_tx)
                             tx = VersionedTransaction.from_bytes(tx_bytes)
                             signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                            signature = await self.rpc.send_transaction(signed_tx)
+                            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
                             sol_received = int(quote.get("outAmount", 0)) / 1e9
 
                             if telemetry and correlation_id:
@@ -515,7 +519,7 @@ class PositionManager:
         
         # Fallback to PumpPortal - try multiple pools
         pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
-        pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+        pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
         last_error = None
         
         for pool in pools_to_try:
@@ -531,7 +535,11 @@ class PositionManager:
                     "pool": pool
                 }
                 
-                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                async with self.session.post(
+                    PUMPFUN_API,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=6)
+                ) as resp:
                     if resp.status != 200:
                         last_error = await resp.text()
                         if telemetry and correlation_id:
@@ -553,7 +561,7 @@ class PositionManager:
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                signature = await self.rpc.send_transaction(signed_tx)
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
                 
                 logger.info("direct_sell_pumpfun_success", token=token_mint[:8], pool=pool)
                 if telemetry and correlation_id:
@@ -1083,7 +1091,7 @@ class PositionManager:
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
             submit_at = datetime.now(timezone.utc)
-            signature = await self.rpc.send_transaction(signed_tx)
+            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
             
             sol_received = int(quote.get("outAmount", 0)) / 1e9
 
@@ -1251,7 +1259,7 @@ class PositionManager:
             pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
             # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
-            pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
             last_error = None
             
             for pool in pools_to_try:
@@ -1272,7 +1280,11 @@ class PositionManager:
                     pool=pool
                 )
                 
-                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                async with self.session.post(
+                    PUMPFUN_API,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=6)
+                ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         last_error = f"{pool}: {error_text}"
@@ -1299,7 +1311,7 @@ class PositionManager:
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
                 
                 submit_at = datetime.now(timezone.utc)
-                signature = await self.rpc.send_transaction(signed_tx)
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
                 
                 logger.info(
                     "pumpfun_sell_success",
@@ -1507,7 +1519,7 @@ class PositionManager:
                 "slippageBps": str(self.config.slippage_bps)
             }
             
-            async with self.session.get(JUPITER_QUOTE_API, params=params) as resp:
+            async with self.session.get(JUPITER_QUOTE_API, params=params, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return None

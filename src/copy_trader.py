@@ -1326,7 +1326,7 @@ class CopyTrader:
                     block_time=getattr(swap, 'block_time', None),
                     slot=getattr(swap, 'slot', None),
                     market_snapshot=snapshot,
-                    copied=None,  # Will be updated later for buys
+                    copied=False,  # Will be updated to True later for executed buys
                     skip_reason=None
                 )
             except Exception as e:
@@ -1386,12 +1386,19 @@ class CopyTrader:
                     # If untracked, sell directly via copy_trader instead of position_manager
                     if onchain_balance > 0 and not self.position_manager.has_position(swap.token_mint):
                         logger.info("selling_untracked_position", token=swap.token_mint[:8], balance=onchain_balance)
-                        result = await self._execute_real_trade_with_fallbacks(swap, onchain_balance, 0, is_pumpfun=True)
-                        if result and result.success:
-                            real_sold = True
-                            logger.info("untracked_sell_success", token=swap.token_mint[:8])
-                        else:
-                            logger.warning("untracked_sell_failed", error=result.error if result else "no_result")
+                        if self.position_manager:
+                            correlation_id = str(uuid.uuid4())
+                            sell_result = await self.position_manager._execute_direct_sell(
+                                swap.token_mint,
+                                onchain_balance,
+                                correlation_id=correlation_id
+                            )
+                            if sell_result and sell_result.success:
+                                real_sold = True
+                                logger.info("untracked_sell_success", token=swap.token_mint[:8])
+                            else:
+                                logger.warning("untracked_sell_failed", error=sell_result.error if sell_result else "no_result")
+
                     else:
                         result = await self.position_manager.trigger_sell(swap.token_mint, ExitReason.COPIED_SELL)
                         if result.success:
@@ -2526,7 +2533,11 @@ class CopyTrader:
                 "asLegacyTransaction": "false"
             }
             
-            async with self.session.get(JUPITER_QUOTE_API, params=quote_params) as resp:
+            async with self.session.get(
+                JUPITER_QUOTE_API,
+                params=quote_params,
+                timeout=aiohttp.ClientTimeout(total=4)
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     if self.telemetry and correlation_id:
@@ -2575,7 +2586,11 @@ class CopyTrader:
                 "prioritizationFeeLamports": effective_priority_fee
             }
             
-            async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
+            async with self.session.post(
+                JUPITER_SWAP_API,
+                json=swap_data,
+                timeout=aiohttp.ClientTimeout(total=6)
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     if self.telemetry and correlation_id:
@@ -2627,7 +2642,7 @@ class CopyTrader:
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
             # Send
-            signature = await self.rpc.send_transaction(signed_tx)
+            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=(exec_type == "sell"))
             
             # CRITICAL: Confirm transaction actually succeeded on-chain
             confirmed = await self._confirm_transaction(signature)
@@ -2791,7 +2806,7 @@ class CopyTrader:
             pumpfun_slippage = max(self.config.slippage_bps / 100, 30)
             
             # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
-            pools_to_try = ["pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
             last_error = None
             
             for pool in pools_to_try:
@@ -2828,7 +2843,11 @@ class CopyTrader:
                     pool=pool
                 )
                 
-                async with self.session.post(PUMPFUN_API, json=payload) as resp:
+                async with self.session.post(
+                    PUMPFUN_API,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=6)
+                ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         last_error = f"{pool}: {error_text}"
@@ -2858,7 +2877,7 @@ class CopyTrader:
                 signed_tx = VersionedTransaction(tx.message, [self.wallet])
                 
                 # Send the transaction
-                signature = await self.rpc.send_transaction(signed_tx)
+                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=(not is_buy))
                 
                 # CRITICAL: Confirm transaction actually succeeded on-chain
                 confirmed = await self._confirm_transaction(signature)

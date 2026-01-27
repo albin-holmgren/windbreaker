@@ -5,6 +5,7 @@ Supports Helius/QuickNode with rate limiting and backoff.
 
 import asyncio
 import time
+import os
 from typing import Optional, Dict, Any, List
 import aiohttp
 from solders.rpc.responses import GetBalanceResp, SendTransactionResp
@@ -48,11 +49,21 @@ class RPCClient:
     
     def __init__(self, config: Config):
         self.config = config
-        self.rpc_url = config.rpc_url
+        rpc_urls: List[str] = [u.strip() for u in (config.rpc_url or "").split(",") if u.strip()]
+        secondary = os.getenv("RPC_URL_SECONDARY", "")
+        if secondary:
+            rpc_urls.extend([u.strip() for u in secondary.split(",") if u.strip()])
+        self.rpc_urls: List[str] = []
+        for u in rpc_urls:
+            if u not in self.rpc_urls:
+                self.rpc_urls.append(u)
+
+        self.rpc_url = self.rpc_urls[0] if self.rpc_urls else config.rpc_url
         self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
         self._session: Optional[aiohttp.ClientSession] = None
         self._backoff_until: float = 0
         self._consecutive_errors = 0
+        self._timeout_sec = float(os.getenv("RPC_TIMEOUT_SEC", "8"))
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -101,30 +112,51 @@ class RPCClient:
             "params": params
         }
         
-        try:
-            async with session.post(
-                self.rpc_url,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as response:
-                if response.status == 429:
-                    self._apply_backoff()
-                    raise Exception("Rate limited by RPC")
-                
-                response.raise_for_status()
-                result = await response.json()
-                
-                if "error" in result:
-                    error = result["error"]
-                    raise Exception(f"RPC error: {error.get('message', error)}")
-                
-                self._reset_backoff()
-                return result.get("result", {})
-                
-        except aiohttp.ClientError as e:
-            self._apply_backoff()
-            logger.error("rpc_request_failed", method=method, error=str(e))
-            raise
+        last_error: Optional[str] = None
+        last_exception: Optional[Exception] = None
+
+        for url in self.rpc_urls or [self.rpc_url]:
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=self._timeout_sec)
+                ) as response:
+                    if response.status == 429:
+                        last_error = "rate_limited"
+                        continue
+                    if response.status != 200:
+                        last_error = f"http_{response.status}"
+                        continue
+
+                    result = await response.json()
+                    if "error" in result:
+                        error = result["error"]
+                        last_error = f"rpc_error:{error.get('message', error)}"
+                        continue
+
+                    self.rpc_url = url
+                    self._reset_backoff()
+                    return result.get("result", {})
+            except asyncio.TimeoutError as e:
+                last_exception = e
+                last_error = "timeout"
+                continue
+            except aiohttp.ClientError as e:
+                last_exception = e
+                last_error = str(e)
+                continue
+            except Exception as e:
+                last_exception = e
+                last_error = str(e)
+                continue
+
+        self._apply_backoff()
+        logger.error("rpc_request_failed", method=method, error=last_error)
+        if last_exception:
+            raise last_exception
+        raise Exception(f"RPC request failed: {last_error}")
     
     async def get_balance(self, pubkey: Pubkey) -> int:
         """Get SOL balance in lamports."""
