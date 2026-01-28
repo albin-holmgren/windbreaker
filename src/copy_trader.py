@@ -1736,6 +1736,21 @@ class CopyTrader:
                         original_swap=swap
                     )
             
+            # BUYS: Pre-check sellability - skip tokens we can't sell later
+            # This prevents entering positions in dead/rugged/no-liquidity tokens
+            has_sell_route = await self._check_token_sellable(swap.token_mint)
+            if not has_sell_route:
+                logger.warning(
+                    "skipping_unsellable_token",
+                    token=swap.token_mint[:8],
+                    reason="no_sell_route"
+                )
+                return CopyTradeResult(
+                    success=False,
+                    error="token_not_sellable (no route on Jupiter)",
+                    original_swap=swap
+                )
+            
             # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
             is_pumpfun = swap.dex == "pump.fun"
@@ -3457,6 +3472,52 @@ class CopyTrader:
         except Exception as e:
             logger.warning("check_trader_holds_error", trader=trader_wallet[:8], token=mint[:8], error=str(e))
             # On error, assume trader still holds (safer)
+            return True
+    
+    async def _check_token_sellable(self, mint: str) -> bool:
+        """Check if a token has a sell route on Jupiter before buying.
+        
+        This prevents entering positions in tokens we can't exit.
+        Returns True if sellable, False if no route found.
+        """
+        try:
+            # Use a small test amount (1 token unit) to check if route exists
+            # We just need to know IF a route exists, not get exact quote
+            test_amount = 1000000  # 1 token (assuming 6 decimals)
+            
+            quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={mint}&outputMint=So11111111111111111111111111111111111111112&amount={test_amount}&slippageBps=5000"
+            
+            async with self.session.get(quote_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # If we get a quote with outAmount > 0, token is sellable
+                    out_amount = int(data.get("outAmount", 0))
+                    if out_amount > 0:
+                        return True
+                    # Check for error in response
+                    error = data.get("error", "")
+                    if "Could not find any route" in error or "COULD_NOT_FIND_ANY_ROUTE" in str(data):
+                        logger.debug("token_not_sellable_no_route", token=mint[:8])
+                        return False
+                    return True  # Got a response, assume sellable
+                elif resp.status == 400:
+                    # Check if it's a "no route" error
+                    try:
+                        error_data = await resp.json()
+                        if "Could not find any route" in str(error_data):
+                            return False
+                    except:
+                        pass
+                    return False
+                else:
+                    # Other errors - assume sellable to not block trades
+                    return True
+        except asyncio.TimeoutError:
+            # Timeout - assume sellable to not slow down
+            return True
+        except Exception as e:
+            logger.debug("sellability_check_error", token=mint[:8], error=str(e))
+            # On error, assume sellable (don't block trades on API issues)
             return True
     
     async def _get_token_info(self, mint: str) -> tuple[float, float, float, float, float, int]:
