@@ -114,6 +114,25 @@ class CopyTrader:
         self.min_volume_24h_usd = config.min_volume_24h_usd
         self.max_price_change_1h_pct = config.max_price_change_1h_pct
         self.min_txns_1h = config.min_txns_1h
+
+        try:
+            hard_min_sol = float(os.getenv('HARD_MIN_SOL_PER_TRADE', '0.08'))
+        except ValueError:
+            hard_min_sol = 0.08
+        if hard_min_sol > 0:
+            self.min_sol_per_trade = max(self.min_sol_per_trade, hard_min_sol)
+
+        try:
+            hard_max_pump = float(os.getenv('HARD_MAX_PRICE_CHANGE_1H_PCT', '120'))
+        except ValueError:
+            hard_max_pump = 120.0
+        if hard_max_pump > 0:
+            if self.max_price_change_1h_pct <= 0:
+                self.max_price_change_1h_pct = hard_max_pump
+            else:
+                self.max_price_change_1h_pct = min(self.max_price_change_1h_pct, hard_max_pump)
+
+        self.parser.min_sol_value = self.min_sol_per_trade
         self.max_top10_holders_pct = config.max_top10_holders_pct
         self.max_dev_holdings_pct = config.max_dev_holdings_pct
         self.min_holders_count = config.min_holders_count
