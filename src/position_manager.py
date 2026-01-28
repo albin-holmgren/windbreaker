@@ -28,6 +28,8 @@ PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
 
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
 
+HARD_MIN_SOL_FLOOR_SOL = 0.08
+
 
 class ExitReason(Enum):
     TAKE_PROFIT = "take_profit"
@@ -199,7 +201,12 @@ class PositionManager:
                     entry_time = datetime.utcnow()
                 
                 # Get entry SOL amount
-                entry_amount = entry_sol.get(token_mint, 0.03)  # Default to 0.03
+                entry_amount = entry_sol.get(token_mint, HARD_MIN_SOL_FLOOR_SOL)
+                try:
+                    entry_amount = float(entry_amount)
+                except Exception:
+                    entry_amount = HARD_MIN_SOL_FLOOR_SOL
+                entry_amount = max(entry_amount, HARD_MIN_SOL_FLOOR_SOL)
                 
                 position = Position(
                     token_mint=token_mint,
@@ -519,7 +526,9 @@ class PositionManager:
         
         # Fallback to PumpPortal - try multiple pools
         pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50)
-        pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+        pumpfun_priority_fee_sol = min(max(float(self.config.pumpfun_priority_fee_sol), 0.0002), 0.001)
+        pumpfun_priority_fee_lamports = int(pumpfun_priority_fee_sol * 1e9)
+        pools_to_try = ["auto", "pump", "pump-amm"]
         last_error = None
         
         for pool in pools_to_try:
@@ -531,7 +540,7 @@ class PositionManager:
                     "denominatedInSol": "false",
                     "amount": "100%",
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.0005,
+                    "priorityFee": pumpfun_priority_fee_sol,
                     "pool": pool
                 }
                 
@@ -579,8 +588,10 @@ class PositionManager:
                             error_category="api_error",
                             attempt_number=1,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.0005 * 1e9)
+                            priority_fee=pumpfun_priority_fee_lamports
                         ))
+                    if status_code == 400 and pool != "auto":
+                        break
                     continue
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -596,7 +607,7 @@ class PositionManager:
                         dex_used="pump.fun",
                         pumpfun_pool_type=pool,
                         slippage_bps_configured=int(pumpfun_slippage * 100),
-                        priority_fee_lamports=int(0.0005 * 1e9),
+                        priority_fee_lamports=pumpfun_priority_fee_lamports,
                         final_status="submitted"
                     )
                     asyncio.create_task(telemetry.record_execution_details(
@@ -618,7 +629,7 @@ class PositionManager:
                         error_category="exception",
                         attempt_number=1,
                         slippage_bps=int(pumpfun_slippage * 100),
-                        priority_fee=int(0.0005 * 1e9)
+                        priority_fee=pumpfun_priority_fee_lamports
                     ))
                 continue
         
@@ -1281,9 +1292,12 @@ class PositionManager:
             # Request transaction from PumpPortal - sell 100% of holdings
             # Use very high slippage for pump.fun sells (tokens move fast) - minimum 50%
             pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50)
+
+            pumpfun_priority_fee_sol = min(max(float(self.config.pumpfun_priority_fee_sol), 0.0002), 0.001)
+            pumpfun_priority_fee_lamports = int(pumpfun_priority_fee_sol * 1e9)
             
             # Try pools in order: pump (bonding curve), pump-amm (graduated), raydium
-            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+            pools_to_try = ["auto", "pump", "pump-amm"]
             last_error = None
             
             for pool in pools_to_try:
@@ -1294,7 +1308,7 @@ class PositionManager:
                     "denominatedInSol": "false",
                     "amount": "100%",  # Sell all tokens
                     "slippage": pumpfun_slippage,
-                    "priorityFee": 0.0005,  # Reduced from 0.005 to save SOL on failures
+                    "priorityFee": pumpfun_priority_fee_sol,
                     "pool": pool
                 }
                 
@@ -1355,8 +1369,10 @@ class PositionManager:
                             error_category="api_error",
                             attempt_number=attempt_number,
                             slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=int(0.0005 * 1e9)
+                            priority_fee=pumpfun_priority_fee_lamports
                         ))
+                    if status_code == 400 and pool != "auto":
+                        break
                     continue  # Try next pool
                 
                 tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -1380,7 +1396,7 @@ class PositionManager:
                         token_mint=position.token_mint,
                         pool=pool,
                         slippage_bps_configured=int(pumpfun_slippage * 100),
-                        priority_fee_lamports=int(0.0005 * 1e9),
+                        priority_fee_lamports=pumpfun_priority_fee_lamports,
                         submit_at=submit_at,
                         attempt_number=attempt_number
                     ))
@@ -1405,7 +1421,7 @@ class PositionManager:
                     error_category="no_route",
                     attempt_number=attempt_number,
                     slippage_bps=int(pumpfun_slippage * 100),
-                    priority_fee=int(0.0005 * 1e9)
+                    priority_fee=pumpfun_priority_fee_lamports
                 ))
             return SellResult(success=False, error=f"pumpfun_api: {last_error}")
             
@@ -1423,7 +1439,7 @@ class PositionManager:
                     error_category="exception",
                     attempt_number=attempt_number,
                     slippage_bps=int(pumpfun_slippage * 100) if 'pumpfun_slippage' in locals() else None,
-                    priority_fee=int(0.0005 * 1e9)
+                    priority_fee=pumpfun_priority_fee_lamports if 'pumpfun_priority_fee_lamports' in locals() else None
                 ))
             return SellResult(success=False, error=f"pumpfun_error: {str(e)}")
 

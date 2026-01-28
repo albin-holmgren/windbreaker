@@ -45,6 +45,7 @@ PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
 # Native SOL
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
 
+HARD_MIN_SOL_FLOOR_SOL = 0.08
 
 @dataclass
 class CopyTradeResult:
@@ -116,9 +117,10 @@ class CopyTrader:
         self.min_txns_1h = config.min_txns_1h
 
         try:
-            hard_min_sol = float(os.getenv('HARD_MIN_SOL_PER_TRADE', '0.08'))
+            hard_min_sol = float(os.getenv('HARD_MIN_SOL_PER_TRADE', str(HARD_MIN_SOL_FLOOR_SOL)))
         except ValueError:
-            hard_min_sol = 0.08
+            hard_min_sol = HARD_MIN_SOL_FLOOR_SOL
+        hard_min_sol = max(hard_min_sol, HARD_MIN_SOL_FLOOR_SOL)
         if hard_min_sol > 0:
             self.min_sol_per_trade = max(self.min_sol_per_trade, hard_min_sol)
 
@@ -263,6 +265,8 @@ class CopyTrader:
             wallets=len(self.target_wallets),
             copy_pct=f"{self.copy_percentage*100:.0f}%",
             max_sol=self.max_sol_per_trade,
+            min_sol=self.min_sol_per_trade,
+            pumpfun_priority_fee_sol=self.pumpfun_priority_fee_sol,
             max_positions=self.config.max_positions,
             take_profit=f"{self.config.take_profit_pct}%",
             stop_loss=f"{self.config.stop_loss_pct}%"
@@ -2131,7 +2135,7 @@ class CopyTrader:
                     "real_trade_skipped_low_balance",
                     token=swap.token_mint[:8],
                     real_balance=f"{real_balance_sol:.4f}",
-                    min_required="0.03"
+                    min_required=f"{self.min_sol_per_trade}"
                 )
             
             # Simulate/mock trade - allow if:
@@ -2858,15 +2862,15 @@ class CopyTrader:
             pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50 if not is_buy else 30)
             
             # Dynamic priority fee escalation: start low, increase on retries
-            base_fee_buy = 0.0005   # Start at 0.0005 SOL for buys
-            base_fee_sell = 0.0002  # Start at 0.0002 SOL for sells
+            base_fee_buy = min(max(self.pumpfun_priority_fee_sol, 0.0005), 0.0015)
+            base_fee_sell = min(max(self.pumpfun_priority_fee_sol, 0.0002), 0.001)
             fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x
             priority_fee = (base_fee_buy if is_buy else base_fee_sell) * fee_multiplier
 
             priority_fee = min(priority_fee, 0.0015 if is_buy else 0.001)
             
             # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
-            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
+            pools_to_try = ["auto", "pump", "pump-amm"]
             last_error = None
             
             for pool in pools_to_try:
@@ -2957,6 +2961,8 @@ class CopyTrader:
                             slippage_bps=int(pumpfun_slippage * 100),
                             priority_fee=int(priority_fee * 1e9)
                         ))
+                    if status_code == 400 and pool != "auto":
+                        break
                     continue  # Try next pool
                 
                 # Deserialize and sign the transaction
