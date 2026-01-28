@@ -466,6 +466,7 @@ class CopyTrader:
                             reason=sell_reason
                         )
                         our_real_positions.discard(mint)
+                        self._unsellable_tokens.add(mint)
                         continue
                     
                     for attempt in range(max_retries):
