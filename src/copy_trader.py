@@ -520,6 +520,30 @@ class CopyTrader:
                                     "bad request",
                                 ]
                             ):
+                                # Unrecoverable: there is no viable way to exit this token.
+                                # IMPORTANT: we must mark it unsellable HERE because this code path
+                                # breaks out of the retry loop early (and the for-else would never run).
+                                self._unsellable_attempt_count[mint] = self._unsellable_attempt_count.get(mint, 0) + 1
+                                logger.error(
+                                    "token_marked_unsellable",
+                                    token=mint[:8],
+                                    reason=sell_reason,
+                                    cycles=self._unsellable_attempt_count[mint]
+                                )
+                                self._unsellable_tokens.add(mint)
+
+                                # Remove from position manager AND its retry queues to stop fee drain.
+                                if self.position_manager:
+                                    try:
+                                        if hasattr(self.position_manager, "failed_sells") and mint in self.position_manager.failed_sells:
+                                            del self.position_manager.failed_sells[mint]
+                                        if hasattr(self.position_manager, "failed_sell_attempts"):
+                                            self.position_manager.failed_sell_attempts.pop(mint, None)
+                                        if mint in getattr(self.position_manager, "positions", {}):
+                                            del self.position_manager.positions[mint]
+                                    except Exception:
+                                        pass
+
                                 break
                             await asyncio.sleep(retry_delay)
                             retry_delay = min(retry_delay * 1.5, 10)
