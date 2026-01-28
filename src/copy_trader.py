@@ -306,6 +306,10 @@ class CopyTrader:
         # Collect ALL holdings from ALL tracked wallets
         check_count = 0
         
+        # Track tokens that are unsellable (failed too many times) - stop retrying them
+        unsellable_tokens: Set[str] = set()
+        unsellable_attempt_count: Dict[str, int] = {}
+        
         while self.running:
             try:
                 await asyncio.sleep(1)  # Check every 1 second for fast sell detection
@@ -375,6 +379,10 @@ class CopyTrader:
                 TRADER_RUG_THRESHOLD_USD = 20.0  # Sell if trader's position value drops below this
                 
                 for mint in list(our_real_positions):
+                    # Skip tokens we've already given up on
+                    if mint in unsellable_tokens:
+                        continue
+                    
                     should_sell = False
                     sell_reason = None
                     trader_value_total = 0.0
@@ -501,12 +509,30 @@ class CopyTrader:
                             await asyncio.sleep(retry_delay)
                             retry_delay = min(retry_delay * 1.5, 10)
                     else:
-                        logger.error(
-                            "real_sell_all_retries_failed",
-                            token=mint[:8],
-                            reason=sell_reason,
-                            attempts=max_retries
-                        )
+                        # Track how many full sell cycles we've tried for this token
+                        unsellable_attempt_count[mint] = unsellable_attempt_count.get(mint, 0) + 1
+                        
+                        if unsellable_attempt_count[mint] >= 3:
+                            # Give up after 3 full sell cycles - token is unsellable (no liquidity/no route)
+                            logger.error(
+                                "token_marked_unsellable",
+                                token=mint[:8],
+                                reason=sell_reason,
+                                cycles=unsellable_attempt_count[mint]
+                            )
+                            unsellable_tokens.add(mint)
+                            # Remove from position manager to stop all retry attempts
+                            if self.position_manager and mint in self.position_manager.positions:
+                                del self.position_manager.positions[mint]
+                        else:
+                            logger.error(
+                                "real_sell_all_retries_failed",
+                                token=mint[:8],
+                                reason=sell_reason,
+                                attempts=max_retries,
+                                cycle=unsellable_attempt_count[mint]
+                            )
+                        
                         if not hasattr(self, '_failed_sells'):
                             self._failed_sells = set()
                         self._failed_sells.add(mint)
