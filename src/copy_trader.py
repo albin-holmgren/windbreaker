@@ -3501,14 +3501,17 @@ class CopyTrader:
                         return False
                     return True  # Got a response, assume sellable
                 elif resp.status == 400:
-                    # Check if it's a "no route" error
+                    # Only block if it's specifically a "no route" error
                     try:
                         error_data = await resp.json()
-                        if "Could not find any route" in str(error_data):
+                        error_str = str(error_data).lower()
+                        if "could not find any route" in error_str or "no_route" in error_str:
+                            logger.debug("token_not_sellable_400", token=mint[:8])
                             return False
                     except:
                         pass
-                    return False
+                    # Other 400 errors - assume sellable (don't block trades)
+                    return True
                 else:
                     # Other errors - assume sellable to not block trades
                     return True
