@@ -1736,24 +1736,25 @@ class CopyTrader:
                         original_swap=swap
                     )
             
-            # BUYS: Pre-check sellability - skip tokens we can't sell later
-            # This prevents entering positions in dead/rugged/no-liquidity tokens
-            has_sell_route = await self._check_token_sellable(swap.token_mint)
-            if not has_sell_route:
-                logger.warning(
-                    "skipping_unsellable_token",
-                    token=swap.token_mint[:8],
-                    reason="no_sell_route"
-                )
-                return CopyTradeResult(
-                    success=False,
-                    error="token_not_sellable (no route on Jupiter)",
-                    original_swap=swap
-                )
-            
             # BUYS: Check all token filters (market cap, age, liquidity, volume, price change, txns)
             # For pump.fun tokens, use Pump.fun API instead of DexScreener
             is_pumpfun = swap.dex == "pump.fun"
+            
+            # BUYS: Pre-check sellability - skip tokens we can't sell later
+            # SKIP for pump.fun tokens - they sell via PumpPortal, not Jupiter
+            if not is_pumpfun:
+                has_sell_route = await self._check_token_sellable(swap.token_mint)
+                if not has_sell_route:
+                    logger.warning(
+                        "skipping_unsellable_token",
+                        token=swap.token_mint[:8],
+                        reason="no_sell_route"
+                    )
+                    return CopyTradeResult(
+                        success=False,
+                        error="token_not_sellable (no route on Jupiter)",
+                        original_swap=swap
+                    )
 
             # Get token info from DexScreener for ALL tokens (including pump.fun)
             (
