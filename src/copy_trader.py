@@ -409,6 +409,15 @@ class CopyTrader:
                     
                     # Check if position is tracked by position_manager
                     in_position_manager = self.position_manager and mint in self.position_manager.positions
+
+                    if not in_position_manager and exit_reason == ExitReason.ABANDONED:
+                        logger.info(
+                            "abandoning_untracked_token",
+                            token=mint[:8],
+                            reason=sell_reason
+                        )
+                        our_real_positions.discard(mint)
+                        continue
                     
                     for attempt in range(max_retries):
                         if in_position_manager:
@@ -421,7 +430,8 @@ class CopyTrader:
                                 token_mint=mint,
                                 sol_amount=0,  # Not used for sells
                                 is_buy=False,
-                                sell_percentage=100
+                                sell_percentage=100,
+                                attempt_number=attempt + 1
                             )
                             # If pump.fun fails, try Jupiter
                             if not result.success:
@@ -2540,6 +2550,11 @@ class CopyTrader:
         fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x base fee
         effective_priority_fee = int(base_priority_fee * fee_multiplier)
 
+        if exec_type == "sell":
+            effective_priority_fee = min(effective_priority_fee, 1_000_000)
+        else:
+            effective_priority_fee = min(effective_priority_fee, 2_000_000)
+
         try:
             # Get quote with expanded routing options
             quote_params = {
@@ -2828,6 +2843,8 @@ class CopyTrader:
             base_fee_sell = 0.0002  # Start at 0.0002 SOL for sells
             fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x
             priority_fee = (base_fee_buy if is_buy else base_fee_sell) * fee_multiplier
+
+            priority_fee = min(priority_fee, 0.0015 if is_buy else 0.001)
             
             # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
             pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab"]
