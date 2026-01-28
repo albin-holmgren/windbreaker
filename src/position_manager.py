@@ -131,6 +131,7 @@ class PositionManager:
         self.positions: Dict[str, Position] = {}  # token_mint -> Position
         self.abandoned_tokens: Dict[str, float] = {}  # token_mint -> entry_sol (for stats)
         self.failed_sells: Dict[str, int] = {}  # token_mint -> token_amount (queued for retry)
+        self.failed_sell_attempts: Dict[str, int] = {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
         
@@ -297,7 +298,7 @@ class PositionManager:
         
         return position
     
-    async def trigger_sell(self, token_mint: str, reason: ExitReason = ExitReason.COPIED_SELL, max_retries: int = 5) -> SellResult:
+    async def trigger_sell(self, token_mint: str, reason: ExitReason = ExitReason.COPIED_SELL, max_retries: int = 3) -> SellResult:
         """
         Trigger a sell for a specific token with aggressive retries.
         Called when the copied trader sells - MUST succeed!
@@ -351,6 +352,7 @@ class PositionManager:
     def queue_failed_sell(self, token_mint: str, token_amount: int) -> None:
         """Queue a failed sell for background retry."""
         self.failed_sells[token_mint] = token_amount
+        self.failed_sell_attempts.setdefault(token_mint, 0)
         logger.info(
             "sell_queued_for_retry",
             token=token_mint[:8],
@@ -360,6 +362,11 @@ class PositionManager:
     
     async def _retry_failed_sells_loop(self) -> None:
         """Background loop to retry failed sells every 10 seconds."""
+        try:
+            max_attempts = int(os.getenv("FAILED_SELL_RETRY_MAX_ATTEMPTS", "3"))
+        except Exception:
+            max_attempts = 3
+
         while self.running:
             try:
                 await asyncio.sleep(10)  # Check every 10 seconds
@@ -369,6 +376,20 @@ class PositionManager:
                 
                 # Process failed sells
                 for token_mint, token_amount in list(self.failed_sells.items()):
+                    attempts = self.failed_sell_attempts.get(token_mint, 0)
+                    if attempts >= max_attempts:
+                        logger.warning(
+                            "failed_sell_giving_up",
+                            token=token_mint[:8],
+                            attempts=attempts,
+                            queue_size=len(self.failed_sells)
+                        )
+                        del self.failed_sells[token_mint]
+                        self.failed_sell_attempts.pop(token_mint, None)
+                        if token_mint in self.positions:
+                            del self.positions[token_mint]
+                        continue
+
                     logger.info(
                         "retrying_failed_sell",
                         token=token_mint[:8],
@@ -380,6 +401,7 @@ class PositionManager:
                         position = self.positions.get(token_mint)
                         correlation_id = position.correlation_id if position and position.correlation_id else str(uuid.uuid4())
                         result = await self._execute_direct_sell(token_mint, token_amount, correlation_id=correlation_id)
+                        self.failed_sell_attempts[token_mint] = attempts + 1
                         
                         if result.success:
                             logger.info(
@@ -389,6 +411,7 @@ class PositionManager:
                             )
                             # Remove from queue
                             del self.failed_sells[token_mint]
+                            self.failed_sell_attempts.pop(token_mint, None)
                             # Also remove from positions if tracked
                             if token_mint in self.positions:
                                 del self.positions[token_mint]
@@ -399,6 +422,7 @@ class PositionManager:
                                 error=result.error
                             )
                     except Exception as e:
+                        self.failed_sell_attempts[token_mint] = attempts + 1
                         logger.warning("retry_sell_error", token=token_mint[:8], error=str(e))
                     
                     # Small delay between retries
@@ -1126,7 +1150,7 @@ class PositionManager:
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
             submit_at = datetime.now(timezone.utc)
-            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=True)
+            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
             
             sol_received = int(quote.get("outAmount", 0)) / 1e9
 

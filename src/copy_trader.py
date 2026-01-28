@@ -427,7 +427,10 @@ class CopyTrader:
                     # Trigger real sell with retries until success
                     from .position_manager import ExitReason
                     exit_reason = ExitReason.COPIED_SELL if sell_reason == "trader_exited" else ExitReason.ABANDONED
-                    max_retries = 10
+                    try:
+                        max_retries = int(os.getenv("URGENT_SELL_MAX_RETRIES", "3"))
+                    except Exception:
+                        max_retries = 3
                     retry_delay = 2
                     
                     # Check if position is tracked by position_manager
@@ -481,6 +484,20 @@ class CopyTrader:
                                 max_retries=max_retries,
                                 error=result.error
                             )
+                            err = (result.error or "").lower() if result else ""
+                            if any(
+                                s in err
+                                for s in [
+                                    "could not find any route",
+                                    "no_route",
+                                    "no_quote",
+                                    "quote_failed",
+                                    "all_pools_failed",
+                                    "http_400",
+                                    "bad request",
+                                ]
+                            ):
+                                break
                             await asyncio.sleep(retry_delay)
                             retry_delay = min(retry_delay * 1.5, 10)
                     else:
@@ -511,6 +528,11 @@ class CopyTrader:
     async def _failed_sells_retry_loop(self) -> None:
         """Keep retrying failed sells until they succeed."""
         self._failed_sells: Set[str] = set()
+        self._failed_sell_attempts: Dict[str, int] = {}
+        try:
+            max_attempts = int(os.getenv("FAILED_SELL_RETRY_MAX_ATTEMPTS", "3"))
+        except Exception:
+            max_attempts = 3
         
         while self.running:
             try:
@@ -526,12 +548,20 @@ class CopyTrader:
                     # Check if we still have this position
                     if not self.position_manager.has_position(mint):
                         self._failed_sells.discard(mint)
+                        self._failed_sell_attempts.pop(mint, None)
+                        continue
+
+                    attempts = self._failed_sell_attempts.get(mint, 0)
+                    if attempts >= max_attempts:
+                        self._failed_sells.discard(mint)
+                        self._failed_sell_attempts.pop(mint, None)
                         continue
                     
                     logger.info("retrying_failed_sell", token=mint[:8])
                     
                     from .position_manager import ExitReason
                     result = await self.position_manager.trigger_sell(mint, ExitReason.COPIED_SELL)
+                    self._failed_sell_attempts[mint] = attempts + 1
                     
                     if result.success:
                         logger.info(
@@ -1579,7 +1609,10 @@ class CopyTrader:
                     return CopyTradeResult(success=True, mock=True, original_swap=swap)
 
                 # AGGRESSIVE RETRY LOOP with exponential backoff for REAL sells
-                max_retries = 5
+                try:
+                    max_retries = int(os.getenv("URGENT_SELL_MAX_RETRIES", "3"))
+                except Exception:
+                    max_retries = 3
                 result = None
                 for attempt in range(max_retries):
                     if is_pumpfun_sell:
@@ -1633,7 +1666,7 @@ class CopyTrader:
                             signature=result.signature
                         )
                         return result
-                    
+
                     # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
                     delay = 0.5 * (2 ** attempt)
                     logger.warning(
@@ -1644,12 +1677,26 @@ class CopyTrader:
                         next_retry_sec=delay,
                         error=result.error if result else "unknown"
                     )
+                    err = (result.error or "").lower() if result else ""
+                    if any(
+                        s in err
+                        for s in [
+                            "could not find any route",
+                            "no_route",
+                            "no_quote",
+                            "quote_failed",
+                            "all_pools_failed",
+                            "http_400",
+                            "bad request",
+                        ]
+                    ):
+                        break
                     await asyncio.sleep(delay)
                 
                 # All retries failed - add to retry queue for background retries
                 logger.error("sell_failed_queuing_retry", token=swap.token_mint[:8])
                 if self.position_manager:
-                    self.position_manager.queue_failed_sell(swap.token_mint, token_balance)
+                    self.position_manager.queue_failed_sell(swap.token_mint, real_balance)
                 
                 return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
             
