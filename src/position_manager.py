@@ -978,11 +978,31 @@ class PositionManager:
         )
         
         try:
+            # Get SOL balance BEFORE sell to calculate actual PnL
+            sol_before = await self._get_sol_balance()
+            
             # Execute sell via Jupiter
             result = await self._execute_sell(position, attempt_number=attempt_number)
             
             if result.success:
-                # Update stats
+                # Wait briefly for transaction to settle, then check actual balance
+                await asyncio.sleep(2)
+                sol_after = await self._get_sol_balance()
+                
+                # Calculate ACTUAL sol_received from balance change (more accurate than estimates)
+                if sol_before is not None and sol_after is not None:
+                    actual_received = sol_after - sol_before
+                    # Only use if positive (fees might make it slightly negative for tiny amounts)
+                    if actual_received > -0.01:  # Allow small negative for fees
+                        logger.info(
+                            "actual_pnl_from_balance",
+                            estimated=f"{result.sol_received:.4f}",
+                            actual=f"{actual_received:.4f}",
+                            diff=f"{actual_received - result.sol_received:.4f}"
+                        )
+                        result.sol_received = max(0, actual_received)
+                
+                # Update stats with ACTUAL pnl
                 pnl_sol = result.sol_received - position.entry_sol
                 if pnl_sol > 0:
                     self.total_profit_sol += pnl_sol
@@ -1560,6 +1580,20 @@ class PositionManager:
             correlation_id=correlation_id,
             exec_detail=exec_detail
         )
+    
+    async def _get_sol_balance(self) -> Optional[float]:
+        """Fetch actual SOL balance for our wallet."""
+        try:
+            result = await self.rpc._request(
+                "getBalance",
+                [str(self.wallet.pubkey())]
+            )
+            if result and "value" in result:
+                return result["value"] / 1e9  # Convert lamports to SOL
+            return None
+        except Exception as e:
+            logger.debug("get_sol_balance_error", error=str(e))
+            return None
     
     async def _get_actual_token_balance(self, token_mint: str) -> Optional[int]:
         """Fetch actual on-chain token balance for our wallet."""
