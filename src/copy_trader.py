@@ -3425,42 +3425,61 @@ class CopyTrader:
         
         try:
             wallet_pubkey = self.wallet.pubkey()
-            
-            # Try BOTH token programs - pump.fun uses Token-2022
+
+            # Fast path: mint filter (works on most RPCs for both SPL + Token-2022)
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(wallet_pubkey),
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            if result and "value" in result:
+                accounts = result["value"]
+                if accounts:
+                    account_data = accounts[0].get("account", {}).get("data", {})
+                    parsed = account_data.get("parsed", {}).get("info", {})
+                    token_amount = parsed.get("tokenAmount", {})
+                    amount = int(token_amount.get("amount", 0))
+                    if amount > 0:
+                        logger.info("token_balance_found", token=mint[:8], amount=amount)
+                        return amount
+
+            # Fallback: query BOTH token programs and filter by mint client-side
             token_programs = [
                 "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token
                 "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
             ]
-            
+
             for program_id in token_programs:
-                # Use getTokenAccountsByOwner RPC call with mint filter
                 result = await self.rpc._request(
                     "getTokenAccountsByOwner",
                     [
                         str(wallet_pubkey),
-                        {"mint": mint},
-                        {"encoding": "jsonParsed", "programId": program_id}
+                        {"programId": program_id},
+                        {"encoding": "jsonParsed"}
                     ]
                 )
-                
-                if result and "value" in result:
-                    accounts = result["value"]
-                    if accounts:
-                        # Get the token amount from the first account
-                        account_data = accounts[0].get("account", {}).get("data", {})
-                        parsed = account_data.get("parsed", {}).get("info", {})
-                        token_amount = parsed.get("tokenAmount", {})
-                        amount = int(token_amount.get("amount", 0))
-                        
-                        if amount > 0:
-                            logger.info(
-                                "token_balance_found",
-                                token=mint[:8],
-                                amount=amount,
-                                program="token-2022" if "Tokenz" in program_id else "spl-token"
-                            )
-                            return amount
-            
+                if not result or "value" not in result:
+                    continue
+
+                for acct in result["value"] or []:
+                    account_data = acct.get("account", {}).get("data", {})
+                    info = account_data.get("parsed", {}).get("info", {})
+                    if info.get("mint") != mint:
+                        continue
+                    token_amount = info.get("tokenAmount", {})
+                    amount = int(token_amount.get("amount", 0))
+                    if amount > 0:
+                        logger.info(
+                            "token_balance_found",
+                            token=mint[:8],
+                            amount=amount,
+                            program="token-2022" if "Tokenz" in program_id else "spl-token"
+                        )
+                        return amount
+
             return 0
         except Exception as e:
             logger.debug("get_token_balance_error", mint=mint[:8], error=str(e))

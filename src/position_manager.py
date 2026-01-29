@@ -1566,9 +1566,8 @@ class PositionManager:
             from solders.pubkey import Pubkey
             
             wallet_pubkey = self.wallet.pubkey()
-            token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
             mint_pubkey = Pubkey.from_string(token_mint)
-            
+
             result = await self.rpc._request(
                 "getTokenAccountsByOwner",
                 [
@@ -1577,21 +1576,53 @@ class PositionManager:
                     {"encoding": "jsonParsed"}
                 ]
             )
-            
-            if not result or "value" not in result or not result["value"]:
-                return None
-            
-            # Get balance from first token account
-            for account in result["value"]:
-                try:
-                    parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                    amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
-                    if amount > 0:
-                        return amount
-                except Exception:
+
+            if result and "value" in result:
+                accounts = result["value"]
+                if not accounts:
+                    return 0
+
+                for account in accounts:
+                    try:
+                        parsed = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        amount = int(parsed.get("tokenAmount", {}).get("amount", 0))
+                        if amount > 0:
+                            return amount
+                    except Exception:
+                        continue
+
+                return 0
+
+            token_programs = [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            ]
+
+            for program_id in token_programs:
+                result = await self.rpc._request(
+                    "getTokenAccountsByOwner",
+                    [
+                        str(wallet_pubkey),
+                        {"programId": program_id},
+                        {"encoding": "jsonParsed"}
+                    ]
+                )
+
+                if not result or "value" not in result:
                     continue
-            
-            return None
+
+                for account in result["value"] or []:
+                    try:
+                        info = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        if info.get("mint") != token_mint:
+                            continue
+                        amount = int((info.get("tokenAmount") or {}).get("amount", 0))
+                        if amount > 0:
+                            return amount
+                    except Exception:
+                        continue
+
+            return 0
             
         except Exception as e:
             logger.debug("get_actual_balance_error", token=token_mint[:8], error=str(e))

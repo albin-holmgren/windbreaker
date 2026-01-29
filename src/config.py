@@ -149,17 +149,17 @@ def load_config(env_file: str = '.env') -> Config:
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
         copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
         exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.02')),  # 0.02 SOL per position for exit fees
-        min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '20000')),  # Min 20k USD market cap
-        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '15')),  # Require token to be at least 15 minutes old
+        min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '5000')),  # Min 5k USD market cap (lowered to match Cupsey)
+        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '0')),  # Disabled - Cupsey trades fresh tokens
         mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
-        min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '10000')),  # Min 10k USD liquidity
+        min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '2000')),  # Min 2k USD liquidity (lowered to match Cupsey)
         min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '0')),  # Disabled - early meme coins have low volume
         max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),  # 0 = disabled - trust trader's judgment on momentum
-        min_txns_1h=int(os.getenv('MIN_TXNS_1H', '20')),  # At least 20 transactions in last hour
+        min_txns_1h=int(os.getenv('MIN_TXNS_1H', '0')),  # Disabled - early tokens have few txns
         max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
         max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
-        min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '100')),  # At least 100 holders
-        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'false').lower() == 'true',  # Explicitly opt-in to skip pump.fun filters
+        min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '0')),  # Disabled - early tokens have few holders
+        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust Cupsey on pump.fun tokens (skip filters)
         skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
