@@ -80,6 +80,8 @@ class WalletMonitor:
         self._tx_fetch_max_age_sec = float(os.getenv("TX_FETCH_MAX_AGE_SEC", "12"))
         self._tx_fetch_max_attempts = int(os.getenv("TX_FETCH_MAX_ATTEMPTS", "8"))
         self._tx_fetch_workers = int(os.getenv("TX_FETCH_WORKERS", "2"))
+        self._tx_fetch_commitment = os.getenv("TX_FETCH_COMMITMENT", "confirmed")
+        self._ws_commitment = os.getenv("WS_LOGS_COMMITMENT", self._tx_fetch_commitment)
         
     async def start(self) -> None:
         """Start the wallet monitor with WebSocket + polling fallback."""
@@ -165,7 +167,7 @@ class WalletMonitor:
                                 "method": "logsSubscribe",
                                 "params": [
                                     {"mentions": [wallet]},
-                                    {"commitment": "confirmed"}
+                                    {"commitment": self._ws_commitment}
                                 ]
                             }
                             await ws.send_json(subscribe_msg)
@@ -311,7 +313,8 @@ class WalletMonitor:
                 signature,
                 {
                     "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0
+                    "maxSupportedTransactionVersion": 0,
+                    "commitment": self._tx_fetch_commitment
                 }
             ]
         }
