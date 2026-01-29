@@ -73,6 +73,7 @@ class Config:
     time_limit_minutes: float  # 0 = disabled (follow trader)
     trailing_stop_pct: float  # 0 = disabled
     rug_abandon_sol: float  # If value < this, abandon position (don't sell, costs more than worth)
+    position_check_interval_sec: float  # How often to check positions for stop-loss/take-profit
     
     # Ops
     log_level: str
@@ -172,6 +173,7 @@ def load_config(env_file: str = '.env') -> Config:
         time_limit_minutes=float(os.getenv('TIME_LIMIT_MINUTES', '0')),  # 0 = disabled (follow trader)
         trailing_stop_pct=float(os.getenv('TRAILING_STOP_PCT', '0')),  # 0 = disabled
         rug_abandon_sol=float(os.getenv('RUG_ABANDON_SOL', '0.005')),  # If worth < 0.005 SOL, abandon (don't sell)
+        position_check_interval_sec=float(os.getenv('POSITION_CHECK_INTERVAL_SEC', '5')),  # Check every 5s (was 60s!)
         
         # Ops
         log_level=os.getenv('LOG_LEVEL', 'INFO'),

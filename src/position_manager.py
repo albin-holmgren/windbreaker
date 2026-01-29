@@ -103,11 +103,11 @@ class PositionManager:
         rpc_client,
         max_positions: int = 3,
         take_profit_pct: float = 0,         # DISABLED - follow the trader
-        stop_loss_pct: float = -60.0,       # Stop loss at -60%
+        stop_loss_pct: float = -35.0,       # Stop loss at -35% (was -60%)
         time_limit_minutes: float = 0,      # 0 = disabled (follow trader)
         trailing_stop_pct: float = 0,       # 0 = disabled
         rug_abandon_sol: float = 0.005,     # Abandon if worth < 0.005 SOL
-        check_interval_sec: float = 60.0,   # Check prices every 60s
+        check_interval_sec: float = 5.0,    # Check prices every 5s (was 60s - too slow!)
         mcap_stop_loss_usd: float = 0,      # 0 = disabled, sell if mcap drops below
     ):
         self.config = config
@@ -400,7 +400,8 @@ class PositionManager:
                     try:
                         position = self.positions.get(token_mint)
                         correlation_id = position.correlation_id if position and position.correlation_id else str(uuid.uuid4())
-                        result = await self._execute_direct_sell(token_mint, token_amount, correlation_id=correlation_id)
+                        estimated_value = position.current_value_sol if position else 0
+                        result = await self._execute_direct_sell(token_mint, token_amount, correlation_id=correlation_id, estimated_value_sol=estimated_value)
                         self.failed_sell_attempts[token_mint] = attempts + 1
                         
                         if result.success:
@@ -431,7 +432,7 @@ class PositionManager:
             except Exception as e:
                 logger.error("retry_loop_error", error=str(e))
     
-    async def _execute_direct_sell(self, token_mint: str, token_amount: int, *, correlation_id: Optional[str] = None) -> SellResult:
+    async def _execute_direct_sell(self, token_mint: str, token_amount: int, *, correlation_id: Optional[str] = None, estimated_value_sol: float = 0) -> SellResult:
         """Execute a direct sell without position tracking - tries Jupiter then PumpPortal."""
         import base64
         from solders.transaction import VersionedTransaction
@@ -638,7 +639,7 @@ class PositionManager:
                         correlation_id=correlation_id,
                         exec_detail=exec_detail
                     ))
-                return SellResult(success=True, signature=signature, sol_received=0, reason=ExitReason.COPIED_SELL)
+                return SellResult(success=True, signature=signature, sol_received=estimated_value_sol, reason=ExitReason.COPIED_SELL)
             except Exception as e:
                 last_error = str(e)
                 if telemetry and correlation_id:

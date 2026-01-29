@@ -248,6 +248,7 @@ class CopyTrader:
                 trailing_stop_pct=self.config.trailing_stop_pct,
                 rug_abandon_sol=self.config.rug_abandon_sol,
                 mcap_stop_loss_usd=self.config.mcap_stop_loss_usd,
+                check_interval_sec=self.config.position_check_interval_sec,
             )
             await self.position_manager.start()
             if self.real_trading_enabled:
