@@ -390,6 +390,20 @@ class PositionManager:
                             del self.positions[token_mint]
                         continue
 
+                    actual_balance = await self._get_actual_token_balance(token_mint)
+                    if actual_balance == 0:
+                        logger.warning(
+                            "failed_sell_removed_zero_balance",
+                            token=token_mint[:8],
+                            attempts=attempts,
+                            queue_size=len(self.failed_sells)
+                        )
+                        del self.failed_sells[token_mint]
+                        self.failed_sell_attempts.pop(token_mint, None)
+                        if token_mint in self.positions:
+                            del self.positions[token_mint]
+                        continue
+
                     logger.info(
                         "retrying_failed_sell",
                         token=token_mint[:8],
@@ -422,6 +436,27 @@ class PositionManager:
                                 token=token_mint[:8],
                                 error=result.error
                             )
+
+                            err = (result.error or "").lower()
+                            if any(
+                                s in err
+                                for s in [
+                                    "http_400",
+                                    "bad request",
+                                    "all_pools_failed",
+                                    "no_quote",
+                                    "no_route",
+                                ]
+                            ):
+                                logger.error(
+                                    "failed_sell_unrecoverable_giving_up",
+                                    token=token_mint[:8],
+                                    error=result.error
+                                )
+                                del self.failed_sells[token_mint]
+                                self.failed_sell_attempts.pop(token_mint, None)
+                                if token_mint in self.positions:
+                                    del self.positions[token_mint]
                     except Exception as e:
                         self.failed_sell_attempts[token_mint] = attempts + 1
                         logger.warning("retry_sell_error", token=token_mint[:8], error=str(e))
@@ -948,6 +983,8 @@ class PositionManager:
                 reason=reason.value,
                 message="Removing position - we don't hold any tokens"
             )
+            self.failed_sells.pop(token_mint, None)
+            self.failed_sell_attempts.pop(token_mint, None)
             # Remove from tracking since we don't have any tokens
             del self.positions[token_mint]
             return SellResult(success=False, error="zero_balance_on_chain")

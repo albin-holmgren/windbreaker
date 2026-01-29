@@ -1681,6 +1681,7 @@ class CopyTrader:
                 except Exception:
                     max_retries = 3
                 result = None
+                unrecoverable = False
                 for attempt in range(max_retries):
                     if is_pumpfun_sell:
                         # Use Pump.fun API for bonding curve sells
@@ -1757,13 +1758,31 @@ class CopyTrader:
                             "bad request",
                         ]
                     ):
+                        unrecoverable = True
                         break
                     await asyncio.sleep(delay)
                 
                 # All retries failed - add to retry queue for background retries
-                logger.error("sell_failed_queuing_retry", token=swap.token_mint[:8])
-                if self.position_manager:
-                    self.position_manager.queue_failed_sell(swap.token_mint, real_balance)
+                if unrecoverable:
+                    try:
+                        self._unsellable_attempt_count[swap.token_mint] = self._unsellable_attempt_count.get(swap.token_mint, 0) + 1
+                    except Exception:
+                        pass
+                    self._unsellable_tokens.add(swap.token_mint)
+                    if self.position_manager:
+                        try:
+                            if hasattr(self.position_manager, "failed_sells") and swap.token_mint in self.position_manager.failed_sells:
+                                del self.position_manager.failed_sells[swap.token_mint]
+                            if hasattr(self.position_manager, "failed_sell_attempts"):
+                                self.position_manager.failed_sell_attempts.pop(swap.token_mint, None)
+                            if swap.token_mint in getattr(self.position_manager, "positions", {}):
+                                del self.position_manager.positions[swap.token_mint]
+                        except Exception:
+                            pass
+                else:
+                    logger.error("sell_failed_queuing_retry", token=swap.token_mint[:8])
+                    if self.position_manager:
+                        self.position_manager.queue_failed_sell(swap.token_mint, real_balance)
                 
                 return result or CopyTradeResult(success=False, error="sell_failed_all_retries", original_swap=swap)
             
