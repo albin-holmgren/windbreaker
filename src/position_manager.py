@@ -132,6 +132,7 @@ class PositionManager:
         self.abandoned_tokens: Dict[str, float] = {}  # token_mint -> entry_sol (for stats)
         self.failed_sells: Dict[str, int] = {}  # token_mint -> token_amount (queued for retry)
         self.failed_sell_attempts: Dict[str, int] = {}
+        self._sell_locks: Dict[str, asyncio.Lock] = {}
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
         
@@ -305,45 +306,57 @@ class PositionManager:
         """
         if token_mint not in self.positions:
             return SellResult(success=False, error="no_position_for_token")
-        
-        logger.info(
-            "trader_sold_copying",
-            token=token_mint[:8] + "...",
-            reason=reason.value,
-            message="URGENT: Copying trader's sell!"
-        )
-        
-        # Aggressive retry loop with exponential backoff
-        for attempt in range(max_retries):
-            result = await self._sell_position(token_mint, reason, attempt_number=attempt + 1)
+
+        sell_lock = self._sell_locks.get(token_mint)
+        if sell_lock is None:
+            sell_lock = asyncio.Lock()
+            self._sell_locks[token_mint] = sell_lock
+
+        logger.info("sell_lock_attempt", token=token_mint[:8], lock_id=id(sell_lock), message="Attempting to acquire sell lock")
+        async with sell_lock:
+            logger.info("sell_lock_acquired", token=token_mint[:8], lock_id=id(sell_lock), message="Sell lock acquired")
+            if token_mint not in self.positions:
+                return SellResult(success=False, error="no_position_for_token")
+
+            logger.info(
+                "trader_sold_copying",
+                token=token_mint[:8] + "...",
+                reason=reason.value,
+                message="URGENT: Copying trader's sell!"
+            )
             
-            if result.success:
-                logger.info(
-                    "sell_success",
+            # Aggressive retry loop with exponential backoff
+            for attempt in range(max_retries):
+                result = await self._sell_position(token_mint, reason, attempt_number=attempt + 1)
+                
+                if result.success:
+                    logger.info(
+                        "sell_success",
+                        token=token_mint[:8],
+                        attempt=attempt + 1,
+                        sol_received=f"{result.sol_received:.4f}"
+                    )
+                    return result
+                
+                # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    "sell_retry",
                     token=token_mint[:8],
                     attempt=attempt + 1,
-                    sol_received=f"{result.sol_received:.4f}"
+                    max_retries=max_retries,
+                    next_retry_sec=delay,
+                    error=result.error
                 )
-                return result
+                await asyncio.sleep(delay)
             
-            # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
-            delay = 0.5 * (2 ** attempt)
-            logger.warning(
-                "sell_retry",
+            logger.error(
+                "sell_failed_all_retries",
                 token=token_mint[:8],
-                attempt=attempt + 1,
-                max_retries=max_retries,
-                next_retry_sec=delay,
-                error=result.error
+                attempts=max_retries
             )
-            await asyncio.sleep(delay)
-        
-        logger.error(
-            "sell_failed_all_retries",
-            token=token_mint[:8],
-            attempts=max_retries
-        )
-        return SellResult(success=False, error=f"failed_after_{max_retries}_retries", reason=reason)
+            return SellResult(success=False, error=f"failed_after_{max_retries}_retries", reason=reason)
+        logger.info("sell_lock_released", token=token_mint[:8], lock_id=id(sell_lock), message="Sell lock released")
     
     def get_position(self, token_mint: str) -> Optional[Position]:
         """Get a position by token mint."""
@@ -415,7 +428,15 @@ class PositionManager:
                         position = self.positions.get(token_mint)
                         correlation_id = position.correlation_id if position and position.correlation_id else str(uuid.uuid4())
                         estimated_value = position.current_value_sol if position else 0
-                        result = await self._execute_direct_sell(token_mint, token_amount, correlation_id=correlation_id, estimated_value_sol=estimated_value)
+                        sell_lock = self._sell_locks.get(token_mint)
+                        if sell_lock is None:
+                            sell_lock = asyncio.Lock()
+                            self._sell_locks[token_mint] = sell_lock
+
+                        logger.info("retry_sell_lock_attempt", token=token_mint[:8], lock_id=id(sell_lock), message="Attempting to acquire retry sell lock")
+                        async with sell_lock:
+                            logger.info("retry_sell_lock_acquired", token=token_mint[:8], lock_id=id(sell_lock), message="Retry sell lock acquired")
+                            result = await self._execute_direct_sell(token_mint, token_amount, correlation_id=correlation_id, estimated_value_sol=estimated_value)
                         self.failed_sell_attempts[token_mint] = attempts + 1
                         
                         if result.success:
@@ -466,234 +487,7 @@ class PositionManager:
                     
             except Exception as e:
                 logger.error("retry_loop_error", error=str(e))
-    
-    async def _execute_direct_sell(self, token_mint: str, token_amount: int, *, correlation_id: Optional[str] = None, estimated_value_sol: float = 0) -> SellResult:
-        """Execute a direct sell without position tracking - tries Jupiter then PumpPortal."""
-        import base64
-        from solders.transaction import VersionedTransaction
-        
-        telemetry = get_telemetry()
-
-        # First try Jupiter
-        try:
-            quote = await self._get_quote(
-                input_mint=token_mint,
-                output_mint=NATIVE_SOL,
-                amount=token_amount
-            )
-            
-            if quote:
-                swap_data = {
-                    "quoteResponse": quote,
-                    "userPublicKey": str(self.wallet.pubkey()),
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": 500000  # Very high priority for retries
-                }
-                
-                async with self.session.post(
-                    JUPITER_SWAP_API,
-                    json=swap_data,
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status == 200:
-                        swap_response = await resp.json()
-                        swap_tx = swap_response.get("swapTransaction")
-                        if swap_tx:
-                            tx_bytes = base64.b64decode(swap_tx)
-                            tx = VersionedTransaction.from_bytes(tx_bytes)
-                            signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                            signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
-                            sol_received = int(quote.get("outAmount", 0)) / 1e9
-
-                            if telemetry and correlation_id:
-                                exec_detail = ExecutionDetails(
-                                    executor="bot",
-                                    execution_type="sell",
-                                    signature=str(signature),
-                                    dex_used="jupiter",
-                                    jupiter_route=quote,
-                                    jupiter_route_hops=len(quote.get("routePlan", [])) if isinstance(quote.get("routePlan"), list) else None,
-                                    jupiter_dexes_used=[
-                                        (hop.get("swapInfo", {}) or {}).get("label")
-                                        for hop in (quote.get("routePlan") or [])
-                                        if isinstance(hop, dict) and (hop.get("swapInfo", {}) or {}).get("label")
-                                    ] if isinstance(quote.get("routePlan"), list) else None,
-                                    jupiter_quote_in=Decimal(str(quote.get("inAmount"))) if quote.get("inAmount") is not None else None,
-                                    jupiter_quote_out=Decimal(str(quote.get("outAmount"))) if quote.get("outAmount") is not None else None,
-                                    jupiter_price_impact_pct=Decimal(str(quote.get("priceImpactPct"))) if quote.get("priceImpactPct") is not None else None,
-                                    requested_in_amount=Decimal(str(token_amount)),
-                                    slippage_bps_configured=5000,  # 50% min for sells
-                                    priority_fee_lamports=500000,
-                                    final_status="submitted"
-                                )
-                                asyncio.create_task(telemetry.record_execution_details(
-                                    correlation_id=correlation_id,
-                                    exec_detail=exec_detail
-                                ))
-
-                            return SellResult(success=True, signature=signature, sol_received=sol_received, reason=ExitReason.COPIED_SELL)
-                    else:
-                        if telemetry and correlation_id:
-                            error_text = await resp.text()
-                            asyncio.create_task(telemetry.record_failed_execution(
-                                trade_id=None,
-                                correlation_id=correlation_id,
-                                token_mint=token_mint,
-                                execution_type="sell",
-                                method="jupiter_swap",
-                                error_code=f"http_{resp.status}",
-                                error_message=error_text,
-                                error_category="api_error",
-                                attempt_number=1,
-                                requested_amount=Decimal(str(token_amount)),
-                                slippage_bps=self.config.slippage_bps,
-                                priority_fee=500000
-                            ))
-            else:
-                if telemetry and correlation_id:
-                    asyncio.create_task(telemetry.record_failed_execution(
-                        trade_id=None,
-                        correlation_id=correlation_id,
-                        token_mint=token_mint,
-                        execution_type="sell",
-                        method="jupiter_quote",
-                        error_code="no_quote",
-                        error_message="no_quote",
-                        error_category="no_route",
-                        attempt_number=1,
-                        requested_amount=Decimal(str(token_amount)),
-                        slippage_bps=self.config.slippage_bps,
-                        priority_fee=500000
-                    ))
-        except Exception as e:
-            logger.debug("direct_sell_jupiter_failed", token=token_mint[:8], error=str(e))
-            if telemetry and correlation_id:
-                asyncio.create_task(telemetry.record_failed_execution(
-                    trade_id=None,
-                    correlation_id=correlation_id,
-                    token_mint=token_mint,
-                    execution_type="sell",
-                    method="jupiter_exception",
-                    error_code="exception",
-                    error_message=str(e),
-                    error_category="exception",
-                    attempt_number=1,
-                    requested_amount=Decimal(str(token_amount)),
-                    slippage_bps=self.config.slippage_bps,
-                    priority_fee=500000
-                ))
-        
-        # Fallback to PumpPortal - try multiple pools
-        pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50)
-        pumpfun_priority_fee_sol = min(max(float(self.config.pumpfun_priority_fee_sol), 0.0002), 0.001)
-        pumpfun_priority_fee_lamports = int(pumpfun_priority_fee_sol * 1e9)
-        pools_to_try = ["auto", "pump", "pump-amm"]
-        last_error = None
-        
-        for pool in pools_to_try:
-            try:
-                payload = {
-                    "publicKey": str(self.wallet.pubkey()),
-                    "action": "sell",
-                    "mint": token_mint,
-                    "denominatedInSol": "false",
-                    "amount": "100%",
-                    "slippage": pumpfun_slippage,
-                    "priorityFee": pumpfun_priority_fee_sol,
-                    "pool": pool
-                }
-                
-                tx_bytes = None
-                status_code = None
-                error_text = None
-                async with self.session.post(
-                    PUMPFUN_API,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=6)
-                ) as resp:
-                    status_code = resp.status
-                    if resp.status == 200:
-                        tx_bytes = await resp.read()
-                    else:
-                        error_text = await resp.text()
-
-                if tx_bytes is None and status_code == 400:
-                    try:
-                        async with self.session.post(
-                            PUMPFUN_API,
-                            data=payload,
-                            timeout=aiohttp.ClientTimeout(total=6)
-                        ) as resp2:
-                            status_code = resp2.status
-                            if resp2.status == 200:
-                                tx_bytes = await resp2.read()
-                            else:
-                                error_text2 = await resp2.text()
-                                error_text = f"{error_text} | form: {error_text2}" if error_text else error_text2
-                    except Exception as e:
-                        error_text = f"{error_text} | form_exception: {e}" if error_text else f"form_exception: {e}"
-
-                if tx_bytes is None:
-                    last_error = error_text or "unknown_error"
-                    if telemetry and correlation_id:
-                        asyncio.create_task(telemetry.record_failed_execution(
-                            trade_id=None,
-                            correlation_id=correlation_id,
-                            token_mint=token_mint,
-                            execution_type="sell",
-                            method="pumpfun_sell",
-                            error_code=f"{pool}_http_{status_code or 'unknown'}",
-                            error_message=str(last_error),
-                            error_category="api_error",
-                            attempt_number=1,
-                            slippage_bps=int(pumpfun_slippage * 100),
-                            priority_fee=pumpfun_priority_fee_lamports
-                        ))
-                    if status_code == 400 and pool != "auto":
-                        break
-                    continue
-                
-                tx = VersionedTransaction.from_bytes(tx_bytes)
-                signed_tx = VersionedTransaction(tx.message, [self.wallet])
-                signature = await self.rpc.send_transaction(signed_tx, skip_preflight=False)
-                
-                logger.info("direct_sell_pumpfun_success", token=token_mint[:8], pool=pool)
-                if telemetry and correlation_id:
-                    exec_detail = ExecutionDetails(
-                        executor="bot",
-                        execution_type="sell",
-                        signature=str(signature),
-                        dex_used="pump.fun",
-                        pumpfun_pool_type=pool,
-                        slippage_bps_configured=int(pumpfun_slippage * 100),
-                        priority_fee_lamports=pumpfun_priority_fee_lamports,
-                        final_status="submitted"
-                    )
-                    asyncio.create_task(telemetry.record_execution_details(
-                        correlation_id=correlation_id,
-                        exec_detail=exec_detail
-                    ))
-                return SellResult(success=True, signature=signature, sol_received=estimated_value_sol, reason=ExitReason.COPIED_SELL)
-            except Exception as e:
-                last_error = str(e)
-                if telemetry and correlation_id:
-                    asyncio.create_task(telemetry.record_failed_execution(
-                        trade_id=None,
-                        correlation_id=correlation_id,
-                        token_mint=token_mint,
-                        execution_type="sell",
-                        method="pumpfun_sell",
-                        error_code=f"{pool}_exception",
-                        error_message=last_error,
-                        error_category="exception",
-                        attempt_number=1,
-                        slippage_bps=int(pumpfun_slippage * 100),
-                        priority_fee=pumpfun_priority_fee_lamports
-                    ))
-                continue
-        
-        return SellResult(success=False, error=f"all_methods_failed: {last_error}")
+        logger.info("retry_sell_lock_released", token=token_mint[:8], lock_id=id(sell_lock), message="Retry sell lock released")
     
     async def _monitor_loop(self) -> None:
         """Main loop to monitor positions and trigger sells."""
@@ -1150,7 +944,7 @@ class PositionManager:
                         attempt_number=attempt_number,
                         requested_amount=Decimal(str(position.token_amount)),
                         slippage_bps=self.config.slippage_bps,
-                        priority_fee=100000
+                        priority_fee=int(getattr(self.config, "jupiter_priority_fee_lamports", 100000))
                     ))
                 return SellResult(success=False, error="no_quote")
             
@@ -1160,7 +954,7 @@ class PositionManager:
                 "userPublicKey": str(self.wallet.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 100000  # High priority ~0.0001 SOL for fast confirmation
+                "prioritizationFeeLamports": int(getattr(self.config, "jupiter_priority_fee_lamports", 100000))  # High priority ~0.0001 SOL for fast confirmation
             }
             
             async with self.session.post(JUPITER_SWAP_API, json=swap_data) as resp:
@@ -1179,7 +973,7 @@ class PositionManager:
                             attempt_number=attempt_number,
                             requested_amount=Decimal(str(position.token_amount)),
                             slippage_bps=self.config.slippage_bps,
-                            priority_fee=100000
+                            priority_fee=int(getattr(self.config, "jupiter_priority_fee_lamports", 100000))
                         ))
                     return SellResult(success=False, error=f"swap_api: {error}")
                 swap_response = await resp.json()
@@ -1199,7 +993,7 @@ class PositionManager:
                         attempt_number=attempt_number,
                         requested_amount=Decimal(str(position.token_amount)),
                         slippage_bps=self.config.slippage_bps,
-                        priority_fee=100000
+                        priority_fee=int(getattr(self.config, "jupiter_priority_fee_lamports", 100000))
                     ))
                 return SellResult(success=False, error="no_swap_tx")
             
@@ -1220,7 +1014,7 @@ class PositionManager:
                     quote=quote,
                     requested_in_amount=Decimal(str(position.token_amount)),
                     slippage_bps_configured=self.config.slippage_bps,
-                    priority_fee_lamports=100000,
+                    priority_fee_lamports=int(getattr(self.config, "jupiter_priority_fee_lamports", 100000)),
                     submit_at=submit_at,
                     attempt_number=attempt_number
                 ))
@@ -1243,7 +1037,7 @@ class PositionManager:
                     error_message=str(e),
                     error_category="exception",
                     attempt_number=attempt_number,
-                    requested_amount=Decimal(str(position.token_amount)) if position.token_amount else None,
+                    requested_amount=Decimal(str(position.token_amount)),
                     slippage_bps=self.config.slippage_bps,
                     priority_fee=100000
                 ))

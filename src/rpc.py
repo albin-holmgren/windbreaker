@@ -98,7 +98,18 @@ class RPCClient:
         """Reset backoff after successful request."""
         self._consecutive_errors = 0
         self._backoff_until = 0
-    
+        
+    def _jsonify(self, value: Any) -> Any:
+        if isinstance(value, (Pubkey, Signature)):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: self._jsonify(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._jsonify(v) for v in value]
+        if isinstance(value, set):
+            return [self._jsonify(v) for v in value]
+        return value
+
     async def _request(self, method: str, params: List[Any]) -> Dict[str, Any]:
         """Make a JSON-RPC request."""
         await self._wait_for_backoff()
@@ -109,7 +120,7 @@ class RPCClient:
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
-            "params": params
+            "params": self._jsonify(params)
         }
         
         last_error: Optional[str] = None

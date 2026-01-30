@@ -86,6 +86,21 @@ async def main():
                 pct = f"{float(r[1]):+.1f}%" if r[1] else "n/a"
                 prof = "✓" if r[2] else "✗"
                 print(f"  {str(r[0])[:8]} | {pct} | {prof} | {str(r[3])[:50] if r[3] else ''}")
+        
+        # Recent failed executions with error details
+        failed = await conn.fetch("""
+            SELECT attempt_at, execution_type, token_mint, error_category, error_code, error_message
+            FROM failed_executions
+            ORDER BY attempt_at DESC
+            LIMIT 10
+        """)
+        if failed:
+            print("\nRecent failed executions:")
+            for f in failed:
+                error = f['error_message'][:100] if f['error_message'] else f['error_code'][:100] if f['error_code'] else 'unknown'
+                print(f"  {f['attempt_at']} | {f['execution_type'].upper():4} | {f['token_mint'][:8]} | Category: {f['error_category'][:20]} | Error: {error}...")
+        else:
+            print("\nNo failed executions found.")
     
     await pool.close()
     print("\nDone!")

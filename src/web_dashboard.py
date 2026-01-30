@@ -6,8 +6,9 @@ Provides a real-time view of trades, positions, and performance.
 import os
 import json
 import asyncio
+import time
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from aiohttp import web
 import structlog
 from solders.pubkey import Pubkey  # For real balance fetch
@@ -446,6 +447,8 @@ class WebDashboard:
         self.wallet_keypair = wallet_keypair
         self.app = web.Application()
         self.runner = None
+        self._real_stats_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+        self._real_stats_refresh_task: Optional[asyncio.Task] = None
         self._setup_routes()
     
     def _setup_routes(self):
@@ -480,7 +483,44 @@ class WebDashboard:
                 # For real wallet, fetch from on-chain via RPC
                 if is_real_wallet:
                     if self.rpc_client and self.wallet_keypair:
-                        stats = await self._fetch_real_wallet_stats()
+                        cached = self._real_stats_cache.get("data")
+                        cached_ts = float(self._real_stats_cache.get("ts", 0.0) or 0.0)
+                        now = time.time()
+
+                        if cached is not None and (now - cached_ts) < 5.0:
+                            stats = cached
+                            stats['tracked_wallet'] = wallet_config['address']
+                            return web.json_response(stats)
+
+                        if self._real_stats_refresh_task is None or self._real_stats_refresh_task.done():
+                            self._real_stats_refresh_task = asyncio.create_task(self._refresh_real_wallet_stats())
+
+                        if cached is not None:
+                            stats = dict(cached)
+                            stats["stale"] = True
+                            stats['tracked_wallet'] = wallet_config['address']
+                            return web.json_response(stats)
+
+                        try:
+                            stats = await asyncio.wait_for(self._fetch_real_wallet_stats(), timeout=3.0)
+                            self._real_stats_cache = {"ts": time.time(), "data": stats}
+                        except Exception as e:
+                            logger.warning("real_wallet_stats_timeout", error=str(e))
+                            stats = {
+                                'starting_balance': 0,
+                                'balance': 0,
+                                'open_positions': 0,
+                                'buys': 0,
+                                'sells': 0,
+                                'realized_pnl': 0,
+                                'total_return_pct': 0,
+                                'positions': {},
+                                'entry_sol': {},
+                                'entry_times': {},
+                                'trades': [],
+                                'stale': True,
+                            }
+
                         stats['tracked_wallet'] = wallet_config['address']
                     else:
                         # RPC not available - use real_state.json as fallback
@@ -498,6 +538,13 @@ class WebDashboard:
         except Exception as e:
             logger.error("stats_error", error=str(e))
             return web.json_response({'error': str(e)}, status=500)
+
+    async def _refresh_real_wallet_stats(self) -> None:
+        try:
+            stats = await asyncio.wait_for(self._fetch_real_wallet_stats(), timeout=15.0)
+            self._real_stats_cache = {"ts": time.time(), "data": stats}
+        except Exception as e:
+            logger.warning("real_wallet_stats_refresh_failed", error=str(e))
     
     async def handle_trades(self, request):
         """Get trade history."""
@@ -658,7 +705,7 @@ class WebDashboard:
             
             # Fetch ACTUAL on-chain transaction history
             try:
-                trades = await self._fetch_real_wallet_trades(str(pubkey_obj))
+                trades = await asyncio.wait_for(self._fetch_real_wallet_trades(str(pubkey_obj)), timeout=2.0)
                 stats['trades'] = trades
                 stats['buys'] = len([t for t in trades if t.get('type') == 'buy'])
                 stats['sells'] = len([t for t in trades if t.get('type') == 'sell'])
@@ -692,7 +739,7 @@ class WebDashboard:
             
             dex_programs = {PUMP_FUN_PROGRAM, PUMP_AMM_PROGRAM, RAYDIUM_V4, JUPITER_V6}
             
-            for sig_info in result[:20]:  # Check last 20 transactions
+            for sig_info in result[:8]:
                 try:
                     sig = sig_info.get('signature')
                     if not sig or sig_info.get('err'):

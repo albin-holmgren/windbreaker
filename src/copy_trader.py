@@ -45,7 +45,7 @@ PUMPFUN_API = "https://pumpportal.fun/api/trade-local"
 # Native SOL
 NATIVE_SOL = "So11111111111111111111111111111111111111112"
 
-HARD_MIN_SOL_FLOOR_SOL = 0.08
+HARD_MIN_SOL_FLOOR_SOL = 0.05
 
 @dataclass
 class CopyTradeResult:
@@ -162,6 +162,8 @@ class CopyTrader:
         # Cache for token info (to avoid repeated API calls)
         # mint -> (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time)
         self.token_info_cache: Dict[str, tuple[float, float, float, float, float, int, float]] = {}
+
+        self.pumpfun_token_info_cache: Dict[str, tuple[float, float, float]] = {}
         
         # Cache for holder info from RugCheck (to avoid repeated API calls)
         # mint -> (top10_pct, dev_pct, holders_count, cache_time)
@@ -199,6 +201,8 @@ class CopyTrader:
         # Tokens that have failed to sell after multiple cycles - stop trying to sell them
         self._unsellable_tokens: Set[str] = set()
         self._unsellable_attempt_count: Dict[str, int] = {}
+
+        self._sell_locks: Dict[str, asyncio.Lock] = {}
         
         # Load persisted state for all tracked wallets
         if self.mock_trading:
@@ -225,6 +229,180 @@ class CopyTrader:
         if wallet not in self.recent_copies_by_wallet:
             self.recent_copies_by_wallet[wallet] = set()
         return self.recent_copies_by_wallet[wallet]
+
+    def _get_sell_lock(self, token_mint: str) -> asyncio.Lock:
+        sell_lock = self._sell_locks.get(token_mint)
+        if sell_lock is None:
+            sell_lock = asyncio.Lock()
+            self._sell_locks[token_mint] = sell_lock
+        return sell_lock
+
+    async def _get_token_info(self, mint: str) -> tuple[float, float, float, float, float, int]:
+        cache_ttl_sec = 20.0
+        now = time.time()
+        cached = self.token_info_cache.get(mint)
+        if cached is not None:
+            try:
+                market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, cache_time = cached
+                if now - float(cache_time) <= cache_ttl_sec:
+                    return market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h
+            except Exception:
+                pass
+
+        market_cap = 0.0
+        age_minutes = 0.0
+        liquidity = 0.0
+        volume_24h = 0.0
+        price_change_1h = 0.0
+        txns_1h = 0
+
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    self.token_info_cache[mint] = (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, now)
+                    return market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h
+
+                data = await resp.json()
+                pairs = data.get("pairs") or []
+                if not pairs:
+                    self.token_info_cache[mint] = (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, now)
+                    return market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h
+
+                best_pair = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
+
+                try:
+                    market_cap = float(best_pair.get("marketCap") or 0)
+                except Exception:
+                    market_cap = 0.0
+
+                try:
+                    liquidity = float((best_pair.get("liquidity") or {}).get("usd") or 0)
+                except Exception:
+                    liquidity = 0.0
+
+                try:
+                    volume_24h = float((best_pair.get("volume") or {}).get("h24") or 0)
+                except Exception:
+                    volume_24h = 0.0
+
+                try:
+                    price_change_1h = float((best_pair.get("priceChange") or {}).get("h1") or 0)
+                except Exception:
+                    price_change_1h = 0.0
+
+                try:
+                    txns = (best_pair.get("txns") or {}).get("h1") or {}
+                    txns_1h = int((txns.get("buys") or 0) + (txns.get("sells") or 0))
+                except Exception:
+                    txns_1h = 0
+
+                try:
+                    created_ms = best_pair.get("pairCreatedAt")
+                    if created_ms:
+                        age_minutes = max(0.0, (now * 1000.0 - float(created_ms)) / 60000.0)
+                except Exception:
+                    age_minutes = 0.0
+
+        except Exception:
+            pass
+
+        self.token_info_cache[mint] = (market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h, now)
+        return market_cap, age_minutes, liquidity, volume_24h, price_change_1h, txns_1h
+
+    async def _get_pumpfun_token_info(self, mint: str) -> tuple[float, float]:
+        cache_ttl_sec = 20.0
+        now = time.time()
+        cached = self.pumpfun_token_info_cache.get(mint)
+        if cached is not None:
+            try:
+                market_cap, age_minutes, cache_time = cached
+                if now - float(cache_time) <= cache_ttl_sec:
+                    return float(market_cap), float(age_minutes)
+            except Exception:
+                pass
+
+        market_cap = 0.0
+        age_minutes = 0.0
+
+        if not self.session:
+            return market_cap, age_minutes
+
+        try:
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    self.pumpfun_token_info_cache[mint] = (market_cap, age_minutes, now)
+                    return market_cap, age_minutes
+
+                data = await resp.json()
+                if not isinstance(data, dict):
+                    self.pumpfun_token_info_cache[mint] = (market_cap, age_minutes, now)
+                    return market_cap, age_minutes
+
+                raw_mcap = (
+                    data.get("usd_market_cap")
+                    or data.get("market_cap_usd")
+                    or data.get("marketCapUsd")
+                    or data.get("marketCap")
+                    or data.get("market_cap")
+                    or 0
+                )
+                try:
+                    market_cap = float(raw_mcap or 0)
+                except Exception:
+                    market_cap = 0.0
+
+                raw_created = (
+                    data.get("created_timestamp")
+                    or data.get("createdTs")
+                    or data.get("created_at")
+                    or data.get("createdAt")
+                    or data.get("timestamp")
+                )
+                if raw_created is not None:
+                    try:
+                        created = float(raw_created)
+                        if created > 1e12:
+                            created = created / 1000.0
+                        age_minutes = max(0.0, (now - created) / 60.0)
+                    except Exception:
+                        age_minutes = 0.0
+        except Exception:
+            pass
+
+        self.pumpfun_token_info_cache[mint] = (market_cap, age_minutes, now)
+        return market_cap, age_minutes
+
+    async def _is_wallet_token_creator(self, token_mint: str, wallet: str) -> bool:
+        try:
+            result = await self.rpc._request(
+                "getAccountInfo",
+                [
+                    token_mint,
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+
+            value = result.get("value") if isinstance(result, dict) else None
+            data = value.get("data") if isinstance(value, dict) else None
+            parsed = data.get("parsed") if isinstance(data, dict) else None
+            info = parsed.get("info") if isinstance(parsed, dict) else None
+            if not isinstance(info, dict):
+                return False
+
+            mint_authority = info.get("mintAuthority")
+            freeze_authority = info.get("freezeAuthority")
+
+            return wallet in (mint_authority, freeze_authority)
+        except Exception as e:
+            logger.debug(
+                "token_creator_check_error",
+                wallet=wallet[:8],
+                token=token_mint[:8],
+                error=str(e),
+            )
+            return False
         
     async def start(self) -> None:
         """Start the copy trader."""
@@ -476,18 +654,23 @@ class CopyTrader:
                         else:
                             # Token is on-chain but not tracked - sell directly via pump.fun/jupiter
                             logger.info("selling_untracked_token", token=mint[:8], attempt=attempt+1, reason=sell_reason)
-                            # Try pump.fun first
-                            result = await self._execute_pumpfun_swap(
-                                token_mint=mint,
-                                sol_amount=0,  # Not used for sells
-                                is_buy=False,
-                                sell_percentage=100,
-                                attempt_number=attempt + 1
-                            )
-                            # If pump.fun fails, try Jupiter
-                            if not result.success:
-                                logger.info("pumpfun_sell_failed_trying_jupiter", token=mint[:8])
-                                result = await self._sell_via_jupiter(mint)
+                            sell_lock = self._get_sell_lock(mint)
+                            logger.info("untracked_sell_lock_attempt", token=mint[:8], lock_id=id(sell_lock))
+                            async with sell_lock:
+                                logger.info("untracked_sell_lock_acquired", token=mint[:8], lock_id=id(sell_lock))
+                                try:
+                                    result = await self._execute_pumpfun_swap(
+                                        token_mint=mint,
+                                        sol_amount=0,
+                                        is_buy=False,
+                                        sell_percentage=100,
+                                        attempt_number=attempt + 1
+                                    )
+                                    if not result.success:
+                                        logger.info("pumpfun_sell_failed_trying_jupiter", token=mint[:8])
+                                        result = await self._sell_via_jupiter(mint)
+                                finally:
+                                    logger.info("untracked_sell_lock_released", token=mint[:8], lock_id=id(sell_lock))
                         
                         if result.success:
                             logger.info(
@@ -692,7 +875,7 @@ class CopyTrader:
                             continue
                 except Exception:
                     continue
-            
+
             return holdings if holdings else None
             
         except Exception as e:
@@ -974,19 +1157,12 @@ class CopyTrader:
                     
                     # Check how long we've held this position
                     entry_times = state.get('entry_times', {})
-                    entry_time_str = entry_times.get(mint)
-                    hold_minutes = 0
-                    if entry_time_str:
-                        try:
-                            entry_dt = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
-                            hold_minutes = (datetime.now(entry_dt.tzinfo) - entry_dt).total_seconds() / 60
-                        except:
-                            pass
-                    
+                    entry_time_str = entry_times.get(mint, time.time())
+                    hold_minutes = (time.time() - entry_time_str) / 60 if entry_time_str else 0
                     if not should_sell and TIME_LIMIT_MINUTES > 0 and hold_minutes >= TIME_LIMIT_MINUTES:
                         reason = f"time_limit_triggered (held {hold_minutes:.1f}m >= {TIME_LIMIT_MINUTES:.1f}m)"
                         should_sell = True
-                        if current_value == 0 and entry_sol > 0:
+                        if current_value == 0:
                             current_value = entry_sol * 0.5
                     
                     # Rug detection checks - ALWAYS run to protect from unsellable tokens
@@ -1030,14 +1206,7 @@ class CopyTrader:
                             should_sell = True
                             # Use current value if available, otherwise estimate based on current mcap
                             if current_value == 0:
-                                current_value = entry_sol * 0.5  # Conservative estimate
-                            logger.warning(
-                                "missed_sell_detected",
-                                wallet=wallet[:8],
-                                token=mint[:8],
-                                hold_minutes=f"{hold_minutes:.1f}",
-                                message="Trader exited but we missed the sell - syncing now!"
-                            )
+                                current_value = entry_sol * 0.5
                     
                     if should_sell and reason:
                         await self._auto_mock_sell(wallet, mint, tokens_held, entry_sol, current_value, reason)
@@ -1300,78 +1469,6 @@ class CopyTrader:
         for wallet in self.wallet_states:
             self._save_wallet_state(wallet)
     
-    def _log_real_trade_to_state(self, swap: 'ParsedSwap', trade_sol: float, trade_type: str, signature: str = None, tokens_received: int = 0) -> None:
-        """Log a real trade to the state file for dashboard display."""
-        try:
-            real_state_file = Path('real_state.json')
-            
-            # Load existing state or create new with full structure
-            if real_state_file.exists():
-                with open(real_state_file, 'r') as f:
-                    state = json.load(f)
-            else:
-                state = {
-                    'starting_balance': 0,
-                    'balance': 0,
-                    'positions': {},
-                    'entry_sol': {},
-                    'entry_times': {},
-                    'trades_history': [],
-                    'last_updated': datetime.now().isoformat()
-                }
-            
-            # Ensure all required fields exist
-            state.setdefault('positions', {})
-            state.setdefault('entry_sol', {})
-            state.setdefault('entry_times', {})
-            state.setdefault('trades_history', [])
-            state.setdefault('balance', 0)
-            state.setdefault('starting_balance', 0)
-            
-            token_mint = swap.token_mint
-            
-            # Update positions based on trade type
-            if trade_type == 'buy':
-                # Add position
-                current_tokens = state['positions'].get(token_mint, 0)
-                state['positions'][token_mint] = current_tokens + tokens_received
-                state['entry_sol'][token_mint] = state['entry_sol'].get(token_mint, 0) + trade_sol
-                if token_mint not in state['entry_times']:
-                    state['entry_times'][token_mint] = datetime.now().isoformat()
-            elif trade_type == 'sell':
-                # Remove position
-                if token_mint in state['positions']:
-                    del state['positions'][token_mint]
-                if token_mint in state['entry_sol']:
-                    del state['entry_sol'][token_mint]
-                if token_mint in state['entry_times']:
-                    del state['entry_times'][token_mint]
-            
-            # Add trade to history
-            trades = state['trades_history']
-            trades.append({
-                'type': trade_type,
-                'token': token_mint[:8],
-                'full_mint': token_mint,
-                'sol': trade_sol,
-                'signature': signature[:16] if signature else None,
-                'timestamp': datetime.now().isoformat(),
-                'real': True
-            })
-            
-            # Keep last 100 trades
-            state['trades_history'] = trades[-100:]
-            state['last_updated'] = datetime.now().isoformat()
-            
-            # Save state
-            with open(real_state_file, 'w') as f:
-                json.dump(state, f, indent=2)
-            
-            logger.info("real_trade_logged", type=trade_type, token=token_mint[:8], sol=f"{trade_sol:.4f}")
-            
-        except Exception as e:
-            logger.warning("real_trade_log_error", error=str(e))
-    
     def get_dashboard_state(self, wallet: str = None) -> Dict:
         """Get current state for dashboard display. If wallet specified, returns that wallet's state."""
         if wallet:
@@ -1525,11 +1622,18 @@ class CopyTrader:
                         logger.info("selling_untracked_position", token=swap.token_mint[:8], balance=onchain_balance)
                         if self.position_manager:
                             correlation_id = str(uuid.uuid4())
-                            sell_result = await self.position_manager._execute_direct_sell(
-                                swap.token_mint,
-                                onchain_balance,
-                                correlation_id=correlation_id
-                            )
+                            sell_lock = self._get_sell_lock(swap.token_mint)
+                            logger.info("untracked_sell_lock_attempt", token=swap.token_mint[:8], lock_id=id(sell_lock))
+                            async with sell_lock:
+                                logger.info("untracked_sell_lock_acquired", token=swap.token_mint[:8], lock_id=id(sell_lock))
+                                try:
+                                    sell_result = await self.position_manager._execute_direct_sell(
+                                        swap.token_mint,
+                                        onchain_balance,
+                                        correlation_id=correlation_id
+                                    )
+                                finally:
+                                    logger.info("untracked_sell_lock_released", token=swap.token_mint[:8], lock_id=id(sell_lock))
                             if sell_result and sell_result.success:
                                 real_sold = True
                                 logger.info("untracked_sell_success", token=swap.token_mint[:8])
@@ -1639,7 +1743,7 @@ class CopyTrader:
                     # Temporarily disable mock to get real balance
                     original_mock = self.mock_trading
                     self.mock_trading = False
-                    real_balance = await self._get_token_balance(swap.token_mint, swap.wallet)
+                    real_balance = await self._get_token_balance(swap.token_mint)
                     self.mock_trading = original_mock
                     logger.debug("real_sell_balance_check", token=swap.token_mint[:8], real_balance=real_balance)
                 
@@ -1675,92 +1779,98 @@ class CopyTrader:
                     logger.info("skip_real_sell", token=swap.token_mint[:8], reason="no_real_balance")
                     return CopyTradeResult(success=True, mock=True, original_swap=swap)
 
-                # AGGRESSIVE RETRY LOOP with exponential backoff for REAL sells
-                try:
-                    max_retries = int(os.getenv("URGENT_SELL_MAX_RETRIES", "3"))
-                except Exception:
-                    max_retries = 3
-                result = None
-                unrecoverable = False
-                for attempt in range(max_retries):
-                    if is_pumpfun_sell:
-                        # Use Pump.fun API for bonding curve sells
-                        # Estimate SOL value from token balance (rough estimate)
-                        estimated_sol = real_balance / 1e9 * 0.00001  # Very rough, will be adjusted by API
-                        result = await self._execute_pumpfun_swap(
-                            token_mint=swap.token_mint,
-                            sol_amount=estimated_sol,
-                            is_buy=False,
-                            correlation_id=correlation_id,
-                            attempt_number=attempt + 1
-                        )
-                    else:
-                        # Use Jupiter for Raydium/other DEXes
-                        result = await self._execute_swap(
-                            input_mint=swap.token_mint,
-                            output_mint=NATIVE_SOL,
-                            amount=real_balance,
-                            correlation_id=correlation_id,
-                            attempt_number=attempt + 1
-                        )
-                    
-                    if result.success:
-                        if self.telemetry and result.execution_details:
-                            asyncio.create_task(self.telemetry.record_execution_details(
-                                correlation_id=correlation_id,
-                                exec_detail=result.execution_details
-                            ))
-                        self.stats.total_sol_received += swap.sol_value * 0.01  # Estimate
-                        trade_logger.log_sell(
-                            token_mint=swap.token_mint,
-                            token_symbol=swap.token_symbol,
-                            our_sol_received=swap.sol_value * 0.01,  # Estimate
-                            our_tokens_sold=real_balance,
-                            our_signature=result.signature or "",
-                            copied_wallet=swap.wallet,
-                            their_sol=swap.sol_value,
-                            their_signature=swap.signature,
-                            delay_seconds=0,
-                            entry_sol=swap.sol_value * 0.01,  # Estimate
-                            exit_reason="copied_sell",
-                            success=True
-                        )
-                        logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
-                        # Log real sell to state file for dashboard display
-                        self._log_real_trade_to_state(
-                            swap=swap,
-                            trade_sol=swap.sol_value * 0.01,  # Estimate
-                            trade_type="sell",
-                            signature=result.signature
-                        )
-                        return result
+                sell_lock = self._get_sell_lock(swap.token_mint)
+                logger.info("fast_sell_lock_attempt", token=swap.token_mint[:8], lock_id=id(sell_lock))
+                async with sell_lock:
+                    logger.info("fast_sell_lock_acquired", token=swap.token_mint[:8], lock_id=id(sell_lock))
+                    try:
+                        try:
+                            max_retries = int(os.getenv("URGENT_SELL_MAX_RETRIES", "3"))
+                        except Exception:
+                            max_retries = 3
+                        result = None
+                        unrecoverable = False
+                        for attempt in range(max_retries):
+                            if is_pumpfun_sell:
+                                estimated_sol = real_balance / 1e9 * 0.00001
+                                result = await self._execute_pumpfun_swap(
+                                    token_mint=swap.token_mint,
+                                    sol_amount=estimated_sol,
+                                    is_buy=False,
+                                    correlation_id=correlation_id,
+                                    attempt_number=attempt + 1
+                                )
+                                logger.info("pumpfun_swap_attempt", token=swap.token_mint[:8], attempt=attempt+1)
+                                if result.success:
+                                    logger.info("pumpfun_swap_success", token=swap.token_mint[:8], signature=str(result.signature)[:16] if result.signature else None)
+                                else:
+                                    logger.error("pumpfun_swap_failed", token=swap.token_mint[:8], error=result.error if result.error else 'unknown', status_code='unknown')
+                            else:
+                                result = await self._execute_swap(
+                                    input_mint=swap.token_mint,
+                                    output_mint=NATIVE_SOL,
+                                    amount=real_balance,
+                                    correlation_id=correlation_id,
+                                    attempt_number=attempt + 1
+                                )
 
-                    # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
-                    delay = 0.5 * (2 ** attempt)
-                    logger.warning(
-                        "sell_retry",
-                        token=swap.token_mint[:8],
-                        attempt=attempt + 1,
-                        max_retries=max_retries,
-                        next_retry_sec=delay,
-                        error=result.error if result else "unknown"
-                    )
-                    err = (result.error or "").lower() if result else ""
-                    if any(
-                        s in err
-                        for s in [
-                            "could not find any route",
-                            "no_route",
-                            "no_quote",
-                            "quote_failed",
-                            "all_pools_failed",
-                            "http_400",
-                            "bad request",
-                        ]
-                    ):
-                        unrecoverable = True
-                        break
-                    await asyncio.sleep(delay)
+                            if result.success:
+                                if self.telemetry and result.execution_details:
+                                    asyncio.create_task(self.telemetry.record_execution_details(
+                                        correlation_id=correlation_id,
+                                        exec_detail=result.execution_details
+                                    ))
+                                self.stats.total_sol_received += swap.sol_value * 0.01
+                                trade_logger.log_sell(
+                                    token_mint=swap.token_mint,
+                                    token_symbol=swap.token_symbol,
+                                    our_sol_received=swap.sol_value * 0.01,
+                                    our_tokens_sold=real_balance,
+                                    our_signature=result.signature or "",
+                                    copied_wallet=swap.wallet,
+                                    their_sol=swap.sol_value,
+                                    their_signature=swap.signature,
+                                    delay_seconds=0,
+                                    entry_sol=swap.sol_value * 0.01,
+                                    exit_reason="copied_sell",
+                                    success=True
+                                )
+                                logger.info("sell_success", token=swap.token_mint[:8], attempt=attempt+1)
+                                self._log_real_trade_to_state(
+                                    swap=swap,
+                                    trade_sol=swap.sol_value * 0.01,
+                                    trade_type="sell",
+                                    signature=result.signature
+                                )
+                                return result
+
+                            delay = 0.5 * (2 ** attempt)
+                            logger.warning(
+                                "sell_retry",
+                                token=swap.token_mint[:8],
+                                attempt=attempt+1,
+                                error=result.error,
+                                delay=f"{delay:.1f}s"
+                            )
+                            err = (result.error or "").lower() if result else ""
+                            if any(
+                                s in err
+                                for s in [
+                                    "could not find any route",
+                                    "no_route",
+                                    "no_quote",
+                                    "quote_failed",
+                                    "all_pools_failed",
+                                    "http_400",
+                                    "bad request",
+                                ]
+                            ):
+                                unrecoverable = True
+                                break
+                            await asyncio.sleep(delay)
+                            delay = min(delay * 1.2, 10)
+                    finally:
+                        logger.info("fast_sell_lock_released", token=swap.token_mint[:8], lock_id=id(sell_lock))
                 
                 # All retries failed - add to retry queue for background retries
                 if unrecoverable:
@@ -1847,7 +1957,7 @@ class CopyTrader:
             
             # trust_trader_pumpfun: skip TIMING filters (age, volume, txns, price change)
             # but ALWAYS apply SAFETY filters (market cap, liquidity) to avoid buying into rugs
-            skip_timing_filters = self.trust_trader_pumpfun
+            skip_timing_filters = self.trust_trader_pumpfun and is_pumpfun
             
             # Helper to log detection with all market data and record telemetry
             def log_skip(skip_reason: str):
@@ -1871,17 +1981,24 @@ class CopyTrader:
                 # Record comprehensive telemetry for skipped trade
                 if self.telemetry:
                     correlation_id = str(uuid.uuid4())
-                    asyncio.create_task(self._record_trade_telemetry(
-                        swap=swap,
+                    asyncio.create_task(self.telemetry.record_skipped_trade(
                         correlation_id=correlation_id,
-                        status="skipped",
-                        market_cap=market_cap,
-                        liquidity=liquidity,
-                        volume_24h=volume_24h,
-                        price_change_1h=price_change_1h,
-                        txns_1h=txns_1h,
-                        age_minutes=age_minutes,
+                        token_mint=swap.token_mint,
+                        trader_wallet=swap.wallet,
+                        their_signature=swap.signature,
+                        their_sol_amount=Decimal(str(swap.sol_value)),
+                        their_dex=swap.dex,
                         skip_reason=skip_reason,
+                        skip_category=self._categorize_skip_reason(skip_reason),
+                        market_snapshot=None,
+                        filter_thresholds={
+                            "min_mcap": self.min_market_cap_usd,
+                            "min_liquidity": self.min_liquidity_usd,
+                            "min_volume": self.min_volume_24h_usd,
+                            "min_age": self.min_token_age_minutes,
+                            "max_pump": self.max_price_change_1h_pct if hasattr(self, 'max_price_change_1h_pct') else 0
+                        },
+                        error_code="skipped",
                         error_message=skip_reason
                     ))
             
@@ -1900,12 +2017,13 @@ class CopyTrader:
                     original_swap=swap
                 )
             
-            # SAFETY filters - apply unless token is brand new pump.fun (no DEX data yet)
-            # $0 mcap + $0 liquidity = not on DEX yet (early pump.fun) - trust trader if enabled
-            is_early_pumpfun = (market_cap == 0 and liquidity == 0 and skip_timing_filters)
-            
+            # SAFETY filters
+            # DexScreener liquidity is often 0 for early pump.fun bonding curve tokens.
+            # If TRUST_TRADER_PUMPFUN is enabled, allow liquidity==0 for pump.fun tokens (we sell via PumpPortal).
+            allow_pumpfun_liquidity_zero = bool(skip_timing_filters and liquidity == 0)
+
             # Check market cap (SAFETY filter)
-            if not is_early_pumpfun and self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
+            if self.min_market_cap_usd > 0 and market_cap < self.min_market_cap_usd:
                 logger.info(
                     "skipping_low_mcap",
                     token=swap.token_mint[:8],
@@ -1920,7 +2038,7 @@ class CopyTrader:
                 )
             
             # Check liquidity - CRITICAL for being able to sell! (SAFETY filter)
-            if not is_early_pumpfun and self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
+            if not allow_pumpfun_liquidity_zero and self.min_liquidity_usd > 0 and liquidity < self.min_liquidity_usd:
                 logger.info(
                     "skipping_low_liquidity",
                     token=swap.token_mint[:8],
@@ -2187,7 +2305,7 @@ class CopyTrader:
                 asyncio.create_task(self._clear_recent_copy(swap.wallet, swap.token_mint, 60))  # Block for 60s
             
             # Buy: Use appropriate API based on DEX
-            # Check if we should execute real trade (either real-only mode, or real+mock mode for specific wallet)
+            # Check if we should execute real sell
             should_execute_real = (
                 not self.mock_trading or 
                 (self.real_trading_enabled and 
@@ -2252,21 +2370,19 @@ class CopyTrader:
                     if real_result and not real_result.success:
                         # Record failed trade telemetry (so we can analyze missed executions)
                         if self.telemetry:
-                            asyncio.create_task(self._record_trade_telemetry(
-                                swap=swap,
+                            asyncio.create_task(self.telemetry.record_failed_execution(
+                                trade_id=None,
                                 correlation_id=correlation_id,
-                                status="failed",
-                                market_cap=market_cap,
-                                liquidity=liquidity,
-                                volume_24h=volume_24h,
-                                price_change_1h=price_change_1h,
-                                txns_1h=txns_1h,
-                                age_minutes=age_minutes,
-                                our_sol_amount=real_trade_sol,
-                                our_signature=real_result.signature if real_result else None,
-                                entry_reason="copied_buy",
-                                error_message=real_result.error if real_result else "real_trade_failed",
-                                execution_details=real_result.execution_details if real_result else None
+                                token_mint=swap.token_mint,
+                                execution_type="buy",
+                                method="jupiter",
+                                error_code="real_trade_failed",
+                                error_message=real_result.error,
+                                error_category="real_trade_error",
+                                attempt_number=1,
+                                requested_amount=Decimal(str(real_trade_sol)),
+                                slippage_bps=self.config.slippage_bps,
+                                priority_fee=self.jupiter_priority_fee_lamports
                             ))
                         if not self.mock_trading or require_real_success:
                             return real_result
@@ -2367,6 +2483,8 @@ class CopyTrader:
                         their_signature=swap.signature,
                         their_timestamp=None,
                         delay_seconds=(datetime.utcnow() - datetime.utcnow()).total_seconds(),  # TODO: track actual delay
+                        entry_sol=swap.sol_value * 0.01,
+                        exit_reason="copied_buy",
                         success=True
                     )
                     
@@ -2427,105 +2545,6 @@ class CopyTrader:
                 error=str(e),
                 original_swap=swap
             )
-    
-    async def _execute_real_trade_with_fallbacks(
-        self,
-        swap: ParsedSwap,
-        trade_lamports: int,
-        trade_sol: float,
-        is_pumpfun: bool,
-        correlation_id: Optional[str] = None
-    ) -> CopyTradeResult:
-        """Execute real trade with slippage steps and pump.fun fallback."""
-        # Try pump.fun first if detected as pump.fun token
-        attempt_counter = 0
-        if is_pumpfun:
-            attempt_counter += 1
-            result = await self._execute_pumpfun_swap(
-                token_mint=swap.token_mint,
-                sol_amount=trade_sol,
-                is_buy=True,
-                correlation_id=correlation_id,
-                attempt_number=attempt_counter
-            )
-            if result.success:
-                return result
-            logger.warning(
-                "pumpfun_direct_failed_trying_jupiter",
-                token=swap.token_mint[:8],
-                error=result.error
-            )
-        
-        # Try Jupiter with increasing slippage steps
-        last_error = None
-        for slippage in self.slippage_steps_bps:
-            attempt_counter += 1
-            logger.debug(
-                "trying_jupiter_slippage",
-                token=swap.token_mint[:8],
-                full_mint=swap.token_mint,
-                slippage_bps=slippage,
-                lamports=trade_lamports
-            )
-            result = await self._execute_swap(
-                input_mint=NATIVE_SOL,
-                output_mint=swap.token_mint,
-                amount=trade_lamports,
-                slippage_bps=slippage,
-                correlation_id=correlation_id,
-                attempt_number=attempt_counter
-            )
-            if result.success:
-                return result
-            last_error = result.error
-            
-            # Check if error is worth retrying with higher slippage
-            error_text = (result.error or "").lower()
-            if "slippage" not in error_text and "price" not in error_text:
-                # Not a slippage issue, try fallback instead
-                break
-        
-        # Fallback to pump.fun if Jupiter failed (and we didn't already try it)
-        if not is_pumpfun:
-            logger.warning(
-                "jupiter_failed_trying_pumpfun_fallback",
-                token=swap.token_mint[:8],
-                sol=f"{trade_sol:.4f}",
-                last_error=last_error
-            )
-            attempt_counter += 1
-            fallback_result = await self._execute_pumpfun_swap(
-                token_mint=swap.token_mint,
-                sol_amount=trade_sol,
-                is_buy=True,
-                correlation_id=correlation_id,
-                attempt_number=attempt_counter
-            )
-            if fallback_result.success:
-                logger.info(
-                    "pumpfun_fallback_success",
-                    token=swap.token_mint[:8],
-                    sol=f"{trade_sol:.4f}"
-                )
-                return fallback_result
-            logger.error(
-                "pumpfun_fallback_failed",
-                token=swap.token_mint[:8],
-                error=fallback_result.error
-            )
-            last_error = f"{last_error}; pumpfun_fallback: {fallback_result.error}"
-        
-        logger.error(
-            "real_trade_failed",
-            token=swap.token_mint[:8],
-            sol=f"{trade_sol:.4f}",
-            error=last_error
-        )
-        return CopyTradeResult(
-            success=False,
-            error=last_error or "all_routes_failed",
-            original_swap=swap
-        )
     
     async def _record_trade_telemetry(
         self,
@@ -2872,6 +2891,9 @@ class CopyTrader:
                     executor="bot",
                     execution_type=exec_type,
                     signature=str(signature),
+                    slot=None,
+                    block_time=None,
+                    program_ids=None,
                     dex_used="jupiter",
                     jupiter_route=quote,
                     jupiter_route_hops=len(quote.get("routePlan", [])) if isinstance(quote.get("routePlan"), list) else None,
@@ -2892,7 +2914,6 @@ class CopyTrader:
                     send_to_confirm_ms=int((datetime.now(timezone.utc) - submit_at).total_seconds() * 1000),
                     attempt_number=attempt_number,
                     total_retries=max(0, attempt_number - 1),
-                    errors=["tx_not_confirmed"],
                     final_status="failed"
                 )
 
@@ -3011,6 +3032,7 @@ class CopyTrader:
             pumpfun_slippage = max(int(self.config.slippage_bps / 100), 50 if not is_buy else 30)
             
             # Dynamic priority fee escalation: start low, increase on retries
+            # attempt 1: base fee, attempt 2: 2x, attempt 3: 4x, etc.
             base_fee_buy = min(max(self.pumpfun_priority_fee_sol, 0.0005), 0.0015)
             base_fee_sell = min(max(self.pumpfun_priority_fee_sol, 0.0002), 0.001)
             fee_multiplier = min(2 ** (attempt_number - 1), 8)  # Cap at 8x
@@ -3018,8 +3040,7 @@ class CopyTrader:
 
             priority_fee = min(priority_fee, 0.0015 if is_buy else 0.001)
             
-            # Try pools in order: pump, pump-amm, raydium, raydium-cpmm, launchlab
-            pools_to_try = ["auto", "pump", "pump-amm"]
+            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm", "launchlab", "bonk"]
             last_error = None
             
             for pool in pools_to_try:
@@ -3050,10 +3071,19 @@ class CopyTrader:
                 logger.info(
                     "pumpfun_swap_request",
                     action=action,
-                    token=token_mint[:8],
+                    token=token_mint[:8] + "...",
                     full_mint=token_mint,
-                    sol=f"{sol_amount:.4f}",
+                    sol=sol_amount,
                     pool=pool
+                )
+                logger.info(
+                    "pumpfun_swap_request_details",
+                    action=action,
+                    token=token_mint[:8] + "...",
+                    full_mint=token_mint,
+                    sol=sol_amount,
+                    pool=pool,
+                    payload=payload
                 )
                 
                 tx_bytes = None
@@ -3110,8 +3140,6 @@ class CopyTrader:
                             slippage_bps=int(pumpfun_slippage * 100),
                             priority_fee=int(priority_fee * 1e9)
                         ))
-                    if status_code == 400 and pool != "auto":
-                        break
                     continue  # Try next pool
                 
                 # Deserialize and sign the transaction
@@ -3262,7 +3290,7 @@ class CopyTrader:
             result = await self.rpc._request(
                 "getTokenAccountsByOwner",
                 [
-                    str(wallet_pubkey),
+                    wallet_pubkey,
                     {"mint": token_mint},
                     {"encoding": "jsonParsed"}
                 ]
@@ -3376,7 +3404,7 @@ class CopyTrader:
             # If we have more tokens, we'd face slippage - cap at their price
             sol_received = min(raw_sol, swap.sol_value)
         else:
-            sol_received = token_balance / 1_000_000
+            sol_received = token_balance / 1e9
         
         # Calculate P&L for this trade
         entry_sol_map = state.get('entry_sol', {})
@@ -3455,16 +3483,23 @@ class CopyTrader:
                     {"encoding": "jsonParsed"}
                 ]
             )
+            
             if result and "value" in result:
                 accounts = result["value"]
-                if accounts:
-                    account_data = accounts[0].get("account", {}).get("data", {})
-                    parsed = account_data.get("parsed", {}).get("info", {})
-                    token_amount = parsed.get("tokenAmount", {})
-                    amount = int(token_amount.get("amount", 0))
-                    if amount > 0:
-                        logger.info("token_balance_found", token=mint[:8], amount=amount)
-                        return amount
+                if not accounts:
+                    # No token account = trader doesn't hold this token
+                    logger.info("trader_exited_no_account", trader=wallet[:8], token=mint[:8])
+                    return 0
+                
+                # Check if balance is > 0
+                account_data = accounts[0].get("account", {}).get("data", {})
+                parsed = account_data.get("parsed", {}).get("info", {})
+                token_amount = parsed.get("tokenAmount", {})
+                amount = int(token_amount.get("amount", 0))
+                
+                if amount > 0:
+                    logger.info("token_balance_found", token=mint[:8], amount=amount)
+                    return amount
 
             # Fallback: query BOTH token programs and filter by mint client-side
             token_programs = [
@@ -3473,32 +3508,36 @@ class CopyTrader:
             ]
 
             for program_id in token_programs:
-                result = await self.rpc._request(
-                    "getTokenAccountsByOwner",
-                    [
-                        str(wallet_pubkey),
-                        {"programId": program_id},
-                        {"encoding": "jsonParsed"}
-                    ]
-                )
-                if not result or "value" not in result:
-                    continue
-
-                for acct in result["value"] or []:
-                    account_data = acct.get("account", {}).get("data", {})
-                    info = account_data.get("parsed", {}).get("info", {})
-                    if info.get("mint") != mint:
+                try:
+                    result = await self.rpc._request(
+                        "getTokenAccountsByOwner",
+                        [
+                            str(wallet_pubkey),
+                            {"programId": program_id},
+                            {"encoding": "jsonParsed"}
+                        ]
+                    )
+                    if not result or "value" not in result:
                         continue
-                    token_amount = info.get("tokenAmount", {})
-                    amount = int(token_amount.get("amount", 0))
-                    if amount > 0:
-                        logger.info(
-                            "token_balance_found",
-                            token=mint[:8],
-                            amount=amount,
-                            program="token-2022" if "Tokenz" in program_id else "spl-token"
-                        )
-                        return amount
+
+                    for acct in result["value"] or []:
+                        account_data = acct.get("account", {}).get("data", {})
+                        info = account_data.get("parsed", {}).get("info", {})
+                        if info.get("mint") != mint:
+                            continue
+                        token_amount = info.get("tokenAmount", {})
+                        amount = int(token_amount.get("amount", 0))
+                        if amount > 0:
+                            logger.info(
+                                "token_balance_found",
+                                token=mint[:8],
+                                amount=amount,
+                                program="token-2022" if "Tokenz" in program_id else "spl-token"
+                            )
+                            return amount
+
+                except Exception:
+                    continue
 
             return 0
         except Exception as e:
@@ -3554,276 +3593,6 @@ class CopyTrader:
             # On error, assume trader still holds (safer)
             return True
     
-    async def _check_token_sellable(self, mint: str) -> bool:
-        """Check if a token has a sell route on Jupiter before buying.
-        
-        This prevents entering positions in tokens we can't exit.
-        Returns True if sellable, False if no route found.
-        """
-        try:
-            # Use a small test amount (1 token unit) to check if route exists
-            # We just need to know IF a route exists, not get exact quote
-            test_amount = 1000000  # 1 token (assuming 6 decimals)
-            
-            quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={mint}&outputMint=So11111111111111111111111111111111111111112&amount={test_amount}&slippageBps=5000"
-            
-            async with self.session.get(quote_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # If we get a quote with outAmount > 0, token is sellable
-                    out_amount = int(data.get("outAmount", 0))
-                    if out_amount > 0:
-                        return True
-                    # Check for error in response
-                    error = data.get("error", "")
-                    if "Could not find any route" in error or "COULD_NOT_FIND_ANY_ROUTE" in str(data):
-                        logger.debug("token_not_sellable_no_route", token=mint[:8])
-                        return False
-                    return True  # Got a response, assume sellable
-                elif resp.status == 400:
-                    # Only block if it's specifically a "no route" error
-                    try:
-                        error_data = await resp.json()
-                        error_str = str(error_data).lower()
-                        if "could not find any route" in error_str or "no_route" in error_str:
-                            logger.debug("token_not_sellable_400", token=mint[:8])
-                            return False
-                    except:
-                        pass
-                    # Other 400 errors - assume sellable (don't block trades)
-                    return True
-                else:
-                    # Other errors - assume sellable to not block trades
-                    return True
-        except asyncio.TimeoutError:
-            # Timeout - assume sellable to not slow down
-            return True
-        except Exception as e:
-            logger.debug("sellability_check_error", token=mint[:8], error=str(e))
-            # On error, assume sellable (don't block trades on API issues)
-            return True
-    
-    async def _get_token_info(self, mint: str) -> tuple[float, float, float, float, float, int]:
-        """Get market cap, token age, liquidity, volume, price change and txn count using DexScreener API.
-        
-        Returns:
-            tuple: (market_cap_usd, age_minutes, liquidity_usd, volume_24h_usd, price_change_1h_pct, txns_1h)
-        """
-        import time
-        
-        # Check cache (valid for 60 seconds)
-        if mint in self.token_info_cache:
-            cached_cap, cached_age, cached_liq, cached_vol, cached_price_chg, cached_txns, cached_time = self.token_info_cache[mint]
-            if time.time() - cached_time < 60:
-                # Adjust age for time passed since cache
-                adjusted_age = cached_age + (time.time() - cached_time) / 60
-                return cached_cap, adjusted_age, cached_liq, cached_vol, cached_price_chg, cached_txns
-        
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pairs = data.get("pairs", [])
-                    if pairs:
-                        # Get the best pair's stats (highest liquidity)
-                        market_cap = 0
-                        oldest_age = 0
-                        total_liquidity = 0
-                        total_volume_24h = 0
-                        price_change_1h = 0
-                        total_txns_1h = 0
-                        best_pair = None
-                        
-                        for pair in pairs:
-                            mc = pair.get("marketCap") or pair.get("fdv") or 0
-                            if mc > market_cap:
-                                market_cap = mc
-                                best_pair = pair  # Track the main pair
-                            
-                            # Sum up liquidity across all pairs
-                            liq = pair.get("liquidity", {}).get("usd", 0) or 0
-                            total_liquidity += liq
-                            
-                            # Sum up 24h volume across all pairs
-                            vol = pair.get("volume", {}).get("h24", 0) or 0
-                            total_volume_24h += vol
-                            
-                            # Sum up 1h transactions (buys + sells)
-                            txns = pair.get("txns", {}).get("h1", {})
-                            buys_1h = txns.get("buys", 0) or 0
-                            sells_1h = txns.get("sells", 0) or 0
-                            total_txns_1h += buys_1h + sells_1h
-                            
-                            # Get pair creation time
-                            created_at = pair.get("pairCreatedAt")
-                            if created_at:
-                                age_ms = time.time() * 1000 - created_at
-                                age_minutes = age_ms / 60000
-                                if age_minutes > oldest_age:
-                                    oldest_age = age_minutes
-                        
-                        # Get 1h price change from best pair
-                        if best_pair:
-                            price_change_1h = best_pair.get("priceChange", {}).get("h1", 0) or 0
-                        
-                        self.token_info_cache[mint] = (market_cap, oldest_age, total_liquidity, total_volume_24h, price_change_1h, total_txns_1h, time.time())
-                        return market_cap, oldest_age, total_liquidity, total_volume_24h, price_change_1h, total_txns_1h
-            
-            return 0, 0, 0, 0, 0, 0
-        except Exception as e:
-            logger.debug("token_info_fetch_error", mint=mint[:8], error=str(e))
-            return 0, 0, 0, 0, 0, 0
-    
-    async def _get_pumpfun_token_info(self, mint: str) -> tuple[float, float]:
-        """Get token info from Pump.fun API.
-        
-        Returns:
-            tuple: (market_cap_usd, age_minutes)
-        """
-        import time
-        
-        # Check cache (valid for 30 seconds for pump.fun - things move fast)
-        cache_key = f"pumpfun_{mint}"
-        if cache_key in self.token_info_cache:
-            cached = self.token_info_cache[cache_key]
-            if len(cached) >= 3 and time.time() - cached[2] < 30:
-                return cached[0], cached[1]
-        
-        try:
-            url = f"https://frontend-api.pump.fun/coins/{mint}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    
-                    # Get market cap in USD
-                    market_cap = data.get("usd_market_cap", 0) or 0
-                    
-                    # Get token age from created_timestamp (in milliseconds)
-                    created_ts = data.get("created_timestamp")
-                    age_minutes = 0
-                    if created_ts:
-                        age_ms = time.time() * 1000 - created_ts
-                        age_minutes = age_ms / 60000
-                    
-                    # Cache it
-                    self.token_info_cache[cache_key] = (market_cap, age_minutes, time.time())
-                    logger.debug("pumpfun_api_success", mint=mint[:8], market_cap=market_cap, age=age_minutes)
-                    return market_cap, age_minutes
-                else:
-                    logger.debug("pumpfun_api_error", mint=mint[:8], status=resp.status)
-            
-            return 0, 0
-        except Exception as e:
-            logger.debug("pumpfun_info_fetch_error", mint=mint[:8], error=str(e))
-            return 0, 0
-    
-    async def _get_holder_info(self, mint: str) -> tuple[float, float, int]:
-        """Get holder distribution info using RugCheck API.
-        
-        Returns:
-            tuple: (top10_holders_pct, dev_holdings_pct, holders_count)
-        """
-        import time
-        
-        # Check cache (valid for 5 minutes - holder data doesn't change fast)
-        if mint in self.holder_info_cache:
-            cached_top10, cached_dev, cached_holders, cached_time = self.holder_info_cache[mint]
-            if time.time() - cached_time < 300:  # 5 minutes
-                return cached_top10, cached_dev, cached_holders
-        
-        try:
-            # RugCheck API
-            url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    
-                    # Get top holders percentage
-                    top_holders = data.get("topHolders", [])
-                    top10_pct = 0
-                    for i, holder in enumerate(top_holders[:10]):
-                        top10_pct += holder.get("pct", 0)
-                    
-                    # Get creator/dev holdings
-                    creator_pct = 0
-                    creator = data.get("creator")
-                    if creator:
-                        creator_pct = creator.get("pct", 0) or 0
-                    
-                    # Also check for "insider" or high-risk holders
-                    risks = data.get("risks", [])
-                    for risk in risks:
-                        if "creator" in risk.get("name", "").lower():
-                            # Try to extract percentage from risk description
-                            pass
-                    
-                    # Get total holders count
-                    holders_count = data.get("holderCount", 0) or len(top_holders)
-                    
-                    self.holder_info_cache[mint] = (top10_pct, creator_pct, holders_count, time.time())
-                    return top10_pct, creator_pct, holders_count
-            
-            return 0, 0, 0
-        except Exception as e:
-            logger.debug("holder_info_fetch_error", mint=mint[:8], error=str(e))
-            return 0, 0, 0
-    
-    async def _is_wallet_token_creator(self, mint: str, wallet: str) -> bool:
-        """Check if the wallet is the creator of the token using Pump.fun API.
-        
-        Returns:
-            bool: True if wallet is the token creator, False otherwise
-        """
-        try:
-            # Try Pump.fun API first (most pump.fun tokens)
-            url = f"https://frontend-api.pump.fun/coins/{mint}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    creator = data.get("creator")
-                    if creator:
-                        # Compare with tracked wallet (case-insensitive, first 8 chars for logging)
-                        is_creator = creator.lower() == wallet.lower()
-                        if is_creator:
-                            logger.info(
-                                "wallet_is_token_creator",
-                                token=mint[:8],
-                                wallet=wallet[:8],
-                                message="Skipping - tracked wallet created this token"
-                            )
-                        return is_creator
-            
-            # Try RugCheck API as fallback
-            url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    creator_info = data.get("creator")
-                    creator_addr = ""
-                    
-                    # Handle both string and dict formats from RugCheck
-                    if isinstance(creator_info, str):
-                        creator_addr = creator_info
-                    elif isinstance(creator_info, dict):
-                        creator_addr = creator_info.get("address", "")
-                    
-                    if creator_addr:
-                        is_creator = creator_addr.lower() == wallet.lower()
-                        if is_creator:
-                            logger.info(
-                                "wallet_is_token_creator",
-                                token=mint[:8],
-                                wallet=wallet[:8],
-                                message="Skipping - tracked wallet created this token (RugCheck)"
-                            )
-                        return is_creator
-            
-            return False
-        except Exception as e:
-            logger.debug("creator_check_error", mint=mint[:8], error=str(e))
-            return False
-    
     async def _clear_recent_copy(self, wallet: str, token_mint: str, delay: int) -> None:
         """Remove token from a wallet's recent copies after delay."""
         await asyncio.sleep(delay)
@@ -3843,3 +3612,62 @@ class CopyTrader:
     def get_stats(self) -> TradeStats:
         """Get current statistics."""
         return self.stats
+
+    async def _execute_real_trade_with_fallbacks(
+        self,
+        swap: ParsedSwap,
+        trade_lamports: int,
+        trade_sol: float,
+        is_pumpfun: bool,
+        correlation_id: str
+    ) -> CopyTradeResult:
+        """Execute a real trade with fallbacks for failed executions."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            if is_pumpfun:
+                result = await self._execute_pumpfun_swap(
+                    token_mint=swap.token_mint,
+                    sol_amount=trade_sol,
+                    is_buy=True,
+                    correlation_id=correlation_id,
+                    attempt_number=attempt + 1
+                )
+            else:
+                result = await self._execute_swap(
+                    input_mint=NATIVE_SOL,
+                    output_mint=swap.token_mint,
+                    amount=trade_lamports,
+                    correlation_id=correlation_id,
+                    attempt_number=attempt + 1
+                )
+            
+            if result.success:
+                return result
+            
+            # Exponential backoff: wait 2^attempt seconds before retrying
+            wait_time = 2 ** attempt
+            logger.info("real_trade_retry_wait", attempt=attempt+1, wait_time=wait_time, token=swap.token_mint[:8])
+            await asyncio.sleep(wait_time)
+        
+        return CopyTradeResult(success=False, error="all_retries_failed")
+
+    async def _log_real_trade_to_state(
+        self,
+        swap: ParsedSwap,
+        trade_sol: float,
+        trade_type: str,
+        signature: str
+    ) -> None:
+        """Log real trade to state file for dashboard display."""
+        if self.mock_trading:
+            state = self._get_wallet_state(swap.wallet)
+            trades = state.setdefault('trades_history', [])
+            trades.append({
+                'type': trade_type,
+                'token': swap.token_mint[:8],
+                'full_mint': swap.token_mint,
+                'sol': trade_sol,
+                'signature': signature,
+                'timestamp': datetime.now().isoformat()
+            })
+            self._save_wallet_state(swap.wallet)
