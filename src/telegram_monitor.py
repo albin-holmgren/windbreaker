@@ -5,12 +5,15 @@ Streams messages in real-time and extracts potential token signals.
 
 import asyncio
 import re
+import base64
+import os
 from typing import Optional, Callable, List, Set
 from datetime import datetime
 import structlog
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, Chat, User
+from telethon.sessions import StringSession
 
 logger = structlog.get_logger(__name__)
 
@@ -58,17 +61,26 @@ class TelegramUserMonitor:
         """Start the Telegram client and begin monitoring."""
         logger.info("starting_telegram_monitor", session=self.session_name)
         
+        # Check for session string in environment (for Railway deployment)
+        session_string = os.environ.get("TELEGRAM_SESSION_STRING")
+        if session_string:
+            logger.info("using_session_from_env")
+            session = StringSession(session_string)
+        else:
+            logger.info("using_session_file", file=self.session_name)
+            session = self.session_name
+        
         self.client = TelegramClient(
-            self.session_name,
+            session,
             self.api_id,
             self.api_hash
         )
         
-        await self.client.start(phone=self.phone)
+        await self.client.start(phone=self.phone if not session_string else None)
         
         if not await self.client.is_user_authorized():
             logger.error("telegram_not_authorized")
-            raise ValueError("Telegram login failed - check phone number and code")
+            raise ValueError("Telegram login failed - check phone number and code, or ensure TELEGRAM_SESSION_STRING is valid")
         
         me = await self.client.get_me()
         logger.info("telegram_logged_in", user=me.username or me.phone)
