@@ -320,8 +320,7 @@ class TieredPositionManager:
             
             signature = await self.rpc.send_transaction(
                 signed_tx,
-                skip_preflight=True,
-                max_retries=5
+                skip_preflight=True
             )
             
             # Save signature
