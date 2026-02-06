@@ -67,8 +67,14 @@ class TelegramUserMonitor:
             logger.info("using_session_from_env")
             session = StringSession(session_string)
         else:
-            logger.info("using_session_file", file=self.session_name)
-            session = self.session_name
+            # Check for session file in /data (Railway volume) first, then local
+            railway_session_path = f"/data/{self.session_name}.session"
+            if os.path.exists(railway_session_path):
+                logger.info("using_railway_session", path=railway_session_path)
+                session = railway_session_path.replace('.session', '')
+            else:
+                logger.info("using_local_session", file=self.session_name)
+                session = self.session_name
         
         self.client = TelegramClient(
             session,
