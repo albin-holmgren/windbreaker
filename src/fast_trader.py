@@ -137,37 +137,54 @@ class FastTrader:
         Calculate dynamic trade size based on available balance and market cap.
         
         Rules:
-        - Small market cap (< $100k): 50% of base amount (conservative)
-        - Medium market cap ($100k-$1M): Base amount
-        - Large market cap ($1M+): Up to max amount
-        - Never exceed max_position_percent of balance
-        - Never exceed max_trade_sol
+        - Small market cap (< $100k): HIGHER investment (better risk/reward)
+        - Medium market cap ($100k-$1M): Standard investment
+        - Large market cap ($1M+): Lower investment (safer)
+        - Minimum 0.05 SOL per trade (never go below this)
+        - If balance is low (< 0.2 SOL), allow up to 50% of balance per trade
+        - Otherwise max 25% of balance per position
         """
-        base_amount = self.trade_amount_sol
+        base_amount = self.trade_amount_sol  # 0.05 SOL
         
         # Start with base amount
         trade_amount = base_amount
         
-        # Adjust based on market cap if available
+        # Adjust based on market cap (inverse relationship - more for small caps)
         if market_cap:
-            if market_cap < 100_000:  # <$100k
-                trade_amount = base_amount * 0.5  # 50% of base
+            if market_cap < 100_000:  # <$100k - HIGH CONVICTION
+                trade_amount = base_amount * 1.5  # 150% of base (0.075 SOL)
             elif market_cap < 1_000_000:  # $100k-$1M
-                trade_amount = base_amount * 0.75  # 75% of base
+                trade_amount = base_amount * 1.0  # 100% of base (0.05 SOL)
             elif market_cap < 10_000_000:  # $1M-$10M
-                trade_amount = base_amount  # Base amount
+                trade_amount = base_amount * 0.75  # 75% of base (0.0375 SOL)
             else:  # $10M+
-                trade_amount = base_amount * 1.5  # 150% of base
+                trade_amount = base_amount * 0.5  # 50% of base (0.025 SOL)
         
-        # Cap at max percentage of available balance
-        max_by_balance = available_sol * self.max_position_percent
+        # Dynamic position limit based on balance
+        # If balance is low (< 0.2 SOL), allow up to 50% per trade to ensure trades happen
+        # Otherwise cap at 25% of balance
+        if available_sol < 0.2:
+            max_by_balance = available_sol * 0.50  # 50% of balance when low
+        else:
+            max_by_balance = available_sol * self.max_position_percent  # 25% normally
+        
         trade_amount = min(trade_amount, max_by_balance)
         
-        # Hard cap at max_trade_sol
+        # Hard cap at max_trade_sol (0.10 SOL)
         trade_amount = min(trade_amount, self.max_trade_sol)
         
-        # Ensure minimum
-        trade_amount = max(trade_amount, self.min_trade_sol)
+        # ENSURE MINIMUM: Never go below 0.05 SOL
+        # If we can't meet minimum, still trade with what we have (up to 80% of balance)
+        if trade_amount < self.trade_amount_sol:
+            if available_sol >= self.trade_amount_sol:
+                trade_amount = self.trade_amount_sol  # Use minimum if we can afford it
+            else:
+                # If balance is really low, use up to 80% of what's available
+                trade_amount = min(available_sol * 0.80, self.trade_amount_sol)
+        
+        # Final floor: ensure we always trade at least something if balance > 0.01
+        if trade_amount < 0.01 and available_sol > 0.01:
+            trade_amount = min(available_sol * 0.80, self.trade_amount_sol)
         
         return round(trade_amount, 4)
     
