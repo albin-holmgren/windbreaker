@@ -148,7 +148,11 @@ class FastTrader:
         """Execute buy via pump.fun API."""
         try:
             import base64
+            import os
             from solders.transaction import VersionedTransaction
+            
+            # Get API key from environment
+            api_key = os.getenv("PUMPFUN_API_KEY", "")
             
             # Build payload
             payload = {
@@ -162,9 +166,15 @@ class FastTrader:
                 "pool": "auto"
             }
             
+            # Build headers with API key if available
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            
             async with self.session.post(
                 PUMPFUN_API,
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status != 200:
@@ -183,8 +193,7 @@ class FastTrader:
             
             signature = await self.rpc.send_transaction(
                 signed_tx,
-                skip_preflight=True,  # Skip preflight for speed
-                max_retries=3
+                skip_preflight=True  # Skip preflight for speed
             )
             
             # Quick confirmation check
