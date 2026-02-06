@@ -6,6 +6,7 @@ Streams messages in real-time and extracts potential token signals.
 import asyncio
 import re
 import base64
+import gzip
 import os
 from typing import Optional, Callable, List, Set
 from datetime import datetime
@@ -61,14 +62,28 @@ class TelegramUserMonitor:
         """Start the Telegram client and begin monitoring."""
         logger.info("starting_telegram_monitor", session=self.session_name)
         
-        # Check for session string in environment (for Railway deployment)
+        # Check for compressed session in environment (Railway deployment)
+        session_gz_b64 = os.environ.get("TELEGRAM_SESSION_GZ")
+        railway_session_path = f"/data/{self.session_name}.session"
+        
+        if session_gz_b64 and not os.path.exists(railway_session_path):
+            try:
+                logger.info("decompressing_session_from_env")
+                session_bytes = gzip.decompress(base64.b64decode(session_gz_b64))
+                os.makedirs("/data", exist_ok=True)
+                with open(railway_session_path, "wb") as f:
+                    f.write(session_bytes)
+                logger.info("session_saved", path=railway_session_path, size=len(session_bytes))
+            except Exception as e:
+                logger.error("failed_to_decompress_session", error=str(e))
+        
+        # Check for session string in environment
         session_string = os.environ.get("TELEGRAM_SESSION_STRING")
         if session_string:
             logger.info("using_session_from_env")
             session = StringSession(session_string)
         else:
             # Check for session file in /data (Railway volume) first, then local
-            railway_session_path = f"/data/{self.session_name}.session"
             if os.path.exists(railway_session_path):
                 logger.info("using_railway_session", path=railway_session_path)
                 session = railway_session_path.replace('.session', '')
