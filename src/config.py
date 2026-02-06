@@ -209,7 +209,7 @@ def load_config(env_file: str = '.env') -> Config:
         
         # AI Gateway (NEW)
         ai_gateway_key=os.getenv('AI_GATEWAY_KEY', ''),
-        ai_model=os.getenv('AI_MODEL', 'openai/gpt-4o-mini'),
+        ai_model=os.getenv('AI_MODEL', 'moonshotai/kimi-k2.5'),
         ai_timeout_ms=int(os.getenv('AI_TIMEOUT_MS', '500')),
         
         # Fast Trading (NEW)
