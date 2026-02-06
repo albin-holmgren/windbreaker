@@ -1,0 +1,182 @@
+"""
+Telegram User Monitor - Monitors all Telegram groups using Telethon.
+Streams messages in real-time and extracts potential token signals.
+"""
+
+import asyncio
+import re
+from typing import Optional, Callable, List, Set
+from datetime import datetime
+import structlog
+
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel, Chat, User
+
+logger = structlog.get_logger(__name__)
+
+# Regex for Solana addresses (base58, 32-44 chars)
+SOLANA_ADDRESS_PATTERN = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
+
+# Keywords that often accompany token calls
+CRYPTO_KEYWORDS = [
+    'buy', 'gem', 'moon', 'pump', '100x', '1000x', 'ath', 'breakout',
+    'early', 'alpha', 'ca', 'contract', 'address', 'mint', 'token',
+    'shill', 'ape', 'degens', 'degen', 'wagmi', 'fomo', 'hodl',
+    'dev', 'based', 'safu', 'dyor', ' NFA', ' NFA,', 'NFA ',
+    'signal', 'call', 'entry', 'target', 'stop', 'profit',
+    'new', 'fair', 'launch', 'presale', 'ido', 'ico'
+]
+
+
+class TelegramUserMonitor:
+    """Monitor all Telegram groups using a user account via Telethon."""
+    
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        phone: str,
+        session_name: str = "telegram_trader_session",
+        on_message: Optional[Callable[[str, str, str], None]] = None,
+    ):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.phone = phone
+        self.session_name = session_name
+        self.on_message = on_message
+        
+        self.client: Optional[TelegramClient] = None
+        self.monitored_groups: Set[int] = set()
+        self.running = False
+        self.startup_time: Optional[datetime] = None
+        
+        # Stats
+        self.messages_received = 0
+        self.potential_signals = 0
+        
+    async def start(self) -> None:
+        """Start the Telegram client and begin monitoring."""
+        logger.info("starting_telegram_monitor", session=self.session_name)
+        
+        self.client = TelegramClient(
+            self.session_name,
+            self.api_id,
+            self.api_hash
+        )
+        
+        await self.client.start(phone=self.phone)
+        
+        if not await self.client.is_user_authorized():
+            logger.error("telegram_not_authorized")
+            raise ValueError("Telegram login failed - check phone number and code")
+        
+        me = await self.client.get_me()
+        logger.info("telegram_logged_in", user=me.username or me.phone)
+        
+        # Discover all groups/channels
+        await self._discover_groups()
+        
+        # Set startup time AFTER discovery (skip any burst from initial connection)
+        self.startup_time = datetime.now()
+        logger.info("startup_time_set", wait_seconds=3, message="Skipping messages for 3 seconds to avoid burst")
+        await asyncio.sleep(3)
+        
+        # Set up message handler
+        @self.client.on(events.NewMessage())
+        async def handle_new_message(event):
+            await self._process_message(event)
+        
+        self.running = True
+        logger.info("telegram_monitor_started", groups=len(self.monitored_groups))
+        
+        # Keep running
+        while self.running:
+            await asyncio.sleep(1)
+    
+    async def _discover_groups(self) -> None:
+        """Discover all groups and channels the user is in."""
+        logger.info("discovering_groups")
+        
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            
+            # Only monitor groups and channels (not private chats)
+            if isinstance(entity, (Channel, Chat)):
+                self.monitored_groups.add(dialog.id)
+                group_type = "channel" if isinstance(entity, Channel) and entity.broadcast else "group"
+                logger.debug("found_group", 
+                           id=dialog.id, 
+                           name=dialog.name,
+                           type=group_type)
+        
+        logger.info("groups_discovered", count=len(self.monitored_groups))
+    
+    async def _process_message(self, event) -> None:
+        """Process a new message."""
+        try:
+            # Skip if not from monitored group
+            if event.chat_id not in self.monitored_groups:
+                return
+            
+            # Skip if no message text
+            if not event.message or not event.message.text:
+                return
+            
+            # Skip messages from before startup (safety check)
+            if event.message.date and self.startup_time:
+                from datetime import timezone
+                msg_time = event.message.date.replace(tzinfo=timezone.utc) if not event.message.date.tzinfo else event.message.date
+                startup = self.startup_time.replace(tzinfo=timezone.utc) if not self.startup_time.tzinfo else self.startup_time
+                if msg_time < startup:
+                    logger.debug("skipping_old_message", msg_time=str(msg_time), startup=str(startup))
+                    return
+            
+            self.messages_received += 1
+            
+            text = event.message.text
+            chat_name = "unknown"
+            
+            try:
+                chat = await event.get_chat()
+                chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', 'unknown')
+            except Exception:
+                pass
+            
+            # Check if message contains potential crypto signal
+            has_address = bool(SOLANA_ADDRESS_PATTERN.search(text))
+            has_keywords = any(kw.lower() in text.lower() for kw in CRYPTO_KEYWORDS)
+            
+            if has_address and has_keywords:
+                self.potential_signals += 1
+                
+                logger.info("potential_signal_detected",
+                           chat=chat_name,
+                           has_address=has_address,
+                           has_keywords=has_keywords,
+                           text_preview=text[:100])
+                
+                # Extract all potential addresses
+                addresses = SOLANA_ADDRESS_PATTERN.findall(text)
+                
+                if self.on_message and addresses:
+                    # Send to handler with first address
+                    await self.on_message(text, addresses[0], chat_name)
+            
+        except Exception as e:
+            logger.error("message_processing_error", error=str(e))
+    
+    async def stop(self) -> None:
+        """Stop monitoring and disconnect."""
+        logger.info("stopping_telegram_monitor")
+        self.running = False
+        
+        if self.client:
+            await self.client.disconnect()
+    
+    def get_stats(self) -> dict:
+        """Get monitoring stats."""
+        return {
+            "messages_received": self.messages_received,
+            "potential_signals": self.potential_signals,
+            "monitored_groups": len(self.monitored_groups)
+        }

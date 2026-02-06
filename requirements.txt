@@ -37,3 +37,6 @@ itsdangerous==2.1.2
 
 # Database (PostgreSQL)
 asyncpg==0.29.0
+
+# Telegram (user account monitoring)
+telethon==1.33.1

@@ -1,0 +1,8 @@
+[build]
+  command = "pip install -r requirements.txt"
+  functions = "src"
+
+[[redirects]]
+  from = "/*"
+  to = "/"
+  status = 200

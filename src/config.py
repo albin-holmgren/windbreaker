@@ -75,6 +75,30 @@ class Config:
     rug_abandon_sol: float  # If value < this, abandon position (don't sell, costs more than worth)
     position_check_interval_sec: float  # How often to check positions for stop-loss/take-profit
     
+    # Telegram AI Trading (NEW)
+    telegram_enabled: bool  # Enable Telegram signal monitoring
+    telegram_api_id: int  # Telegram API ID from my.telegram.org
+    telegram_api_hash: str  # Telegram API hash
+    telegram_phone: str  # Phone number for Telegram login
+    telegram_session_name: str  # Session file name
+    
+    # AI Gateway (NEW)
+    ai_gateway_key: str  # Vercel AI Gateway API key
+    ai_model: str  # AI model to use
+    ai_timeout_ms: int  # AI request timeout
+    
+    # Fast Trading (NEW)
+    trade_amount_sol: float  # Fixed SOL amount per trade (0.05)
+    exit_fee_reserve_per_position: float  # SOL to reserve per position for exit fees
+    min_balance_buffer: float  # Minimum SOL to keep in wallet
+    
+    # Tiered Selling (NEW)
+    tier1_sell_percent: float  # 0.50 for 50%
+    tier1_multiplier: float  # 2.0 for 2x
+    tier2_sell_percent: float  # 0.20 for 20%
+    tier2_multiplier: float  # 5.0 for 5x
+    tier3_trailing_stop: float  # 0.45 for 45% trailing stop
+    
     # Ops
     log_level: str
     
@@ -95,7 +119,8 @@ class Config:
         return self.slippage_bps / 100.0
     
     @property
-    def telegram_enabled(self) -> bool:
+    def telegram_alerts_enabled(self) -> bool:
+        """Legacy alerts via bot token (not user monitoring)."""
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
 
@@ -124,8 +149,8 @@ def load_config(env_file: str = '.env') -> Config:
         # Trading
         min_profit_pct=float(os.getenv('MIN_PROFIT_PCT', '0.5')),
         trade_amount_usd=float(os.getenv('TRADE_AMOUNT_USD', '10')),
-        trade_balance_pct=float(os.getenv('TRADE_BALANCE_PCT', '80')),  # 80% of balance
-        fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.01')),  # Reserve 0.01 SOL base for rent
+        trade_balance_pct=float(os.getenv('TRADE_BALANCE_PCT', '80')),
+        fee_reserve_sol=float(os.getenv('FEE_RESERVE_SOL', '0.01')),
         slippage_bps=int(os.getenv('SLIPPAGE_BPS', '50')),
         slippage_steps_bps=os.getenv('SLIPPAGE_STEPS_BPS', '50,100,200'),
         jupiter_priority_fee_lamports=int(os.getenv('JUPITER_PRIORITY_FEE_LAMPORTS', '500000')),
@@ -143,37 +168,61 @@ def load_config(env_file: str = '.env') -> Config:
         # Copy Trading
         copy_enabled=os.getenv('COPY_ENABLED', 'false').lower() == 'true',
         copy_wallets=os.getenv('COPY_WALLETS', ''),
-        copy_balance_pct=float(os.getenv('COPY_BALANCE_PCT', '50')),  # 50% of balance per copy
-        copy_max_sol=float(os.getenv('COPY_MAX_SOL', '0.5')),  # Max 0.5 SOL per trade
-        copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),  # Only copy trades > 0.05 SOL
-        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '300')),  # Poll every 300ms (WebSocket is primary, this is fallback)
+        copy_balance_pct=float(os.getenv('COPY_BALANCE_PCT', '50')),
+        copy_max_sol=float(os.getenv('COPY_MAX_SOL', '0.5')),
+        copy_min_sol=float(os.getenv('COPY_MIN_SOL', '0.05')),
+        copy_poll_interval_ms=int(os.getenv('COPY_POLL_INTERVAL_MS', '300')),
         copy_sells=os.getenv('COPY_SELLS', 'true').lower() == 'true',
-        copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',  # Match trader's %
-        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.02')),  # 0.02 SOL per position for exit fees
-        min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '5000')),  # Min 5k USD market cap (lowered to match Cupsey)
-        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '0')),  # Disabled - Cupsey trades fresh tokens
-        mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),  # Sell if mcap drops below (0 = disabled)
-        min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '2000')),  # Min 2k USD liquidity (lowered to match Cupsey)
-        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '0')),  # Disabled - early meme coins have low volume
-        max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),  # 0 = disabled - trust trader's judgment on momentum
-        min_txns_1h=int(os.getenv('MIN_TXNS_1H', '0')),  # Disabled - early tokens have few txns
-        max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),  # Top 10 holders max 30%
-        max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),  # Dev holdings max 30%
-        min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '0')),  # Disabled - early tokens have few holders
-        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',  # Trust Cupsey on pump.fun tokens (skip filters)
-        skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',  # Skip tokens created by tracked wallet
+        copy_proportional=os.getenv('COPY_PROPORTIONAL', 'true').lower() == 'true',
+        exit_fee_reserve=float(os.getenv('EXIT_FEE_RESERVE', '0.02')),
+        min_market_cap_usd=float(os.getenv('MIN_MARKET_CAP_USD', '5000')),
+        min_token_age_minutes=int(os.getenv('MIN_TOKEN_AGE_MINUTES', '0')),
+        mcap_stop_loss_usd=float(os.getenv('MCAP_STOP_LOSS_USD', '0')),
+        min_liquidity_usd=float(os.getenv('MIN_LIQUIDITY_USD', '2000')),
+        min_volume_24h_usd=float(os.getenv('MIN_VOLUME_24H_USD', '0')),
+        max_price_change_1h_pct=float(os.getenv('MAX_PRICE_CHANGE_1H_PCT', '0')),
+        min_txns_1h=int(os.getenv('MIN_TXNS_1H', '0')),
+        max_top10_holders_pct=float(os.getenv('MAX_TOP10_HOLDERS_PCT', '30')),
+        max_dev_holdings_pct=float(os.getenv('MAX_DEV_HOLDINGS_PCT', '30')),
+        min_holders_count=int(os.getenv('MIN_HOLDERS_COUNT', '0')),
+        trust_trader_pumpfun=os.getenv('TRUST_TRADER_PUMPFUN', 'true').lower() == 'true',
+        skip_creator_tokens=os.getenv('SKIP_CREATOR_TOKENS', 'true').lower() == 'true',
         mock_trading=os.getenv('MOCK_TRADING', 'false').lower() == 'true',
         mock_balance_sol=float(os.getenv('MOCK_BALANCE_SOL', '1')),
         sync_mock_with_real=os.getenv('SYNC_MOCK_WITH_REAL', 'false').lower() == 'true',
         
         # Position Management
-        max_positions=int(os.getenv('MAX_POSITIONS', '3')),  # Max 3 positions at once
-        take_profit_pct=float(os.getenv('TAKE_PROFIT_PCT', '100')),  # Only for safety (100% = 2x)
-        stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', '-35')),  # Exit if down 35%
-        time_limit_minutes=float(os.getenv('TIME_LIMIT_MINUTES', '0')),  # 0 = disabled (follow trader)
-        trailing_stop_pct=float(os.getenv('TRAILING_STOP_PCT', '0')),  # 0 = disabled
-        rug_abandon_sol=float(os.getenv('RUG_ABANDON_SOL', '0.005')),  # If worth < 0.005 SOL, abandon (don't sell)
-        position_check_interval_sec=float(os.getenv('POSITION_CHECK_INTERVAL_SEC', '5')),  # Check every 5s (was 60s!)
+        max_positions=int(os.getenv('MAX_POSITIONS', '3')),
+        take_profit_pct=float(os.getenv('TAKE_PROFIT_PCT', '100')),
+        stop_loss_pct=float(os.getenv('STOP_LOSS_PCT', '-35')),
+        time_limit_minutes=float(os.getenv('TIME_LIMIT_MINUTES', '0')),
+        trailing_stop_pct=float(os.getenv('TRAILING_STOP_PCT', '0')),
+        rug_abandon_sol=float(os.getenv('RUG_ABANDON_SOL', '0.005')),
+        position_check_interval_sec=float(os.getenv('POSITION_CHECK_INTERVAL_SEC', '5')),
+        
+        # Telegram AI Trading (NEW)
+        telegram_enabled=os.getenv('TELEGRAM_ENABLED', 'true').lower() == 'true',
+        telegram_api_id=int(os.getenv('TELEGRAM_API_ID', '0')),
+        telegram_api_hash=os.getenv('TELEGRAM_API_HASH', ''),
+        telegram_phone=os.getenv('TELEGRAM_PHONE', ''),
+        telegram_session_name=os.getenv('TELEGRAM_SESSION_NAME', 'telegram_trader_session'),
+        
+        # AI Gateway (NEW)
+        ai_gateway_key=os.getenv('AI_GATEWAY_KEY', ''),
+        ai_model=os.getenv('AI_MODEL', 'openai/gpt-4o-mini'),
+        ai_timeout_ms=int(os.getenv('AI_TIMEOUT_MS', '500')),
+        
+        # Fast Trading (NEW)
+        trade_amount_sol=float(os.getenv('TRADE_AMOUNT_SOL', '0.05')),
+        exit_fee_reserve_per_position=float(os.getenv('EXIT_FEE_RESERVE_PER_POSITION', '0.02')),
+        min_balance_buffer=float(os.getenv('MIN_BALANCE_BUFFER', '0.01')),
+        
+        # Tiered Selling (NEW)
+        tier1_sell_percent=float(os.getenv('TIER1_SELL_PERCENT', '0.50')),
+        tier1_multiplier=float(os.getenv('TIER1_MULTIPLIER', '2.0')),
+        tier2_sell_percent=float(os.getenv('TIER2_SELL_PERCENT', '0.20')),
+        tier2_multiplier=float(os.getenv('TIER2_MULTIPLIER', '5.0')),
+        tier3_trailing_stop=float(os.getenv('TIER3_TRAILING_STOP', '0.45')),
         
         # Ops
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
