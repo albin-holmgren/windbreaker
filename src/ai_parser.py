@@ -40,7 +40,7 @@ class AIGatewayParser:
     def __init__(
         self,
         api_key: str,
-        model: str = "openai/gpt-4o-mini",  # Fast and cheap
+        model: str = "moonshotai/kimi-k2.5",
         timeout_ms: int = 500,
         confidence_threshold: float = 0.0,  # Trust everything
     ):
