@@ -57,3 +57,28 @@ Thumbs.db
 private_key*
 wallet_key*
 .env.telegram
+.env.*
+!.env.example
+
+# Session files - contain auth tokens
+*.session
+*.session.gz.b64
+session_*.txt
+extract_session.py
+setup_railway_session.py
+
+# Debug/utility scripts with hardcoded keys
+check_positions.py
+close_positions.py
+close_via_jupiter.py
+test_trade.py
+check_transactions.py
+check_wallet_detailed.py
+find_big_losses.py
+find_drain_transactions.py
+check_specific_tx.py
+check_user_tx.py
+check_tokens.py
+analyze_drain.py
+verify_drain.py
+debug_balance.py
