@@ -145,14 +145,10 @@ class FastTrader:
             return False
     
     async def _execute_pumpfun_buy(self, token_mint: str) -> Optional[str]:
-        """Execute buy via pump.fun API."""
+        """Execute buy via pump.fun API - with 400 error fallback like copy trader."""
         try:
             import base64
-            import os
             from solders.transaction import VersionedTransaction
-            
-            # Get API key from environment
-            api_key = os.getenv("PUMPFUN_API_KEY", "")
             
             # Build payload
             payload = {
@@ -166,26 +162,46 @@ class FastTrader:
                 "pool": "auto"
             }
             
-            # Build headers with API key if available
-            headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            tx_bytes = None
+            status_code = None
+            error_text = None
             
+            # Try JSON first (like copy trader)
             async with self.session.post(
                 PUMPFUN_API,
                 json=payload,
-                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                if resp.status != 200:
-                    error = await resp.text()
-                    logger.warning("pumpfun_buy_failed",
-                                 token=token_mint[:8],
-                                 status=resp.status,
-                                 error=error[:100])
-                    return None
-                
-                tx_bytes = await resp.read()
+                status_code = resp.status
+                if resp.status == 200:
+                    tx_bytes = await resp.read()
+                else:
+                    error_text = await resp.text()
+            
+            # CRITICAL: If 400 error, retry with form data (copy trader pattern)
+            if tx_bytes is None and status_code == 400:
+                logger.debug("pumpfun_400_retrying_with_form", token=token_mint[:8])
+                try:
+                    async with self.session.post(
+                        PUMPFUN_API,
+                        data=payload,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp2:
+                        if resp2.status == 200:
+                            tx_bytes = await resp2.read()
+                            logger.info("pumpfun_form_retry_success", token=token_mint[:8])
+                        else:
+                            error_text2 = await resp2.text()
+                            error_text = f"{error_text} | form: {error_text2}"
+                except Exception as e:
+                    error_text = f"{error_text} | form_exception: {e}"
+            
+            if tx_bytes is None:
+                logger.warning("pumpfun_buy_failed",
+                             token=token_mint[:8],
+                             status=status_code,
+                             error=error_text[:100] if error_text else "unknown")
+                return None
             
             # Sign and send
             tx = VersionedTransaction.from_bytes(tx_bytes)
