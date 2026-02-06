@@ -28,14 +28,16 @@ class FastSignalManager:
     
     def __init__(
         self,
-        dedup_minutes: int = 5,
+        dedup_minutes: int = 1440,  # 24 hours to prevent duplicate buys
         on_signal: Optional[Callable[[TradingSignal], None]] = None,
     ):
         self.dedup_minutes = dedup_minutes
         self.on_signal = on_signal
         
         # Deduplication tracking: token -> last seen timestamp
+        # Also track successfully bought tokens to prevent re-buying
         self._recent_signals: Dict[str, datetime] = {}
+        self._bought_tokens: Dict[str, datetime] = {}  # Track bought tokens
         
         # Active signals queue
         self._signals: Dict[str, TradingSignal] = {}
@@ -54,6 +56,16 @@ class FastSignalManager:
         now = datetime.utcnow()
         
         async with self._lock:
+            # Check if we already bought this token (24 hour window)
+            if token_address in self._bought_tokens:
+                bought_time = self._bought_tokens[token_address]
+                if now - bought_time < timedelta(hours=24):
+                    logger.info("token_already_bought_skipping",
+                               token=token_address[:8],
+                               hours_ago=(now - bought_time).total_seconds() / 3600)
+                    self.deduplicated += 1
+                    return False
+            
             # Check deduplication
             if token_address in self._recent_signals:
                 last_seen = self._recent_signals[token_address]
@@ -89,6 +101,11 @@ class FastSignalManager:
             
             return True
     
+    def mark_bought(self, token_address: str) -> None:
+        """Mark a token as successfully bought to prevent re-buying."""
+        self._bought_tokens[token_address] = datetime.utcnow()
+        logger.info("token_marked_as_bought", token=token_address[:8])
+    
     def mark_processed(self, token_address: str, executed: bool = True) -> None:
         """Mark a signal as processed."""
         if token_address in self._signals:
@@ -123,8 +140,17 @@ class FastSignalManager:
                     if token in self._signals:
                         del self._signals[token]
                 
-                if old_tokens:
-                    logger.debug("cleaned_old_signals", count=len(old_tokens))
+                # Also clean up old bought tokens (48 hours)
+                bought_cutoff = now - timedelta(hours=48)
+                old_bought = [
+                    token for token, ts in self._bought_tokens.items()
+                    if ts < bought_cutoff
+                ]
+                for token in old_bought:
+                    del self._bought_tokens[token]
+                
+                if old_tokens or old_bought:
+                    logger.debug("cleaned_old_signals", signals=len(old_tokens), bought=len(old_bought))
     
     def get_stats(self) -> dict:
         """Get signal manager stats."""
@@ -132,5 +158,6 @@ class FastSignalManager:
             "total_signals": self.total_signals,
             "deduplicated": self.deduplicated,
             "processed": self.processed,
-            "active_signals": len(self._signals)
+            "active_signals": len(self._signals),
+            "bought_tokens_24h": len(self._bought_tokens)
         }

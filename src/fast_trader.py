@@ -50,6 +50,14 @@ class FastTrader:
         # Track open positions for balance calculation
         self.open_positions: Dict[str, dict] = {}  # token -> position info
         
+        # Track recently bought tokens to prevent re-buying
+        self._recently_bought: Dict[str, datetime] = {}
+        
+        # Dynamic sizing config
+        self.min_trade_sol = 0.01  # Minimum 0.01 SOL per trade
+        self.max_trade_sol = trade_amount_sol * 2  # Max 2x the base amount
+        self.max_position_percent = 0.25  # Max 25% of balance in one position
+        
         # Stats
         self.buys_attempted = 0
         self.buys_successful = 0
@@ -98,6 +106,71 @@ class FastTrader:
             logger.error("balance_check_error", error=str(e))
             return False, 0.0
     
+    async def _get_token_market_cap(self, token_mint: str) -> Optional[float]:
+        """Get token market cap from DexScreener or similar."""
+        try:
+            # Try DexScreener API for market cap
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        # Get highest liquidity pair
+                        best_pair = max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0)
+                        market_cap = best_pair.get("marketCap")
+                        if market_cap:
+                            return float(market_cap)
+                        
+                        # Fallback: estimate from price and supply
+                        price_usd = best_pair.get("priceUsd")
+                        if price_usd:
+                            # Assume typical pump.fun supply ~1B tokens
+                            return float(price_usd) * 1_000_000_000
+            
+            return None
+        except Exception:
+            return None
+    
+    def _calculate_dynamic_trade_size(self, available_sol: float, market_cap: Optional[float] = None) -> float:
+        """
+        Calculate dynamic trade size based on available balance and market cap.
+        
+        Rules:
+        - Small market cap (< $100k): 50% of base amount (conservative)
+        - Medium market cap ($100k-$1M): Base amount
+        - Large market cap ($1M+): Up to max amount
+        - Never exceed max_position_percent of balance
+        - Never exceed max_trade_sol
+        """
+        base_amount = self.trade_amount_sol
+        
+        # Start with base amount
+        trade_amount = base_amount
+        
+        # Adjust based on market cap if available
+        if market_cap:
+            if market_cap < 100_000:  # <$100k
+                trade_amount = base_amount * 0.5  # 50% of base
+            elif market_cap < 1_000_000:  # $100k-$1M
+                trade_amount = base_amount * 0.75  # 75% of base
+            elif market_cap < 10_000_000:  # $1M-$10M
+                trade_amount = base_amount  # Base amount
+            else:  # $10M+
+                trade_amount = base_amount * 1.5  # 150% of base
+        
+        # Cap at max percentage of available balance
+        max_by_balance = available_sol * self.max_position_percent
+        trade_amount = min(trade_amount, max_by_balance)
+        
+        # Hard cap at max_trade_sol
+        trade_amount = min(trade_amount, self.max_trade_sol)
+        
+        # Ensure minimum
+        trade_amount = max(trade_amount, self.min_trade_sol)
+        
+        return round(trade_amount, 4)
+    
     async def execute_buy(self, signal: TradingSignal) -> bool:
         """
         Execute a buy for a signal.
@@ -107,31 +180,51 @@ class FastTrader:
         
         self.buys_attempted += 1
         
+        # Check if we already bought this token recently (duplicate prevention)
+        now = datetime.utcnow()
+        if token_address in self._recently_bought:
+            last_buy = self._recently_bought[token_address]
+            if (now - last_buy).total_seconds() < 86400:  # 24 hours
+                logger.info("skipping_duplicate_buy",
+                           token=token_address[:8],
+                           hours_ago=(now - last_buy).total_seconds() / 3600)
+                return False
+        
         # Check balance
         can_trade, available = await self.can_execute_trade()
         if not can_trade:
             return False
         
+        # Get market cap for dynamic sizing
+        market_cap = await self._get_token_market_cap(token_address)
+        
+        # Calculate dynamic trade amount
+        trade_amount = self._calculate_dynamic_trade_size(available, market_cap)
+        
         logger.info("executing_buy",
                    token=token_address[:8] + "...",
-                   amount=self.trade_amount_sol,
+                   amount=trade_amount,
+                   base_amount=self.trade_amount_sol,
+                   market_cap=f"${market_cap:,.0f}" if market_cap else "unknown",
                    available=available)
         
         try:
             # Try pump.fun first (fastest for new tokens)
-            result = await self._execute_pumpfun_buy(token_address)
+            result = await self._execute_pumpfun_buy(token_address, trade_amount)
             
             if result:
                 self.buys_successful += 1
-                self.total_sol_spent += self.trade_amount_sol
+                self.total_sol_spent += trade_amount
+                self._recently_bought[token_address] = datetime.utcnow()  # Track as bought
                 self.open_positions[token_address] = {
                     "entry_time": datetime.utcnow(),
                     "entry_price": None,  # Will be filled by position manager
-                    "amount_sol": self.trade_amount_sol,
+                    "amount_sol": trade_amount,
                     "source_chat": signal.source_chat,
                 }
                 logger.info("buy_success",
                            token=token_address[:8],
+                           amount=trade_amount,
                            signature=result[:16] if result else None)
                 return True
             else:
@@ -144,19 +237,19 @@ class FastTrader:
                         error=str(e))
             return False
     
-    async def _execute_pumpfun_buy(self, token_mint: str) -> Optional[str]:
+    async def _execute_pumpfun_buy(self, token_mint: str, trade_amount: float) -> Optional[str]:
         """Execute buy via pump.fun API - with 400 error fallback like copy trader."""
         try:
             import base64
             from solders.transaction import VersionedTransaction
             
-            # Build payload
+            # Build payload with dynamic amount
             payload = {
                 "publicKey": str(self.wallet.pubkey()),
                 "action": "buy",
                 "mint": token_mint,
                 "denominatedInSol": "true",
-                "amount": self.trade_amount_sol,
+                "amount": trade_amount,
                 "slippage": 15,  # 15% slippage for speed
                 "priorityFee": 0.001,  # High priority
                 "pool": "auto"
@@ -277,5 +370,9 @@ class FastTrader:
             "skipped_balance": self.skipped_insufficient_balance,
             "open_positions": len(self.open_positions),
             "total_sol_spent": f"{self.total_sol_spent:.4f}",
-            "success_rate": f"{(self.buys_successful / max(self.buys_attempted, 1) * 100):.1f}%"
+            "success_rate": f"{(self.buys_successful / max(self.buys_attempted, 1) * 100):.1f}%",
+            "dynamic_sizing": True,
+            "min_trade": self.min_trade_sol,
+            "max_trade": self.max_trade_sol,
+            "max_position_pct": f"{self.max_position_percent*100:.0f}%"
         }

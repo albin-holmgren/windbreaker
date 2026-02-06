@@ -56,3 +56,4 @@ Thumbs.db
 *.key
 private_key*
 wallet_key*
+.env.telegram
