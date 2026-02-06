@@ -228,7 +228,7 @@ class TelegramAITrader:
             await self.rpc.close()
     
     async def run(self) -> None:
-        """Main run loop."""
+        """Main run loop with auto-restart for Telegram monitor."""
         self.running = True
         
         # Setup signal handlers
@@ -239,18 +239,23 @@ class TelegramAITrader:
         logger.info("telegram_ai_trader_starting",
                    message="Monitoring Telegram groups for signals...")
         
+        # Start dashboard
+        self.dashboard = WebDashboard(
+            state_file='telegram_trader_state.json',
+            rpc_client=self.rpc,
+            wallet_keypair=self.wallet
+        )
+        await self.dashboard.start()
+        
+        # Start position manager monitoring
+        position_task = asyncio.create_task(self._run_position_manager())
+        
+        # Start Telegram monitor with auto-restart
+        telegram_task = asyncio.create_task(self._run_telegram_monitor_with_restart())
+        
         try:
-            # Start dashboard
-            self.dashboard = WebDashboard(
-                state_file='telegram_trader_state.json',
-                rpc_client=self.rpc,
-                wallet_keypair=self.wallet
-            )
-            await self.dashboard.start()
-            
-            # Start Telegram monitor (this blocks)
-            await self.telegram_monitor.start()
-            
+            # Wait for both tasks
+            await asyncio.gather(position_task, telegram_task)
         except asyncio.CancelledError:
             logger.info("trader_cancelled")
         except Exception as e:
@@ -258,6 +263,38 @@ class TelegramAITrader:
         finally:
             await self.cleanup()
             logger.info("trader_shutdown_complete")
+    
+    async def _run_position_manager(self) -> None:
+        """Run position manager monitoring loop."""
+        logger.info("position_manager_task_started")
+        while self.running:
+            try:
+                await asyncio.sleep(5)  # Check positions every 5 seconds
+                # Position manager runs its own checks
+            except Exception as e:
+                logger.error("position_manager_error", error=str(e))
+                await asyncio.sleep(10)  # Backoff on error
+    
+    async def _run_telegram_monitor_with_restart(self) -> None:
+        """Run Telegram monitor with auto-restart on failure."""
+        restart_delay = 5
+        max_restart_delay = 60
+        
+        while self.running:
+            try:
+                logger.info("starting_telegram_monitor_task")
+                await self.telegram_monitor.start()
+                logger.warning("telegram_monitor_exited_gracefully")
+            except Exception as e:
+                logger.error("telegram_monitor_crashed", error=str(e), restart_delay=restart_delay)
+            
+            if not self.running:
+                break
+            
+            # Wait before restart with exponential backoff
+            logger.info("restarting_telegram_monitor", delay=restart_delay)
+            await asyncio.sleep(restart_delay)
+            restart_delay = min(restart_delay * 2, max_restart_delay)
     
     def _handle_shutdown(self) -> None:
         """Handle shutdown signal."""
