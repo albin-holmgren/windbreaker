@@ -3236,6 +3236,10 @@ class CopyTrader:
                     final_status="success"
                 )
 
+                # Close empty token account after successful sell
+                if not is_buy:
+                    asyncio.create_task(self._close_empty_token_accounts(token_mint))
+
                 return CopyTradeResult(success=True, signature=signature, execution_details=exec_detail)
             
             # All pools failed
@@ -3316,12 +3320,85 @@ class CopyTrader:
 
             if result.success:
                 logger.info("jupiter_sell_success", token=token_mint[:8], signature=str(result.signature)[:16] if result.signature else None)
+                # Close empty token account to reclaim rent
+                asyncio.create_task(self._close_empty_token_accounts(token_mint))
             return result
             
         except Exception as e:
             logger.error("jupiter_sell_error", token=token_mint[:8], error=str(e))
             return CopyTradeResult(success=False, error=f"jupiter_error: {str(e)}")
-    
+
+    async def _close_empty_token_accounts(self, token_mint: str) -> None:
+        """Close empty token accounts for a given mint to reclaim rent SOL."""
+        try:
+            from solders.pubkey import Pubkey
+            from solders.instruction import Instruction, AccountMeta
+            from solders.transaction import Transaction
+            from solders.message import Message
+            from solders.hash import Hash
+
+            wallet_pubkey = self.wallet.pubkey()
+
+            token_programs = [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            ]
+
+            for program_id in token_programs:
+                result = await self.rpc._request(
+                    "getTokenAccountsByOwner",
+                    [
+                        str(wallet_pubkey),
+                        {"mint": token_mint},
+                        {"encoding": "jsonParsed", "commitment": "confirmed"}
+                    ]
+                )
+
+                if not result or "value" not in result:
+                    continue
+
+                for account in result["value"] or []:
+                    try:
+                        pubkey_str = account.get("pubkey", "")
+                        info = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        amount = int((info.get("tokenAmount") or {}).get("amount", 0))
+                        owner = info.get("owner", "")
+
+                        if amount != 0 or owner != str(wallet_pubkey):
+                            continue
+
+                        account_pubkey = Pubkey.from_string(pubkey_str)
+                        token_program_pubkey = Pubkey.from_string(program_id)
+
+                        close_ix = Instruction(
+                            program_id=token_program_pubkey,
+                            accounts=[
+                                AccountMeta(pubkey=account_pubkey, is_signer=False, is_writable=True),
+                                AccountMeta(pubkey=wallet_pubkey, is_signer=False, is_writable=True),
+                                AccountMeta(pubkey=wallet_pubkey, is_signer=True, is_writable=False),
+                            ],
+                            data=bytes([9]),  # CloseAccount instruction index
+                        )
+
+                        blockhash_str = await self.rpc.get_latest_blockhash()
+                        blockhash = Hash.from_string(blockhash_str)
+                        msg = Message.new_with_blockhash([close_ix], wallet_pubkey, blockhash)
+                        tx = Transaction.new_unsigned(msg)
+                        tx.sign([self.wallet], blockhash)
+
+                        sig = await self.rpc.send_transaction(tx, skip_preflight=True)
+                        logger.info(
+                            "token_account_closed",
+                            token=token_mint[:8],
+                            account=pubkey_str[:12],
+                            signature=sig[:16] if sig else "none",
+                        )
+                    except Exception as e:
+                        logger.debug("close_account_error", token=token_mint[:8], error=str(e))
+
+        except Exception as e:
+            logger.debug("close_empty_accounts_error", token=token_mint[:8], error=str(e))
+
     def _simulate_mock_buy(self, swap: 'ParsedSwap', trade_sol: float, *, correlation_id: Optional[str] = None) -> 'CopyTradeResult':
         """Simulate a buy trade without executing on-chain."""
         # Get wallet-specific state
