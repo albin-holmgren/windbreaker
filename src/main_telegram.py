@@ -110,7 +110,8 @@ class TelegramAITrader:
         self.ai_parser = AIGatewayParser(
             api_key=self.config.ai_gateway_key,
             model=self.config.ai_model,
-            timeout_ms=self.config.ai_timeout_ms
+            timeout_ms=self.config.ai_timeout_ms,
+            gateway_url=self.config.ai_gateway_url
         )
         await self.ai_parser.start()
         logger.info("ai_parser_initialized", model=self.config.ai_model)

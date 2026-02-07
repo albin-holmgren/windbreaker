@@ -1,6 +1,7 @@
 """
-Vercel AI Gateway Parser - Fast token extraction from messages.
-Uses Vercel AI Gateway for OpenAI/Anthropic models with low latency.
+AI Gateway Parser - Fast token extraction from messages.
+Uses OpenRouter (or any OpenAI-compatible API) for AI-powered token extraction.
+Falls back to regex if AI fails.
 """
 
 import asyncio
@@ -11,8 +12,8 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Vercel AI Gateway endpoint
-VERCEL_AI_GATEWAY_URL = "https://ai-gateway.vercel.com/v1/chat/completions"
+# Default AI endpoint (OpenRouter - always available, free models)
+DEFAULT_AI_GATEWAY_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # System prompt for token extraction
 TOKEN_EXTRACTION_PROMPT = """You are a crypto trading signal parser. Extract Solana token addresses from Telegram messages.
@@ -35,19 +36,21 @@ Extract the address from this message:"""
 
 
 class AIGatewayParser:
-    """Parse Telegram messages using Vercel AI Gateway."""
+    """Parse Telegram messages using OpenRouter or any OpenAI-compatible API."""
     
     def __init__(
         self,
         api_key: str,
-        model: str = "moonshotai/kimi-k2.5",
-        timeout_ms: int = 500,
+        model: str = "google/gemini-2.0-flash-001",
+        timeout_ms: int = 3000,
         confidence_threshold: float = 0.0,  # Trust everything
+        gateway_url: str = "",
     ):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout_ms / 1000.0  # Convert to seconds
         self.confidence_threshold = confidence_threshold
+        self.gateway_url = gateway_url or DEFAULT_AI_GATEWAY_URL
         
         self.session: Optional[aiohttp.ClientSession] = None
         
@@ -55,11 +58,15 @@ class AIGatewayParser:
         self.requests_made = 0
         self.timeouts = 0
         self.tokens_found = 0
+        self.ai_errors = 0
         
     async def start(self) -> None:
         """Initialize HTTP session."""
         self.session = aiohttp.ClientSession()
-        logger.info("ai_parser_started", model=self.model, timeout_ms=int(self.timeout * 1000))
+        logger.info("ai_parser_started", 
+                   model=self.model, 
+                   timeout_ms=int(self.timeout * 1000),
+                   gateway=self.gateway_url[:40])
     
     async def stop(self) -> None:
         """Close HTTP session."""
@@ -89,17 +96,24 @@ class AIGatewayParser:
             }
             
             async with self.session.post(
-                VERCEL_AI_GATEWAY_URL,
+                self.gateway_url,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/albin-holmgren/windbreaker",
+                    "X-Title": "Windbreaker Trading Bot"
                 },
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    logger.warning("ai_gateway_error", status=resp.status, error=error_text[:100])
+                    self.ai_errors += 1
+                    if self.ai_errors <= 3 or self.ai_errors % 50 == 0:
+                        logger.warning("ai_gateway_error", 
+                                      status=resp.status, 
+                                      error=error_text[:100],
+                                      total_errors=self.ai_errors)
                     return None
                 
                 data = await resp.json()
@@ -170,5 +184,8 @@ class AIGatewayParser:
             "requests_made": self.requests_made,
             "tokens_found": self.tokens_found,
             "timeouts": self.timeouts,
-            "success_rate": f"{(self.tokens_found / max(self.requests_made, 1) * 100):.1f}%"
+            "ai_errors": self.ai_errors,
+            "success_rate": f"{(self.tokens_found / max(self.requests_made, 1) * 100):.1f}%",
+            "gateway": self.gateway_url[:40],
+            "model": self.model
         }

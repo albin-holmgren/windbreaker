@@ -83,7 +83,8 @@ class Config:
     telegram_session_name: str  # Session file name
     
     # AI Gateway (NEW)
-    ai_gateway_key: str  # Vercel AI Gateway API key
+    ai_gateway_key: str  # AI Gateway API key (OpenRouter or any OpenAI-compatible)
+    ai_gateway_url: str  # AI Gateway URL endpoint
     ai_model: str  # AI model to use
     ai_timeout_ms: int  # AI request timeout
     
@@ -207,10 +208,11 @@ def load_config(env_file: str = '.env') -> Config:
         telegram_phone=os.getenv('TELEGRAM_PHONE', ''),
         telegram_session_name=os.getenv('TELEGRAM_SESSION_NAME', 'telegram_trader_session'),
         
-        # AI Gateway (NEW)
+        # AI Gateway (NEW) - defaults to OpenRouter
         ai_gateway_key=os.getenv('AI_GATEWAY_KEY', ''),
-        ai_model=os.getenv('AI_MODEL', 'moonshotai/kimi-k2.5'),
-        ai_timeout_ms=int(os.getenv('AI_TIMEOUT_MS', '500')),
+        ai_gateway_url=os.getenv('AI_GATEWAY_URL', 'https://openrouter.ai/api/v1/chat/completions'),
+        ai_model=os.getenv('AI_MODEL', 'google/gemini-2.0-flash-001'),
+        ai_timeout_ms=int(os.getenv('AI_TIMEOUT_MS', '3000')),
         
         # Fast Trading (NEW)
         trade_amount_sol=float(os.getenv('TRADE_AMOUNT_SOL', '0.05')),
