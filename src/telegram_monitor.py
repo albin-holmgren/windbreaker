@@ -196,7 +196,9 @@ class TelegramUserMonitor:
     
     async def _poll_groups(self) -> None:
         """Poll groups periodically to fetch new messages."""
-        logger.info("polling_started", interval_sec=5)
+        POLL_INTERVAL = 10  # seconds between polling cycles (6 req/min total, well under limits)
+        
+        logger.info("polling_started", interval_sec=POLL_INTERVAL, chats=len(self.monitored_groups))
         
         # Track last seen message ID per chat
         last_message_ids: dict[int, int] = {}
@@ -214,7 +216,7 @@ class TelegramUserMonitor:
         logger.info("baseline_established", chats_tracked=len(last_message_ids))
         
         while self.running:
-            await asyncio.sleep(5)  # Poll every 5 seconds
+            await asyncio.sleep(POLL_INTERVAL)  # Wait between polling cycles
             if not self.running:
                 break
             
