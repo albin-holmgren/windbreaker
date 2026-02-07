@@ -62,48 +62,103 @@ class TelegramUserMonitor:
         """Start the Telegram client and begin monitoring."""
         logger.info("starting_telegram_monitor", session=self.session_name)
         
-        # Check for compressed session in environment (Railway deployment)
-        session_gz_b64 = os.environ.get("TELEGRAM_SESSION_GZ")
-        railway_session_path = f"/data/{self.session_name}.session"
+        # --- Layer 1: Persistent session on Railway volume ---
+        # Priority: file session on volume > import StringSession into file > StringSession direct > local file
+        persistent_session_dir = "/data"
+        persistent_session_path = f"{persistent_session_dir}/{self.session_name}"
+        persistent_session_file = f"{persistent_session_path}.session"
+        has_persistent_volume = os.path.isdir(persistent_session_dir)
         
-        if session_gz_b64 and not os.path.exists(railway_session_path):
+        session_string = os.environ.get("TELEGRAM_SESSION_STRING")
+        session_gz_b64 = os.environ.get("TELEGRAM_SESSION_GZ")
+        use_string_session = False
+        
+        if has_persistent_volume and os.path.exists(persistent_session_file):
+            # Best case: reuse existing file session from volume (survives redeployments)
+            logger.info("using_persistent_session", path=persistent_session_file)
+            session = persistent_session_path
+        elif has_persistent_volume and session_string:
+            # Import StringSession into a file session on the volume for persistence
+            logger.info("importing_session_string_to_volume")
+            try:
+                # First connect with StringSession to validate it
+                temp_client = TelegramClient(
+                    StringSession(session_string),
+                    self.api_id,
+                    self.api_hash,
+                    device_model="Windbreaker Bot",
+                    system_version="Railway",
+                    app_version="1.0"
+                )
+                await temp_client.connect()
+                if await temp_client.is_user_authorized():
+                    # Export session data and create file-based session
+                    exported = temp_client.session.save()
+                    await temp_client.disconnect()
+                    
+                    # Create file-based client with the exported session
+                    file_client = TelegramClient(
+                        StringSession(exported),
+                        self.api_id,
+                        self.api_hash,
+                        device_model="Windbreaker Bot",
+                        system_version="Railway",
+                        app_version="1.0"
+                    )
+                    await file_client.connect()
+                    # Save as file session on volume
+                    file_client.session.save()
+                    await file_client.disconnect()
+                    logger.info("session_imported_to_volume", path=persistent_session_file)
+                else:
+                    await temp_client.disconnect()
+                    logger.warning("string_session_not_authorized_for_import")
+            except Exception as e:
+                logger.warning("failed_to_import_session_to_volume", error=str(e))
+            
+            # Use the StringSession directly (file import is best-effort)
+            session = StringSession(session_string)
+            use_string_session = True
+        elif has_persistent_volume and session_gz_b64:
+            # Decompress session from env to volume
             try:
                 logger.info("decompressing_session_from_env")
                 session_bytes = gzip.decompress(base64.b64decode(session_gz_b64))
-                os.makedirs("/data", exist_ok=True)
-                with open(railway_session_path, "wb") as f:
+                with open(persistent_session_file, "wb") as f:
                     f.write(session_bytes)
-                logger.info("session_saved", path=railway_session_path, size=len(session_bytes))
+                logger.info("session_decompressed_to_volume", path=persistent_session_file)
+                session = persistent_session_path
             except Exception as e:
                 logger.error("failed_to_decompress_session", error=str(e))
-        
-        # Check for session string in environment
-        session_string = os.environ.get("TELEGRAM_SESSION_STRING")
-        if session_string:
-            logger.info("using_session_from_env")
-            session = StringSession(session_string)
-        else:
-            # Check for session file in /data (Railway volume) first, then local
-            if os.path.exists(railway_session_path):
-                logger.info("using_railway_session", path=railway_session_path)
-                session = railway_session_path.replace('.session', '')
-            else:
-                logger.info("using_local_session", file=self.session_name)
                 session = self.session_name
+        elif session_string:
+            # No persistent volume, use StringSession directly
+            logger.info("using_session_string_direct", note="No persistent volume available")
+            session = StringSession(session_string)
+            use_string_session = True
+        else:
+            # Fallback to local session file
+            logger.info("using_local_session", file=self.session_name)
+            session = self.session_name
         
+        # --- Layer 3: Named device so user recognizes bot in Active Sessions ---
         self.client = TelegramClient(
             session,
             self.api_id,
-            self.api_hash
+            self.api_hash,
+            device_model="Windbreaker Bot",
+            system_version="Railway",
+            app_version="1.0"
         )
         
-        if session_string:
-            # StringSession is already authenticated, just connect
+        if use_string_session or isinstance(session, StringSession):
+            # StringSession: connect and validate
             await self.client.connect()
             if not await self.client.is_user_authorized():
                 logger.error("telegram_session_string_not_authorized")
                 raise ValueError("TELEGRAM_SESSION_STRING is invalid or expired - regenerate it")
         else:
+            # File-based session: start normally
             await self.client.start(phone=self.phone)
             if not await self.client.is_user_authorized():
                 logger.error("telegram_not_authorized")

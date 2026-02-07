@@ -279,18 +279,64 @@ class TelegramAITrader:
                 logger.error("position_manager_error", error=str(e))
                 await asyncio.sleep(10)  # Backoff on error
     
+    async def _send_alert(self, message: str) -> None:
+        """Send alert via Telegram bot token (Layer 2: session death alerts)."""
+        bot_token = self.config.telegram_bot_token
+        chat_id = self.config.telegram_chat_id
+        
+        if not bot_token or not chat_id:
+            logger.warning("alert_skipped_no_bot_token", 
+                          has_token=bool(bot_token), has_chat_id=bool(chat_id))
+            return
+        
+        try:
+            import aiohttp
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        logger.info("alert_sent", chat_id=chat_id)
+                    else:
+                        logger.warning("alert_send_failed", status=resp.status)
+        except Exception as e:
+            logger.warning("alert_send_error", error=str(e))
+    
     async def _run_telegram_monitor_with_restart(self) -> None:
         """Run Telegram monitor with auto-restart on failure."""
         restart_delay = 5
         max_restart_delay = 60
+        session_death_alerted = False
         
         while self.running:
             try:
                 logger.info("starting_telegram_monitor_task")
+                session_death_alerted = False  # Reset on successful start attempt
                 await self.telegram_monitor.start()
                 logger.warning("telegram_monitor_exited_gracefully")
             except Exception as e:
-                logger.error("telegram_monitor_crashed", error=str(e), restart_delay=restart_delay)
+                error_str = str(e)
+                logger.error("telegram_monitor_crashed", error=error_str, restart_delay=restart_delay)
+                
+                # --- Layer 2: Alert when session dies ---
+                if "invalid or expired" in error_str or "not authorized" in error_str.lower():
+                    if not session_death_alerted:
+                        session_death_alerted = True
+                        await self._send_alert(
+                            "\u26a0\ufe0f <b>Windbreaker Bot Session Died!</b>\n\n"
+                            "The Telegram session has been invalidated.\n\n"
+                            "<b>To fix:</b>\n"
+                            "1. Run generate_session.py locally\n"
+                            "2. Update TELEGRAM_SESSION_STRING in Railway\n"
+                            "3. Redeploy\n\n"
+                            "<b>To prevent:</b> Don't press 'Terminate All Other Sessions' "
+                            "in Telegram Settings > Active Sessions. "
+                            "Look for <i>Windbreaker Bot</i> and leave it alone."
+                        )
             
             if not self.running:
                 break
