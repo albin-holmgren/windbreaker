@@ -206,6 +206,7 @@ class TelegramAITrader:
                 total_tokens=0  # Will be updated on first price check
             )
             self.signal_manager.mark_processed(signal.token_address, executed=True)
+            self.signal_manager.mark_bought(signal.token_address)
             logger.info("trade_executed",
                        token=signal.token_address[:8],
                        amount=self.config.trade_amount_sol)

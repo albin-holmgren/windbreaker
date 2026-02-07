@@ -20,7 +20,12 @@ async def main():
     print(f"\nPhone: {PHONE}")
     print("\nStep 1: Sending code request to Telegram...")
     
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(
+        StringSession(), API_ID, API_HASH,
+        device_model="Windbreaker Bot",
+        system_version="Railway",
+        app_version="1.0"
+    )
     await client.connect()
     
     # Send code
@@ -51,8 +56,11 @@ async def main():
     print("2. Go to Railway → Your Project → Variables")
     print("3. Replace the old TELEGRAM_SESSION_STRING value")
     print("4. Click 'Redeploy' to restart the bot")
-    print("\n⚠️  DO NOT log out of Telegram on your phone or")
-    print("    you'll need to regenerate this again!")
+    print("\n⚠️  IMPORTANT:")
+    print("    In Telegram Settings > Active Sessions, you'll see")
+    print("    'Windbreaker Bot' — DO NOT terminate it!")
+    print("    Normal phone usage is fine. Only 'Terminate All")
+    print("    Other Sessions' kills the bot.")
     
     await client.disconnect()
 
