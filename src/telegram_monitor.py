@@ -128,9 +128,8 @@ class TelegramUserMonitor:
         self.running = True
         logger.info("telegram_monitor_started", groups=len(self.monitored_groups))
         
-        # Keep running
-        while self.running:
-            await asyncio.sleep(1)
+        # Use Telethon's recommended way to keep receiving updates
+        await self.client.run_until_disconnected()
     
     async def _discover_groups(self) -> None:
         """Discover all groups and channels the user is in."""
@@ -153,6 +152,12 @@ class TelegramUserMonitor:
     async def _process_message(self, event) -> None:
         """Process a new message."""
         try:
+            # Log EVERY incoming event for debugging
+            logger.debug("raw_event_received",
+                        chat_id=event.chat_id,
+                        has_text=bool(event.message and event.message.text),
+                        in_monitored=event.chat_id in self.monitored_groups)
+            
             # Skip if not from monitored group
             if event.chat_id not in self.monitored_groups:
                 return
@@ -181,11 +186,19 @@ class TelegramUserMonitor:
             except Exception:
                 pass
             
+            # Log every message from monitored groups
+            logger.info("group_message_received",
+                       chat=chat_name,
+                       chat_id=event.chat_id,
+                       text_len=len(text),
+                       text_preview=text[:80])
+            
             # Check if message contains potential crypto signal
             has_address = bool(SOLANA_ADDRESS_PATTERN.search(text))
             has_keywords = any(kw.lower() in text.lower() for kw in CRYPTO_KEYWORDS)
             
-            if has_address and has_keywords:
+            # Trigger on address alone OR address+keywords (relaxed filter)
+            if has_address:
                 self.potential_signals += 1
                 
                 logger.info("potential_signal_detected",

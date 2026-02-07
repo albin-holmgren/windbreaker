@@ -303,6 +303,9 @@ class TelegramAITrader:
         
         if self.telegram_monitor:
             self.telegram_monitor.running = False
+            # Disconnect to break run_until_disconnected()
+            if self.telegram_monitor.client:
+                self.telegram_monitor.client.disconnect()
 
 
 async def main():
