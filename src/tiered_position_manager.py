@@ -158,6 +158,15 @@ class TieredPositionManager:
                 if current_price is None:
                     continue
                 
+                # Set entry price on first successful price fetch
+                if position.entry_price == 1.0:
+                    position.entry_price = current_price
+                    position.highest_price_seen = current_price
+                    logger.info("entry_price_set",
+                               token=token_address[:8],
+                               entry_price=current_price)
+                    continue  # Skip first check to avoid immediate triggers
+                
                 # Update highest price for trailing stop
                 if current_price > position.highest_price_seen:
                     position.highest_price_seen = current_price
@@ -283,38 +292,25 @@ class TieredPositionManager:
                                total_pnl=f"{position.pnl_percent:.1f}%")
     
     async def _execute_sell(self, position: TieredPosition, sell_percent: int, tier: str) -> bool:
-        """Execute a sell on pump.fun."""
+        """Execute a sell via pump.fun with Jupiter fallback."""
+        from solders.transaction import VersionedTransaction
+        
+        token_mint = position.token_address
+        
+        # Step 1: Try pump.fun sell (JSON then form-data)
+        tx_bytes = await self._try_pumpfun_sell(token_mint, sell_percent, tier)
+        
+        # Step 2: If pump.fun failed, try Jupiter
+        if tx_bytes is None:
+            logger.info(f"{tier}_trying_jupiter_fallback", token=token_mint[:8])
+            tx_bytes = await self._try_jupiter_sell(token_mint, sell_percent, tier)
+        
+        if tx_bytes is None:
+            logger.error(f"{tier}_all_sell_methods_failed", token=token_mint[:8])
+            return False
+        
+        # Sign and send
         try:
-            import base64
-            from solders.transaction import VersionedTransaction
-            
-            payload = {
-                "publicKey": str(self.wallet.pubkey()),
-                "action": "sell",
-                "mint": position.token_address,
-                "denominatedInSol": "false",
-                "amount": f"{sell_percent}%",
-                "slippage": 20,  # High slippage for sells
-                "priorityFee": 0.001,
-                "pool": "auto"
-            }
-            
-            async with self.session.post(
-                PUMPFUN_API,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
-                if resp.status != 200:
-                    error = await resp.text()
-                    logger.warning(f"{tier}_sell_failed",
-                                 token=position.token_address[:8],
-                                 status=resp.status,
-                                 error=error[:100])
-                    return False
-                
-                tx_bytes = await resp.read()
-            
-            # Sign and send
             tx = VersionedTransaction.from_bytes(tx_bytes)
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
@@ -332,17 +328,166 @@ class TieredPositionManager:
                 position.tier3.signature = str(signature)
             
             logger.info(f"{tier}_sell_submitted",
-                       token=position.token_address[:8],
+                       token=token_mint[:8],
+                       sell_percent=sell_percent,
                        signature=str(signature)[:16])
             
-            # Don't wait for confirmation - trust it was submitted
             return True
             
         except Exception as e:
-            logger.error(f"{tier}_sell_error",
-                        token=position.token_address[:8],
+            logger.error(f"{tier}_sell_send_error",
+                        token=token_mint[:8],
                         error=str(e))
             return False
+    
+    async def _try_pumpfun_sell(self, token_mint: str, sell_percent: int, tier: str) -> Optional[bytes]:
+        """Try pump.fun sell with JSON then form-data fallback."""
+        try:
+            payload = {
+                "publicKey": str(self.wallet.pubkey()),
+                "action": "sell",
+                "mint": token_mint,
+                "denominatedInSol": "false",
+                "amount": f"{sell_percent}%",
+                "slippage": 20,
+                "priorityFee": 0.001,
+                "pool": "auto"
+            }
+            
+            # Try JSON first
+            async with self.session.post(
+                PUMPFUN_API,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                error_text = await resp.text()
+                logger.debug(f"{tier}_pumpfun_json_failed",
+                           token=token_mint[:8],
+                           status=resp.status,
+                           error=error_text[:100])
+            
+            # Retry with form-data on 400
+            async with self.session.post(
+                PUMPFUN_API,
+                data=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"{tier}_pumpfun_form_sell_success", token=token_mint[:8])
+                    return await resp.read()
+                error_text = await resp.text()
+                logger.debug(f"{tier}_pumpfun_form_failed",
+                           token=token_mint[:8],
+                           status=resp.status,
+                           error=error_text[:100])
+            
+            return None
+        except Exception as e:
+            logger.debug(f"{tier}_pumpfun_sell_exception", token=token_mint[:8], error=str(e))
+            return None
+    
+    async def _try_jupiter_sell(self, token_mint: str, sell_percent: int, tier: str) -> Optional[bytes]:
+        """Try selling via Jupiter swap (for tokens migrated off pump.fun)."""
+        try:
+            import base64
+            
+            # Get token balance
+            token_balance = await self._get_token_balance(token_mint)
+            if not token_balance or token_balance <= 0:
+                logger.warning(f"{tier}_no_token_balance", token=token_mint[:8])
+                return None
+            
+            # Calculate sell amount
+            sell_amount = int(token_balance * sell_percent / 100)
+            if sell_amount <= 0:
+                return None
+            
+            # Get Jupiter quote (token -> SOL)
+            quote_params = {
+                "inputMint": token_mint,
+                "outputMint": NATIVE_SOL,
+                "amount": str(sell_amount),
+                "slippageBps": "2000",  # 20% slippage
+            }
+            
+            async with self.session.get(
+                "https://lite-api.jup.ag/swap/v1/quote",
+                params=quote_params,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.warning(f"{tier}_jupiter_quote_failed",
+                                 token=token_mint[:8],
+                                 status=resp.status,
+                                 error=error[:100])
+                    return None
+                quote_data = await resp.json()
+            
+            # Get swap transaction
+            swap_payload = {
+                "quoteResponse": quote_data,
+                "userPublicKey": str(self.wallet.pubkey()),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": 1000000,
+            }
+            
+            async with self.session.post(
+                "https://lite-api.jup.ag/swap/v1/swap",
+                json=swap_payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.warning(f"{tier}_jupiter_swap_failed",
+                                 token=token_mint[:8],
+                                 status=resp.status,
+                                 error=error[:100])
+                    return None
+                swap_data = await resp.json()
+            
+            swap_tx = swap_data.get("swapTransaction")
+            if not swap_tx:
+                logger.warning(f"{tier}_jupiter_no_swap_tx", token=token_mint[:8])
+                return None
+            
+            tx_bytes = base64.b64decode(swap_tx)
+            logger.info(f"{tier}_jupiter_sell_ready",
+                       token=token_mint[:8],
+                       sell_amount=sell_amount,
+                       out_sol=float(quote_data.get("outAmount", 0)) / SOL_DECIMALS)
+            return tx_bytes
+            
+        except Exception as e:
+            logger.error(f"{tier}_jupiter_sell_exception", token=token_mint[:8], error=str(e))
+            return None
+    
+    async def _get_token_balance(self, token_mint: str) -> Optional[int]:
+        """Get token balance in raw units."""
+        try:
+            from solders.pubkey import Pubkey
+            result = await self.rpc._request(
+                "getTokenAccountsByOwner",
+                [
+                    str(self.wallet.pubkey()),
+                    {"mint": token_mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if result and "value" in result:
+                for account in result["value"]:
+                    info = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                    amount = info.get("tokenAmount", {}).get("amount", "0")
+                    if int(amount) > 0:
+                        return int(amount)
+            return None
+        except Exception as e:
+            logger.error("get_token_balance_error", token=token_mint[:8], error=str(e))
+            return None
     
     async def _get_token_price(self, token_address: str) -> Optional[float]:
         """Get token price from Jupiter or cache."""
