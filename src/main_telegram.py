@@ -44,7 +44,11 @@ logger = structlog.get_logger(__name__)
 class TelegramAITrader:
     """Telegram AI Trading Bot - Monitors groups, trades on signals."""
     
+    # Singleton instance for dashboard access
+    _instance = None
+    
     def __init__(self, env_file: str = '.env'):
+        TelegramAITrader._instance = self
         self.config = None
         self.wallet = None
         self.rpc = None

@@ -460,6 +460,7 @@ class WebDashboard:
         self.app.router.add_post('/api/reset', self.handle_reset)
         self.app.router.add_post('/api/import', self.handle_import)
         self.app.router.add_get('/health', self.handle_health)
+        self.app.router.add_post('/api/test_trade', self.handle_test_trade)
     
     async def handle_dashboard(self, request):
         """Serve the dashboard HTML."""
@@ -632,6 +633,120 @@ class WebDashboard:
     async def handle_health(self, request):
         """Health check endpoint."""
         return web.json_response({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+    
+    async def handle_test_trade(self, request):
+        """Execute a test buy/sell to verify trading works."""
+        try:
+            data = await request.json()
+            test_type = data.get('type', 'buy_sell')  # 'buy', 'sell', or 'buy_sell'
+            token_mint = data.get('token', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')  # Default USDC
+            amount = data.get('amount', 0.01)  # Default 0.01 SOL
+            
+            logger.info("test_trade_requested", test_type=test_type, token=token_mint[:8], amount=amount)
+            
+            # Check if we have Telegram AI trader available
+            from main_telegram import TelegramAITrader
+            
+            # Get the running trader instance (hack: store reference in class)
+            if not hasattr(TelegramAITrader, '_instance') or TelegramAITrader._instance is None:
+                return web.json_response({
+                    'error': 'Trader not initialized - cannot run test',
+                    'hint': 'Wait for bot to fully start, then retry'
+                }, status=503)
+            
+            trader = TelegramAITrader._instance
+            fast_trader = trader.fast_trader
+            
+            if not fast_trader:
+                return web.json_response({
+                    'error': 'FastTrader not available',
+                    'hint': 'Check bot logs for initialization errors'
+                }, status=503)
+            
+            # Create test signal
+            from dataclasses import dataclass
+            from datetime import datetime
+            
+            @dataclass
+            class TestSignal:
+                token_address: str
+                source_chat: str
+                confidence: float = 1.0
+                timestamp: datetime = None
+                raw_text: str = ""
+                
+                def __post_init__(self):
+                    if self.timestamp is None:
+                        self.timestamp = datetime.utcnow()
+            
+            results = {}
+            
+            if test_type in ('buy', 'buy_sell'):
+                # Execute buy
+                logger.info("executing_test_buy", token=token_mint[:8], amount=amount)
+                
+                signal = TestSignal(
+                    token_address=token_mint,
+                    source_chat="test_endpoint",
+                    raw_text=f"Test buy of {amount} SOL"
+                )
+                
+                # Temporarily reduce trade amount
+                original_amount = fast_trader.trade_amount_sol
+                fast_trader.trade_amount_sol = amount
+                
+                try:
+                    buy_result = await fast_trader._execute_buy(signal)
+                    results['buy'] = {
+                        'success': buy_result is not None,
+                        'signature': buy_result[:16] if buy_result else None
+                    }
+                    
+                    if buy_result and test_type == 'buy_sell':
+                        # Wait a moment then sell
+                        await asyncio.sleep(2)
+                        
+                        logger.info("executing_test_sell", token=token_mint[:8])
+                        sell_result = await fast_trader._execute_sell(token_mint)
+                        results['sell'] = {
+                            'success': sell_result is not None,
+                            'signature': sell_result[:16] if sell_result else None
+                        }
+                        
+                finally:
+                    # Restore original trade amount
+                    fast_trader.trade_amount_sol = original_amount
+            
+            elif test_type == 'sell':
+                # Just sell existing position
+                logger.info("executing_test_sell_only", token=token_mint[:8])
+                sell_result = await fast_trader._execute_sell(token_mint)
+                results['sell'] = {
+                    'success': sell_result is not None,
+                    'signature': sell_result[:16] if sell_result else None
+                }
+            
+            # Check if we have position data
+            has_position = token_mint in fast_trader.open_positions
+            
+            return web.json_response({
+                'success': any(r.get('success') for r in results.values()),
+                'test_type': test_type,
+                'token': token_mint[:8] + '...',
+                'amount_sol': amount,
+                'results': results,
+                'has_open_position': has_position,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+        except Exception as e:
+            logger.error("test_trade_error", error=str(e))
+            import traceback
+            traceback.print_exc()
+            return web.json_response({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }, status=500)
     
     async def _fetch_real_wallet_stats(self) -> Dict[str, Any]:
         """Fetch ONLY actual on-chain data for the real wallet - NO state file data."""
