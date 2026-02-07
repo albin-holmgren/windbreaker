@@ -176,12 +176,27 @@ class TelegramAITrader:
             logger.debug("invalid_address_length", address=address[:10])
             return
         
-        # Parse with AI for confirmation
-        token_address = await self.ai_parser.extract_token_fast(text)
+        # Parse with AI for confirmation and fresh launch detection
+        token_address, classification = await self.ai_parser.extract_token_fast(text)
         
         if not token_address:
             logger.debug("ai_no_token_extracted")
             return
+        
+        # Skip if AI classified this as an OLD call (not a fresh launch)
+        # Only buy if AI says "fresh" or we can't determine ("unknown")
+        if classification == "old":
+            logger.info("skipping_old_call_message",
+                       token=token_address[:8],
+                       chat=chat_name,
+                       reason="ai_classified_as_old")
+            return
+        
+        if classification == "fresh":
+            logger.info("fresh_launch_detected",
+                       token=token_address[:8],
+                       chat=chat_name,
+                       message_preview=text[:60])
         
         # Add to signal manager (will trigger trade if new)
         await self.signal_manager.add_signal(

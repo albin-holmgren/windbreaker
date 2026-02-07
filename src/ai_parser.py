@@ -15,24 +15,30 @@ logger = structlog.get_logger(__name__)
 # Default AI endpoint (Vercel AI Gateway)
 DEFAULT_AI_GATEWAY_URL = "https://ai-gateway.vercel.com/v1/chat/completions"
 
-# System prompt for token extraction
-TOKEN_EXTRACTION_PROMPT = """You are a crypto trading signal parser. Extract Solana token addresses from Telegram messages.
+# System prompt for token extraction with fresh launch detection
+TOKEN_EXTRACTION_PROMPT = """You are a crypto trading signal parser. Extract Solana token addresses from Telegram messages and classify if it's a FRESH LAUNCH or OLD CALL.
 
 Rules:
 1. Look for base58-encoded Solana addresses (32-44 characters, alphanumeric)
-2. Return ONLY the token address, nothing else
-3. If no valid address found, return "none"
-4. Ignore wallet addresses (typically 43-44 chars), focus on token/mint addresses (32-44 chars)
-5. If multiple addresses, return the one most likely to be a token (usually shorter)
+2. Analyze the message text to determine if this is a NEW/FRESH launch or an OLD call
+3. Return format: ADDRESS|CLASSIFICATION
+   - ADDRESS: the token address (or "none" if not found)
+   - CLASSIFICATION: "fresh" for new launches, "old" for established coins, "unknown" if unclear
 
-Example outputs:
-- Input: "Buy $PEPE now! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263
+Fresh launch indicators: "NEW", "LAUNCH", "JUST", "FRESH", "MINT", "RELEASED", "NOW", "🟢", "🚀"
+Old call indicators: "CALL", "GEM", "BUY", "HOLD", "SUPPORT", "ACCUMULATE", "DIP", "🎯"
+
+Examples:
+- Input: "🟢 NEW LAUNCH! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|fresh
+
+- Input: "BUY $PEPE now! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|old
 
 - Input: "Great project!"
-- Output: none
+- Output: none|unknown
 
-Extract the address from this message:"""
+Extract from this message:"""
 
 
 class AIGatewayParser:
@@ -73,10 +79,10 @@ class AIGatewayParser:
         if self.session:
             await self.session.close()
     
-    async def extract_token(self, message_text: str) -> Optional[str]:
+    async def extract_token(self, message_text: str) -> tuple[Optional[str], str]:
         """
-        Extract token address from message using AI.
-        Returns None if no address found or timeout.
+        Extract token address from message using AI and classify as fresh/old.
+        Returns (address, classification) where classification is "fresh", "old", or "unknown".
         """
         if not self.session:
             await self.start()
@@ -114,53 +120,59 @@ class AIGatewayParser:
                                       status=resp.status, 
                                       error=error_text[:100],
                                       total_errors=self.ai_errors)
-                    return None
+                    return None, "unknown"
                 
                 data = await resp.json()
                 
                 if not data or "choices" not in data or not data["choices"]:
                     logger.warning("ai_invalid_response", data=str(data)[:200])
-                    return None
+                    return None, "unknown"
                 
                 content = data["choices"][0].get("message", {}).get("content", "").strip()
                 
+                # Parse the ADDRESS|CLASSIFICATION format
+                parts = content.split("|")
+                address_part = parts[0].strip() if parts else "none"
+                classification = parts[1].strip().lower() if len(parts) > 1 else "unknown"
+                
                 # Check if it's a valid address (not "none")
-                if content.lower() == "none" or not content:
-                    return None
+                if address_part.lower() == "none" or not address_part:
+                    return None, classification
                 
                 # Validate it looks like a Solana address
-                if len(content) < 32 or len(content) > 44:
-                    logger.debug("ai_returned_invalid_length", content=content[:50])
-                    return None
+                if len(address_part) < 32 or len(address_part) > 44:
+                    logger.debug("ai_returned_invalid_length", content=address_part[:50])
+                    return None, classification
                 
                 self.tokens_found += 1
                 
                 logger.info("token_extracted", 
-                           token=content[:8] + "...",
-                           model=self.model,
-                           latency_ms=int(self.timeout * 1000))
+                           token=address_part[:8] + "...",
+                           classification=classification,
+                           model=self.model)
                 
-                return content
+                return address_part, classification
                 
         except asyncio.TimeoutError:
             self.timeouts += 1
             logger.debug("ai_timeout", timeouts=self.timeouts)
-            return None
+            return None, "unknown"
         except Exception as e:
             logger.error("ai_extraction_error", error=str(e))
-            return None
+            return None, "unknown"
     
-    async def extract_token_fast(self, message_text: str) -> Optional[str]:
+    async def extract_token_fast(self, message_text: str) -> tuple[Optional[str], str]:
         """
         Fast extraction with fallback to regex if AI fails.
         First tries AI, falls back to regex pattern matching if timeout/error.
+        Returns (address, classification) where classification is "fresh", "old", or "unknown".
         """
         # Try AI first
-        result = await self.extract_token(message_text)
-        if result:
-            return result
+        address, classification = await self.extract_token(message_text)
+        if address:
+            return address, classification
         
-        # Fallback: regex extraction
+        # Fallback: regex extraction - classify as unknown since we can't analyze message
         import re
         pattern = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
         matches = pattern.findall(message_text)
@@ -171,12 +183,12 @@ class AIGatewayParser:
                 # Token addresses are typically 32-36 chars
                 # Wallet addresses are typically 43-44 chars
                 if 32 <= len(match) <= 40:
-                    logger.info("token_extracted_fallback", token=match[:8] + "...")
-                    return match
+                    logger.info("token_extracted_fallback", token=match[:8] + "...", classification="unknown")
+                    return match, "unknown"
             # If no short ones, return the first
-            return matches[0]
+            return matches[0], "unknown"
         
-        return None
+        return None, "unknown"
     
     def get_stats(self) -> dict:
         """Get parser stats."""
