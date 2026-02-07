@@ -92,6 +92,7 @@ class Config:
     trade_amount_sol: float  # Fixed SOL amount per trade (0.05)
     exit_fee_reserve_per_position: float  # SOL to reserve per position for exit fees
     min_balance_buffer: float  # Minimum SOL to keep in wallet
+    max_token_age_minutes: int  # Maximum token age to buy (0 = disabled, default 30)
     
     # Tiered Selling (NEW)
     tier1_sell_percent: float  # 0.50 for 50%
@@ -218,6 +219,7 @@ def load_config(env_file: str = '.env') -> Config:
         trade_amount_sol=float(os.getenv('TRADE_AMOUNT_SOL', '0.05')),
         exit_fee_reserve_per_position=float(os.getenv('EXIT_FEE_RESERVE_PER_POSITION', '0.02')),
         min_balance_buffer=float(os.getenv('MIN_BALANCE_BUFFER', '0.01')),
+        max_token_age_minutes=int(os.getenv('MAX_TOKEN_AGE_MINUTES', '30')),
         
         # Tiered Selling (NEW)
         tier1_sell_percent=float(os.getenv('TIER1_SELL_PERCENT', '0.50')),

@@ -106,6 +106,26 @@ class FastTrader:
             logger.error("balance_check_error", error=str(e))
             return False, 0.0
     
+    async def _get_token_age_minutes(self, token_mint: str) -> Optional[float]:
+        """Get token age in minutes from DexScreener. Returns None if can't determine."""
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        # Get the pair with the earliest creation time
+                        best_pair = max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) or 0)
+                        created_ms = best_pair.get("pairCreatedAt")
+                        if created_ms:
+                            import time
+                            age_minutes = max(0.0, (time.time() * 1000.0 - float(created_ms)) / 60000.0)
+                            return age_minutes
+            return None
+        except Exception:
+            return None
+    
     async def _get_token_market_cap(self, token_mint: str) -> Optional[float]:
         """Get token market cap from DexScreener or similar."""
         try:
@@ -188,6 +208,21 @@ class FastTrader:
                            token=token_address[:8],
                            hours_ago=(now - last_buy).total_seconds() / 3600)
                 return False
+        
+        # Check token age - only buy fresh launches (< 30 min old by default)
+        max_age_minutes = getattr(self.config, 'max_token_age_minutes', 30)
+        if max_age_minutes > 0:
+            token_age = await self._get_token_age_minutes(token_address)
+            if token_age is not None and token_age > max_age_minutes:
+                logger.info("skipping_old_token",
+                           token=token_address[:8],
+                           age_minutes=f"{token_age:.1f}",
+                           max_age=max_age_minutes)
+                return False
+            elif token_age is not None:
+                logger.info("token_age_check_passed",
+                           token=token_address[:8],
+                           age_minutes=f"{token_age:.1f}")
         
         # Check balance
         can_trade, available = await self.can_execute_trade()
@@ -510,5 +545,6 @@ class FastTrader:
             "dynamic_sizing": True,
             "min_trade": self.min_trade_sol,
             "max_trade": self.max_trade_sol,
-            "max_position_pct": f"{self.max_position_percent*100:.0f}%"
+            "max_position_pct": f"{self.max_position_percent*100:.0f}%",
+            "max_token_age_minutes": getattr(self.config, 'max_token_age_minutes', 30)
         }
