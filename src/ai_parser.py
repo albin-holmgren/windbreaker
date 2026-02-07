@@ -12,8 +12,8 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Default AI endpoint (OpenRouter - always available, free models)
-DEFAULT_AI_GATEWAY_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Default AI endpoint (Vercel AI Gateway)
+DEFAULT_AI_GATEWAY_URL = "https://ai-gateway.vercel.com/v1/chat/completions"
 
 # System prompt for token extraction
 TOKEN_EXTRACTION_PROMPT = """You are a crypto trading signal parser. Extract Solana token addresses from Telegram messages.
@@ -41,7 +41,7 @@ class AIGatewayParser:
     def __init__(
         self,
         api_key: str,
-        model: str = "google/gemini-2.0-flash-001",
+        model: str = "moonshotai/kimi-k2.5",
         timeout_ms: int = 3000,
         confidence_threshold: float = 0.0,  # Trust everything
         gateway_url: str = "",

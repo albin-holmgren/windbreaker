@@ -210,8 +210,8 @@ def load_config(env_file: str = '.env') -> Config:
         
         # AI Gateway (NEW) - defaults to OpenRouter
         ai_gateway_key=os.getenv('AI_GATEWAY_KEY', ''),
-        ai_gateway_url=os.getenv('AI_GATEWAY_URL', 'https://openrouter.ai/api/v1/chat/completions'),
-        ai_model=os.getenv('AI_MODEL', 'google/gemini-2.0-flash-001'),
+        ai_gateway_url=os.getenv('AI_GATEWAY_URL', 'https://ai-gateway.vercel.com/v1/chat/completions'),
+        ai_model=os.getenv('AI_MODEL', 'moonshotai/kimi-k2.5'),
         ai_timeout_ms=int(os.getenv('AI_TIMEOUT_MS', '3000')),
         
         # Fast Trading (NEW)
