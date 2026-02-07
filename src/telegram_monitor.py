@@ -152,14 +152,17 @@ class TelegramUserMonitor:
     async def _process_message(self, event) -> None:
         """Process a new message."""
         try:
-            # Log EVERY incoming event for debugging
-            logger.debug("raw_event_received",
+            # Log EVERY incoming event for debugging (INFO level to ensure visibility)
+            logger.info("raw_event_received",
                         chat_id=event.chat_id,
                         has_text=bool(event.message and event.message.text),
-                        in_monitored=event.chat_id in self.monitored_groups)
+                        in_monitored=event.chat_id in self.monitored_groups,
+                        monitored_count=len(self.monitored_groups))
             
             # Skip if not from monitored group
             if event.chat_id not in self.monitored_groups:
+                logger.info("chat_not_monitored", chat_id=event.chat_id, 
+                           sample_monitored=list(self.monitored_groups)[:3])
                 return
             
             # Skip if no message text
