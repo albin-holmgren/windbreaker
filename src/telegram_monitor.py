@@ -120,7 +120,7 @@ class TelegramUserMonitor:
         logger.info("startup_time_set", wait_seconds=3, message="Skipping messages for 3 seconds to avoid burst")
         await asyncio.sleep(3)
         
-        # Set up message handler
+        # Set up message handler (also use as backup for real-time events)
         @self.client.on(events.NewMessage())
         async def handle_new_message(event):
             await self._process_message(event)
@@ -131,7 +131,7 @@ class TelegramUserMonitor:
         # Verify handler is registered
         logger.info("handler_registered", handlers_count=len(self.client._event_builders))
         
-        # Force Telegram to sync updates (critical for catching new messages)
+        # Force Telegram to sync updates
         logger.info("syncing_updates_with_telegram")
         try:
             await self.client.catch_up()
@@ -157,13 +157,17 @@ class TelegramUserMonitor:
         # Start a health check task
         health_task = asyncio.create_task(self._health_check())
         
-        # Use Telethon's recommended way to keep receiving updates
+        # Start polling loop (primary mechanism since push updates don't work reliably across IPs)
+        poll_task = asyncio.create_task(self._poll_groups())
+        
+        # Use Telethon's recommended way to keep receiving updates (as backup)
         try:
             await self.client.run_until_disconnected()
         except Exception as e:
             logger.error("run_until_disconnected_error", error=str(e))
         finally:
             health_task.cancel()
+            poll_task.cancel()
             logger.warning("telegram_monitor_exited")
     
     async def _health_check(self) -> None:
@@ -189,6 +193,62 @@ class TelegramUserMonitor:
             if new_messages == 0:
                 logger.warning("no_messages_received_in_30s", 
                               hint="Check if Telegram session is valid and groups are active")
+    
+    async def _poll_groups(self) -> None:
+        """Poll groups periodically to fetch new messages."""
+        logger.info("polling_started", interval_sec=5)
+        
+        # Track last seen message ID per chat
+        last_message_ids: dict[int, int] = {}
+        
+        # Initial fetch to establish baseline
+        for chat_id in list(self.monitored_groups):
+            try:
+                async for message in self.client.iter_messages(chat_id, limit=1):
+                    if message:
+                        last_message_ids[chat_id] = message.id
+                        break
+            except Exception as e:
+                logger.debug("initial_poll_failed", chat_id=chat_id, error=str(e))
+        
+        logger.info("baseline_established", chats_tracked=len(last_message_ids))
+        
+        while self.running:
+            await asyncio.sleep(5)  # Poll every 5 seconds
+            if not self.running:
+                break
+            
+            for chat_id in list(self.monitored_groups):
+                try:
+                    # Fetch new messages since last seen
+                    last_id = last_message_ids.get(chat_id, 0)
+                    
+                    new_messages = []
+                    async for message in self.client.iter_messages(chat_id, min_id=last_id, limit=10):
+                        if message.id > last_id:
+                            new_messages.append(message)
+                    
+                    if new_messages:
+                        # Update last seen ID
+                        last_message_ids[chat_id] = max(m.id for m in new_messages)
+                        
+                        # Process messages (oldest first)
+                        for message in reversed(new_messages):
+                            # Create a fake event structure for _process_message
+                            class FakeEvent:
+                                def __init__(self, msg, chat):
+                                    self.message = msg
+                                    self.chat_id = chat
+                            
+                            await self._process_message(FakeEvent(message, chat_id))
+                        
+                        logger.info("polled_new_messages", 
+                                   chat_id=chat_id, 
+                                   count=len(new_messages),
+                                   latest_id=last_message_ids[chat_id])
+                        
+                except Exception as e:
+                    logger.debug("poll_error", chat_id=chat_id, error=str(e))
     
     async def _discover_groups(self) -> None:
         """Discover all groups and channels the user is in."""
