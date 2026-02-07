@@ -97,11 +97,17 @@ class TelegramUserMonitor:
             self.api_hash
         )
         
-        await self.client.start(phone=self.phone if not session_string else None)
-        
-        if not await self.client.is_user_authorized():
-            logger.error("telegram_not_authorized")
-            raise ValueError("Telegram login failed - check phone number and code, or ensure TELEGRAM_SESSION_STRING is valid")
+        if session_string:
+            # StringSession is already authenticated, just connect
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                logger.error("telegram_session_string_not_authorized")
+                raise ValueError("TELEGRAM_SESSION_STRING is invalid or expired - regenerate it")
+        else:
+            await self.client.start(phone=self.phone)
+            if not await self.client.is_user_authorized():
+                logger.error("telegram_not_authorized")
+                raise ValueError("Telegram login failed - check phone number and code")
         
         me = await self.client.get_me()
         logger.info("telegram_logged_in", user=me.username or me.phone)
