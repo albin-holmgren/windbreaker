@@ -131,6 +131,29 @@ class TelegramUserMonitor:
         # Verify handler is registered
         logger.info("handler_registered", handlers_count=len(self.client._event_builders))
         
+        # Force Telegram to sync updates (critical for catching new messages)
+        logger.info("syncing_updates_with_telegram")
+        try:
+            await self.client.catch_up()
+            logger.info("updates_synced")
+        except Exception as e:
+            logger.warning("catch_up_failed", error=str(e))
+        
+        # Test: Try to read last message from first monitored group to verify access
+        if self.monitored_groups:
+            try:
+                test_chat_id = list(self.monitored_groups)[0]
+                logger.info("testing_group_access", chat_id=test_chat_id)
+                async for message in self.client.iter_messages(test_chat_id, limit=1):
+                    if message:
+                        logger.info("group_access_ok", 
+                                   chat_id=test_chat_id,
+                                   last_message_time=str(message.date),
+                                   has_text=bool(message.text))
+                        break
+            except Exception as e:
+                logger.error("group_access_failed", chat_id=test_chat_id, error=str(e))
+        
         # Start a health check task
         health_task = asyncio.create_task(self._health_check())
         
