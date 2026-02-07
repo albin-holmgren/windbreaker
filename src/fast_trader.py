@@ -214,10 +214,10 @@ class FastTrader:
             if result:
                 self.buys_successful += 1
                 self.total_sol_spent += trade_amount
-                self._recently_bought[token_address] = datetime.utcnow()  # Track as bought
+                self._recently_bought[token_address] = datetime.utcnow()
                 self.open_positions[token_address] = {
                     "entry_time": datetime.utcnow(),
-                    "entry_price": None,  # Will be filled by position manager
+                    "entry_price": None,
                     "amount_sol": trade_amount,
                     "source_chat": signal.source_chat,
                 }
@@ -227,8 +227,28 @@ class FastTrader:
                            signature=result[:16] if result else None)
                 return True
             else:
-                logger.warning("buy_failed", token=token_address[:8])
-                return False
+                # Fallback: Try Jupiter if pump.fun fails
+                logger.info("pumpfun_failed_trying_jupiter", token=token_address[:8])
+                jupiter_result = await self._execute_jupiter_buy(token_address, trade_amount)
+                
+                if jupiter_result:
+                    self.buys_successful += 1
+                    self.total_sol_spent += trade_amount
+                    self._recently_bought[token_address] = datetime.utcnow()
+                    self.open_positions[token_address] = {
+                        "entry_time": datetime.utcnow(),
+                        "entry_price": None,
+                        "amount_sol": trade_amount,
+                        "source_chat": signal.source_chat,
+                    }
+                    logger.info("buy_success_jupiter",
+                               token=token_address[:8],
+                               amount=trade_amount,
+                               signature=jupiter_result[:16] if jupiter_result else None)
+                    return True
+                else:
+                    logger.warning("buy_failed", token=token_address[:8])
+                    return False
                 
         except Exception as e:
             logger.error("buy_execution_error",
@@ -237,86 +257,203 @@ class FastTrader:
             return False
     
     async def _execute_pumpfun_buy(self, token_mint: str, trade_amount: float) -> Optional[str]:
-        """Execute buy via pump.fun API - with 400 error fallback like copy trader."""
+        """Execute buy via pump.fun API - with pool fallbacks like copy trader."""
         try:
             import base64
             from solders.transaction import VersionedTransaction
             
-            # Build payload with dynamic amount
-            payload = {
-                "publicKey": str(self.wallet.pubkey()),
-                "action": "buy",
-                "mint": token_mint,
-                "denominatedInSol": "true",
-                "amount": trade_amount,
-                "slippage": 15,  # 15% slippage for speed
-                "priorityFee": 0.001,  # High priority
-                "pool": "auto"
-            }
+            # Try multiple pools like copy_trader does
+            pools_to_try = ["auto", "pump", "pump-amm", "raydium", "raydium-cpmm"]
+            last_error = None
             
-            tx_bytes = None
-            status_code = None
-            error_text = None
-            
-            # Try JSON first (like copy trader)
-            async with self.session.post(
-                PUMPFUN_API,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                status_code = resp.status
-                if resp.status == 200:
-                    tx_bytes = await resp.read()
-                else:
-                    error_text = await resp.text()
-            
-            # CRITICAL: If 400 error, retry with form data (copy trader pattern)
-            if tx_bytes is None and status_code == 400:
-                logger.debug("pumpfun_400_retrying_with_form", token=token_mint[:8])
+            for pool in pools_to_try:
+                # Build payload with dynamic amount
+                payload = {
+                    "publicKey": str(self.wallet.pubkey()),
+                    "action": "buy",
+                    "mint": token_mint,
+                    "denominatedInSol": "true",
+                    "amount": trade_amount,
+                    "slippage": 15,  # 15% slippage for speed
+                    "priorityFee": 0.001,  # High priority
+                    "pool": pool
+                }
+                
+                logger.debug("pumpfun_trying_pool", token=token_mint[:8], pool=pool)
+                
+                tx_bytes = None
+                status_code = None
+                error_text = None
+                
+                # Try JSON first
                 try:
                     async with self.session.post(
                         PUMPFUN_API,
-                        data=payload,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp2:
-                        if resp2.status == 200:
-                            tx_bytes = await resp2.read()
-                            logger.info("pumpfun_form_retry_success", token=token_mint[:8])
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=6)
+                    ) as resp:
+                        status_code = resp.status
+                        if resp.status == 200:
+                            tx_bytes = await resp.read()
                         else:
-                            error_text2 = await resp2.text()
-                            error_text = f"{error_text} | form: {error_text2}"
+                            error_text = await resp.text()
                 except Exception as e:
-                    error_text = f"{error_text} | form_exception: {e}"
+                    error_text = str(e)
+                
+                # If 400 error, retry with form data
+                if tx_bytes is None and status_code == 400:
+                    try:
+                        async with self.session.post(
+                            PUMPFUN_API,
+                            data=payload,
+                            timeout=aiohttp.ClientTimeout(total=6)
+                        ) as resp2:
+                            status_code = resp2.status
+                            if resp2.status == 200:
+                                tx_bytes = await resp2.read()
+                                logger.info("pumpfun_form_retry_success", token=token_mint[:8], pool=pool)
+                            else:
+                                error_text2 = await resp2.text()
+                                error_text = f"{error_text} | form: {error_text2}"
+                    except Exception as e:
+                        error_text = f"{error_text} | form_exception: {e}"
+                
+                if tx_bytes is not None:
+                    # Success! Sign and send
+                    try:
+                        tx = VersionedTransaction.from_bytes(tx_bytes)
+                        signed_tx = VersionedTransaction(tx.message, [self.wallet])
+                        
+                        signature = await self.rpc.send_transaction(
+                            signed_tx,
+                            skip_preflight=True  # Skip preflight for speed
+                        )
+                        
+                        # Quick confirmation check
+                        confirmed = await self._confirm_transaction(str(signature))
+                        
+                        if confirmed:
+                            logger.info("pumpfun_buy_success", 
+                                       token=token_mint[:8], 
+                                       pool=pool,
+                                       signature=str(signature)[:16])
+                            return str(signature)
+                        else:
+                            logger.warning("tx_not_confirmed",
+                                         token=token_mint[:8],
+                                         pool=pool,
+                                         signature=str(signature)[:16])
+                            last_error = f"{pool}: tx_not_confirmed"
+                            continue  # Try next pool
+                            
+                    except Exception as e:
+                        logger.error("sign_send_error", token=token_mint[:8], pool=pool, error=str(e))
+                        last_error = f"{pool}: sign_error: {e}"
+                        continue
+                else:
+                    last_error = f"{pool}: HTTP {status_code} - {error_text[:50] if error_text else 'unknown'}"
+                    logger.debug("pumpfun_pool_failed", 
+                                token=token_mint[:8], 
+                                pool=pool, 
+                                status=status_code,
+                                error=error_text[:100] if error_text else None)
+                    continue  # Try next pool
             
-            if tx_bytes is None:
-                logger.warning("pumpfun_buy_failed",
-                             token=token_mint[:8],
-                             status=status_code,
-                             error=error_text[:100] if error_text else "unknown")
+            # All pools failed
+            logger.warning("pumpfun_buy_failed_all_pools",
+                         token=token_mint[:8],
+                         last_error=last_error)
+            return None
+                
+        except Exception as e:
+            logger.error("pumpfun_buy_error", token=token_mint[:8], error=str(e))
+            return None
+    
+    async def _execute_jupiter_buy(self, token_mint: str, trade_amount: float) -> Optional[str]:
+        """Execute buy via Jupiter API as fallback."""
+        try:
+            import base64
+            from solders.transaction import VersionedTransaction
+            
+            trade_lamports = int(trade_amount * SOL_DECIMALS)
+            
+            # Get quote from Jupiter
+            quote_url = (
+                f"{JUPITER_QUOTE_API}?inputMint={NATIVE_SOL}"
+                f"&outputMint={token_mint}"
+                f"&amount={trade_lamports}"
+                f"&slippageBps=1500"  # 15% slippage
+            )
+            
+            async with self.session.get(
+                quote_url,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("jupiter_quote_failed", 
+                                token=token_mint[:8], 
+                                status=resp.status)
+                    return None
+                
+                quote_data = await resp.json()
+            
+            if not quote_data or "route" not in quote_data:
+                logger.debug("jupiter_no_route", token=token_mint[:8])
                 return None
             
-            # Sign and send
+            # Build swap transaction
+            swap_payload = {
+                "userPublicKey": str(self.wallet.pubkey()),
+                "route": quote_data["route"],
+                "wrapUnwrapSOL": True,
+                "feeAccount": None,
+                "priorityFeeLamports": 500000  # 0.0005 SOL priority fee
+            }
+            
+            async with self.session.post(
+                JUPITER_SWAP_API,
+                json=swap_payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("jupiter_swap_failed",
+                                token=token_mint[:8],
+                                status=resp.status)
+                    return None
+                
+                swap_data = await resp.json()
+            
+            if not swap_data or "swapTransaction" not in swap_data:
+                logger.debug("jupiter_no_swap_tx", token=token_mint[:8])
+                return None
+            
+            # Deserialize and sign
+            tx_bytes = base64.b64decode(swap_data["swapTransaction"])
             tx = VersionedTransaction.from_bytes(tx_bytes)
             signed_tx = VersionedTransaction(tx.message, [self.wallet])
             
+            # Send transaction
             signature = await self.rpc.send_transaction(
                 signed_tx,
-                skip_preflight=True  # Skip preflight for speed
+                skip_preflight=True
             )
             
-            # Quick confirmation check
+            # Confirm
             confirmed = await self._confirm_transaction(str(signature))
             
             if confirmed:
+                logger.info("jupiter_buy_success",
+                           token=token_mint[:8],
+                           signature=str(signature)[:16])
                 return str(signature)
             else:
-                logger.warning("tx_not_confirmed",
+                logger.warning("jupiter_tx_not_confirmed",
                              token=token_mint[:8],
                              signature=str(signature)[:16])
                 return None
                 
         except Exception as e:
-            logger.error("pumpfun_buy_error", token=token_mint[:8], error=str(e))
+            logger.error("jupiter_buy_error", token=token_mint[:8], error=str(e))
             return None
     
     async def _confirm_transaction(self, signature: str, max_wait: int = 30) -> bool:
