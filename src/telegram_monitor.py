@@ -128,8 +128,44 @@ class TelegramUserMonitor:
         self.running = True
         logger.info("telegram_monitor_started", groups=len(self.monitored_groups))
         
+        # Verify handler is registered
+        logger.info("handler_registered", handlers_count=len(self.client._event_builders))
+        
+        # Start a health check task
+        health_task = asyncio.create_task(self._health_check())
+        
         # Use Telethon's recommended way to keep receiving updates
-        await self.client.run_until_disconnected()
+        try:
+            await self.client.run_until_disconnected()
+        except Exception as e:
+            logger.error("run_until_disconnected_error", error=str(e))
+        finally:
+            health_task.cancel()
+            logger.warning("telegram_monitor_exited")
+    
+    async def _health_check(self) -> None:
+        """Periodic health check to verify updates are being received."""
+        last_count = 0
+        while self.running:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            if not self.running:
+                break
+            
+            # Log current stats
+            current_count = self.messages_received
+            new_messages = current_count - last_count
+            last_count = current_count
+            
+            logger.info("health_check",
+                       messages_received=current_count,
+                       new_in_last_30s=new_messages,
+                       potential_signals=self.potential_signals,
+                       is_connected=self.client.is_connected() if self.client else False,
+                       is_authorized=await self.client.is_user_authorized() if self.client else False)
+            
+            if new_messages == 0:
+                logger.warning("no_messages_received_in_30s", 
+                              hint="Check if Telegram session is valid and groups are active")
     
     async def _discover_groups(self) -> None:
         """Discover all groups and channels the user is in."""
