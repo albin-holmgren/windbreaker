@@ -154,10 +154,11 @@ DASHBOARD_HTML = '''
                                 <th class="px-6 py-4">Entry</th>
                                 <th class="px-6 py-4">Tokens</th>
                                 <th class="px-6 py-4">Opened</th>
+                                <th class="px-6 py-4">Action</th>
                             </tr>
                         </thead>
                         <tbody id="openPositionsBody" class="text-sm">
-                            <tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>
+                            <tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -283,6 +284,40 @@ DASHBOARD_HTML = '''
             }
         }
         
+        async function sellPosition(mint) {
+            if (!confirm('Sell all of this position?\n\nToken: ' + mint.slice(0, 8) + '...')) {
+                return;
+            }
+            
+            try {
+                const btn = event.target;
+                btn.disabled = true;
+                btn.textContent = 'Selling...';
+                
+                const response = await fetch('/api/sell', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: mint })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Sell successful!\nSignature: ' + result.signature?.slice(0, 16));
+                    fetchData(); // Refresh
+                } else {
+                    alert('Sell failed: ' + (result.error || 'Unknown error'));
+                    btn.disabled = false;
+                    btn.textContent = 'Sell';
+                }
+            } catch (e) {
+                alert('Sell error: ' + e.message);
+                const btn = event.target;
+                btn.disabled = false;
+                btn.textContent = 'Sell';
+            }
+        }
+        
         function formatTime(timestamp) {
             if (!timestamp) return '-';
             const date = new Date(timestamp);
@@ -347,6 +382,11 @@ DASHBOARD_HTML = '''
                             <td class="px-6 py-4 text-neutral-400">${entry.toFixed(4)} SOL</td>
                             <td class="px-6 py-4 text-neutral-500">${Number(amt).toLocaleString()}</td>
                             <td class="px-6 py-4 text-neutral-500">${formatTime(entryTime)}</td>
+                            <td class="px-6 py-4">
+                                <button onclick="sellPosition('${mint}')" class="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 text-xs rounded transition-colors border border-red-500/30">
+                                    Sell
+                                </button>
+                            </td>
                         </tr>
                     `;
                 }).join('');
@@ -358,11 +398,12 @@ DASHBOARD_HTML = '''
                         <td class="px-6 py-4 text-white font-medium">${totalInvested.toFixed(4)} SOL</td>
                         <td class="px-6 py-4"></td>
                         <td class="px-6 py-4"></td>
+                        <td class="px-6 py-4"></td>
                     </tr>
                 `;
                 document.getElementById('openPositionsBody').innerHTML = posHtml + totalRow;
             } else {
-                document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="4" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
+                document.getElementById('openPositionsBody').innerHTML = '<tr><td colspan="5" class="px-6 py-8 text-center text-neutral-600">No open positions</td></tr>';
             }
             
             // Update closed trades (sells and auto_sells)
@@ -461,6 +502,54 @@ class WebDashboard:
         self.app.router.add_post('/api/import', self.handle_import)
         self.app.router.add_get('/health', self.handle_health)
         self.app.router.add_post('/api/test_trade', self.handle_test_trade)
+        self.app.router.add_post('/api/sell', self.handle_sell)
+    
+    async def handle_sell(self, request):
+        """Manual sell endpoint for emergency position exit."""
+        try:
+            data = await request.json()
+            token_mint = data.get('token')
+            
+            if not token_mint:
+                return web.json_response({'error': 'Token mint required'}, status=400)
+            
+            logger.info("manual_sell_requested", token=token_mint[:8])
+            
+            # Check if we have Telegram AI trader available
+            from .main_telegram import TelegramAITrader
+            
+            if not hasattr(TelegramAITrader, '_instance') or TelegramAITrader._instance is None:
+                return web.json_response({
+                    'error': 'Trader not initialized',
+                    'hint': 'Wait for bot to fully start'
+                }, status=503)
+            
+            trader = TelegramAITrader._instance
+            position_manager = trader.position_manager
+            
+            if not position_manager:
+                return web.json_response({
+                    'error': 'Position manager not available'
+                }, status=503)
+            
+            # Try emergency sell
+            success = await position_manager.emergency_sell_all(token_mint)
+            
+            if success:
+                return web.json_response({
+                    'success': True,
+                    'token': token_mint[:8],
+                    'message': 'Position sold successfully'
+                })
+            else:
+                return web.json_response({
+                    'success': False,
+                    'error': 'Sell failed - check logs for details'
+                }, status=500)
+                
+        except Exception as e:
+            logger.error("manual_sell_error", error=str(e))
+            return web.json_response({'error': str(e)}, status=500)
     
     async def handle_dashboard(self, request):
         """Serve the dashboard HTML."""
