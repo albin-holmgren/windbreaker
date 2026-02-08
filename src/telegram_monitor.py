@@ -391,7 +391,9 @@ class TelegramUserMonitor:
                 
                 if self.on_message and addresses:
                     # Send to handler with first address
-                    await self.on_message(text, addresses[0], chat_name)
+                    chat_id = event.chat_id
+                    message_id = event.message.id
+                    await self.on_message(text, addresses[0], chat_name, chat_id, message_id)
             
         except Exception as e:
             logger.error("message_processing_error", error=str(e))

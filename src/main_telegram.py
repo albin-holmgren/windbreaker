@@ -21,6 +21,7 @@ from .signal_manager import FastSignalManager
 from .fast_trader import FastTrader
 from .tiered_position_manager import TieredPositionManager
 from .web_dashboard import WebDashboard
+from .chat_logger import ChatLogger
 
 # Configure logging
 structlog.configure(
@@ -60,6 +61,7 @@ class TelegramAITrader:
         self.dashboard = None
         self.running = False
         self.env_file = env_file
+        self.chat_logger: Optional[ChatLogger] = None
     
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -160,12 +162,18 @@ class TelegramAITrader:
             session_name=self.config.telegram_session_name,
             on_message=self._on_telegram_message
         )
-        logger.info("telegram_monitor_initialized",
-                   api_id=self.config.telegram_api_id,
-                   phone=self.config.telegram_phone[:6] + "...")
+        # Initialize chat logger for history
+        self.chat_logger = ChatLogger(
+            base_path="/data/chat_history",
+            retention_days=90,
+            max_file_size_mb=100.0
+        )
+        logger.info("chat_logger_initialized", retention_days=90)
     
-    async def _on_telegram_message(self, text: str, address: str, chat_name: str) -> None:
+    async def _on_telegram_message(self, text: str, address: str, chat_name: str, chat_id: int = 0, message_id: int = 0) -> None:
         """Handle incoming Telegram message with potential signal."""
+        now = datetime.utcnow()
+        
         logger.debug("processing_telegram_message",
                    chat=chat_name,
                    text_preview=text[:50],
@@ -174,37 +182,68 @@ class TelegramAITrader:
         # Quick regex validation
         if len(address) < 32 or len(address) > 44:
             logger.debug("invalid_address_length", address=address[:10])
+            # Log even invalid messages for completeness
+            if self.chat_logger:
+                self.chat_logger.log_message(
+                    timestamp=now,
+                    chat_id=chat_id or hash(chat_name) % 10000000000,  # Use hash if no ID
+                    chat_name=chat_name,
+                    message_id=message_id,
+                    text=text,
+                    has_address=False,
+                    bot_action="invalid_address"
+                )
             return
         
         # Parse with AI for confirmation and fresh launch detection
-        token_address, classification, confidence = await self.ai_parser.extract_token_fast(text, chat_name)
+        token_address, classification, confidence = await self.ai_parser.extract_token_fast(text, chat_id or chat_name)
         
+        # Determine bot action
+        bot_action = "none"
         if not token_address:
+            bot_action = "no_token_extracted"
             logger.debug("ai_no_token_extracted")
-            return
-        
-        # Log confidence level for debugging
-        if confidence == "high":
-            logger.info("high_confidence_signal",
-                       token=token_address[:8],
-                       chat=chat_name,
-                       classification=classification)
-        
-        # Skip if AI classified this as an OLD call (not a fresh launch)
-        # Only buy if AI says "fresh" or we can't determine ("unknown")
-        if classification == "old":
+        elif classification == "old":
+            bot_action = "skipped_old"
             logger.info("skipping_old_call_message",
                        token=token_address[:8],
                        chat=chat_name,
                        reason="ai_classified_as_old")
-            return
-        
-        if classification == "fresh":
+        elif classification == "fresh":
+            bot_action = "fresh_detected"
             logger.info("fresh_launch_detected",
                        token=token_address[:8],
                        chat=chat_name,
                        confidence=confidence,
                        message_preview=text[:60])
+        else:
+            bot_action = "unknown_classification"
+        
+        # Log confidence level for debugging
+        if confidence == "high":
+            logger.info("high_confidence_signal",
+                       token=token_address[:8] if token_address else "none",
+                       chat=chat_name,
+                       classification=classification)
+        
+        # Log message to persistent storage
+        if self.chat_logger:
+            self.chat_logger.log_message(
+                timestamp=now,
+                chat_id=chat_id or hash(chat_name) % 10000000000,
+                chat_name=chat_name,
+                message_id=message_id,
+                text=text,
+                has_address=token_address is not None,
+                token_address=token_address,
+                classification=classification,
+                confidence=confidence,
+                bot_action=bot_action
+            )
+        
+        # Skip if AI classified this as an OLD call (not a fresh launch)
+        if classification == "old" or not token_address:
+            return
         
         # Add to signal manager (will trigger trade if new)
         await self.signal_manager.add_signal(
