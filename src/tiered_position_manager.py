@@ -222,6 +222,13 @@ class TieredPositionManager:
         
         price_ratio = current_price / position.entry_price if position.entry_price > 0 else 0
         
+        # Log every check for debugging
+        logger.debug("tier1_check",
+                   token=position.token_address[:8],
+                   price_ratio=f"{price_ratio:.2f}x",
+                   target=f"{position.tier1.target_multiplier}x",
+                   triggered=price_ratio >= position.tier1.target_multiplier)
+        
         if price_ratio >= position.tier1.target_multiplier:
             logger.info("tier1_triggered",
                        token=position.token_address[:8],
@@ -242,14 +249,26 @@ class TieredPositionManager:
                 logger.info("tier1_executed",
                            token=position.token_address[:8],
                            sold_percent=50,
-                   remaining=50)
+                           remaining=50)
+            else:
+                logger.error("tier1_sell_failed",
+                           token=position.token_address[:8],
+                           price_ratio=price_ratio)
     
     async def _check_tier2(self, position: TieredPosition, current_price: float) -> None:
         """Check and execute Tier 2 (20% at 5x)."""
         if position.tier2.executed or not position.tier1.executed:
+            # Log why we're skipping
+            if not position.tier1.executed:
+                logger.debug("tier2_waiting_for_tier1", token=position.token_address[:8])
             return
         
         price_ratio = current_price / position.entry_price if position.entry_price > 0 else 0
+        
+        logger.debug("tier2_check",
+                   token=position.token_address[:8],
+                   price_ratio=f"{price_ratio:.2f}x",
+                   target=f"{position.tier2.target_multiplier}x")
         
         if price_ratio >= position.tier2.target_multiplier:
             logger.info("tier2_triggered",
@@ -272,6 +291,10 @@ class TieredPositionManager:
                            token=position.token_address[:8],
                            sold_percent=20,
                            remaining=30)
+            else:
+                logger.error("tier2_sell_failed",
+                           token=position.token_address[:8],
+                           price_ratio=price_ratio)
     
     async def _check_tier3(self, position: TieredPosition, current_price: float) -> None:
         """Check and execute Tier 3 (trailing stop on remaining 30%)."""
@@ -542,6 +565,11 @@ class TieredPositionManager:
                 timeout=aiohttp.ClientTimeout(total=3)
             ) as resp:
                 if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.warning("jupiter_price_fetch_failed",
+                               token=token_address[:8],
+                               status=resp.status,
+                               error=error_text[:100])
                     return None
                 
                 data = await resp.json()
@@ -551,12 +579,20 @@ class TieredPositionManager:
                     # Price = tokens per SOL
                     price = out_amount / SOL_DECIMALS
                     self._price_cache[token_address] = (price, datetime.utcnow())
+                    logger.debug("price_fetched",
+                               token=token_address[:8],
+                               price=price,
+                               tokens_per_sol=out_amount)
                     return price
+                else:
+                    logger.warning("jupiter_zero_outamount",
+                               token=token_address[:8],
+                               data=str(data)[:200])
                 
                 return None
                 
         except Exception as e:
-            logger.debug("price_fetch_error", token=token_address[:8], error=str(e))
+            logger.error("price_fetch_exception", token=token_address[:8], error=str(e))
             return None
     
     def get_position(self, token_address: str) -> Optional[TieredPosition]:
@@ -580,4 +616,77 @@ class TieredPositionManager:
             "tier3_executed": self.tier3_executed,
             "avg_pnl": f"{total_pnl / max(len(self.positions), 1):.1f}%",
             "checks_performed": self.checks_performed
+        }
+    
+    async def emergency_sell_all(self, token_address: str) -> bool:
+        """
+        Emergency manual sell - sell 100% of position immediately.
+        Use this when stuck in a position that tiered selling didn't handle.
+        """
+        position = self.positions.get(token_address)
+        if not position:
+            logger.error("emergency_sell_position_not_found", token=token_address[:8])
+            return False
+        
+        if position.fully_exited:
+            logger.info("position_already_exited", token=token_address[:8])
+            return True
+        
+        logger.warning("emergency_sell_initiated",
+                      token=token_address[:8],
+                      current_pnl=f"{position.pnl_percent:.1f}%",
+                      balance=position.total_tokens)
+        
+        # Get current balance
+        await self._update_position_balance(position)
+        
+        if position.total_tokens <= 0:
+            logger.error("emergency_sell_no_balance", token=token_address[:8])
+            return False
+        
+        # Try to sell 100%
+        success = await self._execute_sell(position, 100, "emergency")
+        
+        if success:
+            position.fully_exited = True
+            position.total_sold_percent = 100
+            logger.info("emergency_sell_success",
+                       token=token_address[:8],
+                       sold=position.total_tokens)
+            return True
+        else:
+            logger.error("emergency_sell_failed",
+                       token=token_address[:8],
+                       balance=position.total_tokens)
+            return False
+    
+    async def debug_position(self, token_address: str) -> dict:
+        """Get detailed debug info about a position."""
+        position = self.positions.get(token_address)
+        if not position:
+            return {"error": "Position not found"}
+        
+        # Fetch fresh data
+        current_price = await self._get_token_price(token_address)
+        balance = await self._get_token_balance(token_address)
+        
+        price_ratio = 0
+        if current_price and position.entry_price > 0:
+            price_ratio = current_price / position.entry_price
+        
+        return {
+            "token": token_address[:8],
+            "entry_price": position.entry_price,
+            "current_price": current_price,
+            "price_ratio": price_ratio,
+            "target_tier1": position.tier1.target_multiplier,
+            "target_tier2": position.tier2.target_multiplier,
+            "tier1_executed": position.tier1.executed,
+            "tier2_executed": position.tier2.executed,
+            "tier3_executed": position.tier3.executed,
+            "wallet_balance_raw": balance,
+            "position_balance": position.total_tokens,
+            "pnl_percent": position.pnl_percent,
+            "trailing_active": position.trailing_stop_active,
+            "highest_price_seen": position.highest_price_seen,
         }
