@@ -153,6 +153,9 @@ class TieredPositionManager:
                 continue
             
             try:
+                # Update token balance from wallet (fixes blank values)
+                await self._update_position_balance(position)
+                
                 # Get current price
                 current_price = await self._get_token_price(token_address)
                 if current_price is None:
@@ -184,6 +187,33 @@ class TieredPositionManager:
                 logger.error("position_check_error",
                            token=token_address[:8],
                            error=str(e))
+    
+    async def _update_position_balance(self, position: TieredPosition) -> None:
+        """Fetch and update the token balance for a position."""
+        try:
+            token_balance = await self._get_token_balance(position.token_address)
+            if token_balance and token_balance > 0:
+                # Convert from raw units to human-readable
+                # Most tokens have 6 decimals (standard SPL)
+                # For pump.fun tokens, we'll need to fetch decimals or assume 9
+                human_balance = token_balance / 1_000_000  # Assume 6 decimals default
+                
+                # Only update if significantly different to avoid noise
+                if abs(human_balance - position.total_tokens) > 0.001:
+                    old_balance = position.total_tokens
+                    position.total_tokens = human_balance
+                    logger.info("position_balance_updated",
+                               token=position.token_address[:8],
+                               old_balance=old_balance,
+                               new_balance=human_balance)
+            else:
+                # No balance found - token might have been sold externally
+                if position.total_tokens > 0:
+                    logger.warning("token_balance_zero_in_wallet",
+                                token=position.token_address[:8],
+                                previous_balance=position.total_tokens)
+        except Exception as e:
+            logger.debug("balance_update_failed", token=position.token_address[:8], error=str(e))
     
     async def _check_tier1(self, position: TieredPosition, current_price: float) -> None:
         """Check and execute Tier 1 (50% at 2x)."""

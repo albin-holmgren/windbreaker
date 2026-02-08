@@ -263,11 +263,14 @@ class TelegramAITrader:
         
         if success:
             # Register position with position manager for tiered selling
-            self.position_manager.add_position(
+            position = self.position_manager.add_position(
                 token_address=signal.token_address,
                 entry_sol=self.config.trade_amount_sol,
                 total_tokens=0  # Will be updated on first price check
             )
+            # Immediately update balance so it shows correctly in dashboard
+            await self.position_manager._update_position_balance(position)
+            
             self.signal_manager.mark_processed(signal.token_address, executed=True)
             self.signal_manager.mark_bought(signal.token_address)
             logger.info("trade_executed",
