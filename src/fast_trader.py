@@ -190,6 +190,70 @@ class FastTrader:
         
         return round(trade_amount, 4)
     
+    async def _check_rug_status(self, token_mint: str) -> tuple[bool, str]:
+        """
+        Check token for honeypot/rug status using rugcheck.xyz API.
+        Returns (is_safe, message).
+        """
+        try:
+            # Use rugcheck.xyz API (free tier)
+            url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report"
+            
+            async with self.session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    # Check for critical risks
+                    risks = data.get("risks", [])
+                    score = data.get("score", 0)
+                    
+                    # Critical red flags
+                    critical_risks = [
+                        r for r in risks 
+                        if r.get("level", "").lower() in ["critical", "high", "danger"]
+                        or any(x in r.get("name", "").lower() for x in 
+                               ["honeypot", "mint", "freeze", "blacklist", "rug"])
+                    ]
+                    
+                    if critical_risks:
+                        risk_names = [r.get("name", "unknown") for r in critical_risks]
+                        logger.warning("rugcheck_critical_risks",
+                                   token=token_mint[:8],
+                                   risks=risk_names,
+                                   score=score)
+                        return False, f"Critical risks: {', '.join(risk_names[:3])}"
+                    
+                    if score < 30:  # Very low score
+                        logger.warning("rugcheck_low_score",
+                                   token=token_mint[:8],
+                                   score=score)
+                        return False, f"Low rugcheck score: {score}/100"
+                    
+                    logger.info("rugcheck_passed",
+                               token=token_mint[:8],
+                               score=score,
+                               risk_count=len(risks))
+                    return True, f"Score: {score}/100"
+                    
+                elif resp.status == 404:
+                    # Token not in rugcheck DB yet - probably very new
+                    logger.info("rugcheck_not_found_yet", token=token_mint[:8])
+                    return True, "New token - not in database yet"
+                else:
+                    logger.debug("rugcheck_api_error", 
+                               token=token_mint[:8], 
+                               status=resp.status)
+                    # Allow buy if API fails (don't block on API errors)
+                    return True, "Rugcheck API unavailable"
+                    
+        except Exception as e:
+            logger.debug("rugcheck_exception", token=token_mint[:8], error=str(e))
+            # Allow buy on error - better to try than miss a good trade
+            return True, "Rugcheck check failed"
+    
     async def execute_buy(self, signal: TradingSignal) -> bool:
         """
         Execute a buy for a signal.
@@ -208,6 +272,16 @@ class FastTrader:
                            token=token_address[:8],
                            hours_ago=(now - last_buy).total_seconds() / 3600)
                 return False
+        
+        # --- HONEYPOT/RUG CHECK ---
+        is_safe, rug_msg = await self._check_rug_status(token_address)
+        if not is_safe:
+            logger.warning("skipping_honeypot_token",
+                          token=token_address[:8],
+                          reason=rug_msg)
+            return False
+        else:
+            logger.info("rug_check_passed", token=token_address[:8], details=rug_msg)
         
         # Check token age - only buy fresh launches (< 30 min old by default)
         max_age_minutes = getattr(self.config, 'max_token_age_minutes', 30)
