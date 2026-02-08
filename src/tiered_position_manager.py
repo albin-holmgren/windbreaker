@@ -543,19 +543,32 @@ class TieredPositionManager:
             return None
     
     async def _get_token_price(self, token_address: str) -> Optional[float]:
-        """Get token price from Jupiter or cache."""
+        """Get token price from Jupiter or pump.fun API."""
         # Check cache
         if token_address in self._price_cache:
             price, timestamp = self._price_cache[token_address]
             if datetime.utcnow() - timestamp < self._cache_ttl:
                 return price
         
+        # Try Jupiter first
+        jupiter_price = await self._get_jupiter_price(token_address)
+        if jupiter_price:
+            return jupiter_price
+        
+        # Fallback to pump.fun API for pump.fun tokens
+        pump_price = await self._get_pumpfun_price(token_address)
+        if pump_price:
+            return pump_price
+        
+        return None
+    
+    async def _get_jupiter_price(self, token_address: str) -> Optional[float]:
+        """Get price from Jupiter API."""
         try:
-            # Get Jupiter quote for 1 SOL worth of token
             params = {
                 "inputMint": NATIVE_SOL,
                 "outputMint": token_address,
-                "amount": str(SOL_DECIMALS),  # 1 SOL
+                "amount": str(SOL_DECIMALS),
                 "slippageBps": "100"
             }
             
@@ -565,34 +578,61 @@ class TieredPositionManager:
                 timeout=aiohttp.ClientTimeout(total=3)
             ) as resp:
                 if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning("jupiter_price_fetch_failed",
-                               token=token_address[:8],
-                               status=resp.status,
-                               error=error_text[:100])
+                    logger.debug("jupiter_price_failed", token=token_address[:8], status=resp.status)
                     return None
                 
                 data = await resp.json()
                 out_amount = float(data.get("outAmount", 0))
                 
                 if out_amount > 0:
-                    # Price = tokens per SOL
                     price = out_amount / SOL_DECIMALS
-                    self._price_cache[token_address] = (price, datetime.utcnow())
-                    logger.debug("price_fetched",
-                               token=token_address[:8],
-                               price=price,
-                               tokens_per_sol=out_amount)
+                    logger.debug("jupiter_price_ok", token=token_address[:8], price=price)
                     return price
-                else:
-                    logger.warning("jupiter_zero_outamount",
-                               token=token_address[:8],
-                               data=str(data)[:200])
                 
                 return None
                 
         except Exception as e:
-            logger.error("price_fetch_exception", token=token_address[:8], error=str(e))
+            logger.debug("jupiter_price_exception", token=token_address[:8], error=str(e))
+            return None
+    
+    async def _get_pumpfun_price(self, token_address: str) -> Optional[float]:
+        """Get price from pump.fun API for pump.fun tokens."""
+        try:
+            url = f"https://frontend-api.pump.fun/coins/{token_address}"
+            
+            async with self.session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("pumpfun_price_failed", token=token_address[:8], status=resp.status)
+                    return None
+                
+                data = await resp.json()
+                
+                # Extract market cap - we need to calculate price from this
+                market_cap = data.get("market_cap", 0)
+                total_supply = data.get("total_supply", 0) or data.get("totalSupply", 0)
+                
+                if market_cap > 0 and total_supply > 0:
+                    # Price in USD per token
+                    usd_price = market_cap / total_supply
+                    # Convert to tokens per SOL (rough estimate using $150/SOL)
+                    sol_price = 150.0
+                    tokens_per_sol = sol_price / usd_price if usd_price > 0 else 0
+                    
+                    logger.info("pumpfun_price_fetched",
+                               token=token_address[:8],
+                               market_cap=market_cap,
+                               tokens_per_sol=tokens_per_sol)
+                    
+                    self._price_cache[token_address] = (tokens_per_sol, datetime.utcnow())
+                    return tokens_per_sol
+                
+                return None
+                
+        except Exception as e:
+            logger.debug("pumpfun_price_exception", token=token_address[:8], error=str(e))
             return None
     
     def get_position(self, token_address: str) -> Optional[TieredPosition]:
