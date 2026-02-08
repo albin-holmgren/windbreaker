@@ -177,11 +177,18 @@ class TelegramAITrader:
             return
         
         # Parse with AI for confirmation and fresh launch detection
-        token_address, classification = await self.ai_parser.extract_token_fast(text)
+        token_address, classification, confidence = await self.ai_parser.extract_token_fast(text, chat_name)
         
         if not token_address:
             logger.debug("ai_no_token_extracted")
             return
+        
+        # Log confidence level for debugging
+        if confidence == "high":
+            logger.info("high_confidence_signal",
+                       token=token_address[:8],
+                       chat=chat_name,
+                       classification=classification)
         
         # Skip if AI classified this as an OLD call (not a fresh launch)
         # Only buy if AI says "fresh" or we can't determine ("unknown")
@@ -196,6 +203,7 @@ class TelegramAITrader:
             logger.info("fresh_launch_detected",
                        token=token_address[:8],
                        chat=chat_name,
+                       confidence=confidence,
                        message_preview=text[:60])
         
         # Add to signal manager (will trigger trade if new)

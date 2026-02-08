@@ -1,13 +1,15 @@
 """
-AI Gateway Parser - Fast token extraction from messages.
+AI Gateway Parser - Fast token extraction from messages with chat memory.
 Uses OpenRouter (or any OpenAI-compatible API) for AI-powered token extraction.
 Falls back to regex if AI fails.
+Tracks chat history to understand launch timing and context.
 """
 
 import asyncio
 import aiohttp
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import deque
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -15,34 +17,164 @@ logger = structlog.get_logger(__name__)
 # Default AI endpoint (Vercel AI Gateway)
 DEFAULT_AI_GATEWAY_URL = "https://ai-gateway.vercel.com/v1/chat/completions"
 
-# System prompt for token extraction with fresh launch detection
+# System prompt for token extraction with fresh launch detection and context
 TOKEN_EXTRACTION_PROMPT = """You are a crypto trading signal parser. Extract Solana token addresses from Telegram messages and classify if it's a FRESH LAUNCH or OLD CALL.
+
+CONTEXT: You have access to recent chat history including any "launch in X hours" announcements.
 
 Rules:
 1. Look for base58-encoded Solana addresses (32-44 characters, alphanumeric)
 2. Analyze the message text to determine if this is a NEW/FRESH launch or an OLD call
-3. Return format: ADDRESS|CLASSIFICATION
+3. Consider timing: If there was a recent "launch in X hours" announcement, and this CA appears around that time, it's likely the real launch
+4. Return format: ADDRESS|CLASSIFICATION|CONFIDENCE
    - ADDRESS: the token address (or "none" if not found)
    - CLASSIFICATION: "fresh" for new launches, "old" for established coins, "unknown" if unclear
+   - CONFIDENCE: "high" if launch announcement matches, "medium" for typical fresh signals, "low" for unclear
 
-Fresh launch indicators: "NEW", "LAUNCH", "JUST", "FRESH", "MINT", "RELEASED", "NOW", "🟢", "🚀"
-Old call indicators: "CALL", "GEM", "BUY", "HOLD", "SUPPORT", "ACCUMULATE", "DIP", "🎯"
+Fresh launch indicators: "NEW", "LAUNCH", "JUST", "FRESH", "MINT", "RELEASED", "NOW", "🟢", "🚀", "LIVE"
+Old call indicators: "CALL", "GEM", "BUY", "HOLD", "SUPPORT", "ACCUMULATE", "DIP", "🎯", "REVISITING"
+
+Launch announcement patterns to remember:
+- "Launching in 2 hours" → expect CA in ~2 hours
+- "Going live in 30 minutes" → expect CA in ~30 minutes  
+- "CA dropping soon" → expect CA within minutes
+- "Live now" + CA = immediate buy signal
 
 Examples:
-- Input: "🟢 NEW LAUNCH! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|fresh
+- Input: "🟢 NEW LAUNCH! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" (with prior "launch in 5 min" announcement)
+- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|fresh|high
 
-- Input: "BUY $PEPE now! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|old
+- Input: "BUY $PEPE now! Great entry! CA: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+- Output: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263|old|medium
 
-- Input: "Great project!"
-- Output: none|unknown
+- Input: "Great project!" (no CA)
+- Output: none|unknown|low
 
 Extract from this message:"""
 
 
+class ChatMemory:
+    """Stores chat history to understand launch timing and context."""
+    
+    def __init__(self, max_messages: int = 50, max_age_hours: int = 6):
+        self.messages: deque = deque(maxlen=max_messages)  # (timestamp, chat_id, text, has_address)
+        self.launch_announcements: dict = {}  # chat_id -> list of (timestamp, delay_minutes, token_name)
+        self.max_age = timedelta(hours=max_age_hours)
+    
+    def add_message(self, chat_id: int, text: str, has_address: bool = False) -> None:
+        """Store a message with timestamp."""
+        now = datetime.utcnow()
+        self.messages.append({
+            'timestamp': now,
+            'chat_id': chat_id,
+            'text': text[:200],  # Truncate for memory
+            'has_address': has_address
+        })
+        
+        # Check for launch announcements
+        self._detect_launch_announcement(chat_id, text, now)
+    
+    def _detect_launch_announcement(self, chat_id: int, text: str, timestamp: datetime) -> None:
+        """Detect 'launching in X minutes/hours' patterns."""
+        import re
+        text_lower = text.lower()
+        
+        # Patterns like "launch in 30 minutes", "live in 2 hours", "ca dropping in 15 min"
+        patterns = [
+            r'(?:launch|live|ca|contract|going|dropping)\s+(?:in|at)\s+(\d+)\s*(?:min|minute)',
+            r'(?:launch|live|ca|contract|going|dropping)\s+(?:in|at)\s+(\d+)\s*(?:hr|hour)',
+            r'(\d+)\s*(?:min|minute)s?\s+(?:until|till|to)\s+(?:launch|live|ca|contract)',
+            r'(\d+)\s*(?:hr|hour)s?\s+(?:until|till|to)\s+(?:launch|live|ca|contract)',
+            r'(?:launch|live)\s+(?:in|at)\s+(\d+):(\d+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                # Extract delay
+                if 'hour' in text_lower or 'hr' in text_lower:
+                    delay_minutes = int(match.group(1)) * 60
+                else:
+                    delay_minutes = int(match.group(1))
+                
+                # Try to extract token name (look for $XXX or ALLCAPS)
+                token_match = re.search(r'\$([A-Z]{2,10})|#([A-Z]{2,10})', text)
+                token_name = token_match.group(1) or token_match.group(2) if token_match else "unknown"
+                
+                if chat_id not in self.launch_announcements:
+                    self.launch_announcements[chat_id] = []
+                
+                self.launch_announcements[chat_id].append({
+                    'timestamp': timestamp,
+                    'delay_minutes': delay_minutes,
+                    'token_name': token_name,
+                    'original_text': text[:100]
+                })
+                
+                logger.info("launch_announcement_detected",
+                           chat_id=chat_id,
+                           token=token_name,
+                           delay_minutes=delay_minutes,
+                           expected_time=(timestamp + timedelta(minutes=delay_minutes)).strftime('%H:%M'))
+                break
+    
+    def get_recent_context(self, chat_id: int, minutes: int = 30) -> str:
+        """Get recent messages from a chat for context."""
+        now = datetime.utcnow()
+        cutoff = now - timedelta(minutes=minutes)
+        
+        recent = [
+            f"[{m['timestamp'].strftime('%H:%M')}] {m['text']}"
+            for m in self.messages
+            if m['chat_id'] == chat_id and m['timestamp'] > cutoff
+        ]
+        
+        return "\n".join(recent[-10:])  # Last 10 messages max
+    
+    def is_expected_launch(self, chat_id: int, token_address: str, tolerance_minutes: int = 15) -> tuple[bool, str]:
+        """Check if a token address appearing now matches an expected launch."""
+        now = datetime.utcnow()
+        
+        if chat_id not in self.launch_announcements:
+            return False, "no prior announcement"
+        
+        # Clean old announcements
+        self.launch_announcements[chat_id] = [
+            ann for ann in self.launch_announcements[chat_id]
+            if now - ann['timestamp'] < timedelta(hours=6)  # Keep 6 hours
+        ]
+        
+        if not self.launch_announcements[chat_id]:
+            return False, "no recent announcement"
+        
+        # Check if any announcement's expected time is now (within tolerance)
+        for ann in self.launch_announcements[chat_id]:
+            expected_time = ann['timestamp'] + timedelta(minutes=ann['delay_minutes'])
+            diff = abs((now - expected_time).total_seconds() / 60)
+            
+            if diff <= tolerance_minutes:
+                return True, f"matches {ann['token_name']} launch (expected {expected_time.strftime('%H:%M')}, diff {diff:.0f}min)"
+        
+        return False, "no matching launch time"
+    
+    def cleanup_old(self) -> None:
+        """Remove old messages and announcements."""
+        now = datetime.utcnow()
+        
+        # Messages auto-cleanup via deque maxlen
+        
+        # Clean old announcements
+        for chat_id in list(self.launch_announcements.keys()):
+            self.launch_announcements[chat_id] = [
+                ann for ann in self.launch_announcements[chat_id]
+                if now - ann['timestamp'] < self.max_age
+            ]
+            if not self.launch_announcements[chat_id]:
+                del self.launch_announcements[chat_id]
+
+
 class AIGatewayParser:
-    """Parse Telegram messages using OpenRouter or any OpenAI-compatible API."""
+    """Parse Telegram messages using OpenRouter or any OpenAI-compatible API with chat memory."""
     
     def __init__(
         self,
@@ -60,11 +192,15 @@ class AIGatewayParser:
         
         self.session: Optional[aiohttp.ClientSession] = None
         
+        # Chat memory for context
+        self.memory = ChatMemory(max_messages=100, max_age_hours=6)
+        
         # Stats
         self.requests_made = 0
         self.timeouts = 0
         self.tokens_found = 0
         self.ai_errors = 0
+        self.high_confidence_buys = 0
         
     async def start(self) -> None:
         """Initialize HTTP session."""
@@ -78,6 +214,41 @@ class AIGatewayParser:
         """Close HTTP session."""
         if self.session:
             await self.session.close()
+    
+    async def extract_token_with_context(self, message_text: str, chat_id: int) -> tuple[Optional[str], str, str]:
+        """
+        Extract token with chat context for better launch timing detection.
+        Returns (address, classification, confidence) where confidence is "high", "medium", or "low".
+        """
+        # Store this message
+        has_address = len(message_text) > 32 and any(c.isalnum() for c in message_text)
+        self.memory.add_message(chat_id, message_text, has_address)
+        
+        # Check if there's a matching launch announcement
+        is_expected_launch, launch_context = self.memory.is_expected_launch(chat_id, "")
+        
+        # Get recent context
+        recent_context = self.memory.get_recent_context(chat_id, minutes=60)
+        
+        # Build context-aware prompt
+        context_prompt = message_text
+        if recent_context:
+            context_prompt = f"RECENT CHAT HISTORY:\n{recent_context}\n\nCURRENT MESSAGE:\n{message_text}"
+        
+        # Get result from AI
+        address, classification = await self.extract_token(context_prompt)
+        
+        # Determine confidence based on launch timing match
+        confidence = "medium"  # default
+        if is_expected_launch and address:
+            confidence = "high"
+            self.high_confidence_buys += 1
+            logger.info("high_confidence_launch_match",
+                       token=address[:8] if address else "none",
+                       chat=chat_id,
+                       context=launch_context)
+        
+        return address, classification, confidence
     
     async def extract_token(self, message_text: str) -> tuple[Optional[str], str]:
         """
@@ -161,16 +332,22 @@ class AIGatewayParser:
             logger.error("ai_extraction_error", error=str(e))
             return None, "unknown"
     
-    async def extract_token_fast(self, message_text: str) -> tuple[Optional[str], str]:
+    async def extract_token_fast(self, message_text: str, chat_id: int = 0) -> tuple[Optional[str], str, str]:
         """
-        Fast extraction with fallback to regex if AI fails.
-        First tries AI, falls back to regex pattern matching if timeout/error.
-        Returns (address, classification) where classification is "fresh", "old", or "unknown".
+        Fast extraction with chat context and fallback to regex if AI fails.
+        First tries AI with context, falls back to regex pattern matching if timeout/error.
+        Returns (address, classification, confidence) where confidence is "high", "medium", or "low".
         """
-        # Try AI first
-        address, classification = await self.extract_token(message_text)
-        if address:
-            return address, classification
+        # Try AI with context first (if chat_id provided)
+        if chat_id != 0:
+            address, classification, confidence = await self.extract_token_with_context(message_text, chat_id)
+            if address:
+                return address, classification, confidence
+        else:
+            # No chat context available
+            address, classification = await self.extract_token(message_text)
+            if address:
+                return address, classification, "medium"
         
         # Fallback: regex extraction - classify as unknown since we can't analyze message
         import re
@@ -184,11 +361,11 @@ class AIGatewayParser:
                 # Wallet addresses are typically 43-44 chars
                 if 32 <= len(match) <= 40:
                     logger.info("token_extracted_fallback", token=match[:8] + "...", classification="unknown")
-                    return match, "unknown"
+                    return match, "unknown", "low"
             # If no short ones, return the first
-            return matches[0], "unknown"
+            return matches[0], "unknown", "low"
         
-        return None, "unknown"
+        return None, "unknown", "low"
     
     def get_stats(self) -> dict:
         """Get parser stats."""
