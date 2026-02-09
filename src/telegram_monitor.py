@@ -142,13 +142,22 @@ class TelegramUserMonitor:
             session = self.session_name
         
         # --- Layer 3: Named device so user recognizes bot in Active Sessions ---
+        # Add connection settings for Railway's network environment
+        from telethon import connection
+        
         self.client = TelegramClient(
             session,
             self.api_id,
             self.api_hash,
             device_model="Windbreaker Bot",
             system_version="Railway",
-            app_version="1.0"
+            app_version="1.0",
+            # Connection settings for cloud environment stability
+            connection=connection.ConnectionTcpFull,
+            timeout=10,  # 10 second timeout for operations
+            request_retries=3,  # Retry failed requests 3 times
+            connection_retries=3,  # Retry connection 3 times before failing
+            retry_delay=1,  # Wait 1 second between retries
         )
         
         if use_string_session or isinstance(session, StringSession):
@@ -215,14 +224,16 @@ class TelegramUserMonitor:
         # Start a health check task
         health_task = asyncio.create_task(self._health_check())
         
-        # Start polling loop (primary mechanism since push updates don't work reliably across IPs)
+        # Start polling loop (PRIMARY mechanism - more reliable in cloud environments)
         poll_task = asyncio.create_task(self._poll_groups())
         
-        # Use Telethon's recommended way to keep receiving updates (as backup)
+        # Keep the main task alive - don't use run_until_disconnected 
+        # (causes connection spam in Railway's network environment)
         try:
-            await self.client.run_until_disconnected()
+            while self.running:
+                await asyncio.sleep(60)  # Just keep alive, polling does the work
         except Exception as e:
-            logger.error("run_until_disconnected_error", error=str(e))
+            logger.error("main_loop_error", error=str(e))
         finally:
             health_task.cancel()
             poll_task.cancel()
@@ -273,10 +284,39 @@ class TelegramUserMonitor:
         
         logger.info("baseline_established", chats_tracked=len(last_message_ids))
         
+        consecutive_errors = 0
+        
         while self.running:
             await asyncio.sleep(POLL_INTERVAL)  # Wait between polling cycles
             if not self.running:
                 break
+            
+            # Check if client is still connected, reconnect if needed
+            if not self.client.is_connected():
+                logger.warning("telegram_not_connected", attempt_reconnect=True)
+                try:
+                    await self.client.connect()
+                    if await self.client.is_user_authorized():
+                        logger.info("telegram_reconnected_successfully")
+                        consecutive_errors = 0
+                    else:
+                        logger.error("telegram_reconnect_not_authorized")
+                        consecutive_errors += 1
+                        continue
+                except Exception as e:
+                    logger.error("telegram_reconnect_failed", error=str(e))
+                    consecutive_errors += 1
+                    # Exponential backoff for reconnection failures
+                    if consecutive_errors > 5:
+                        wait_time = min(consecutive_errors * 5, 60)
+                        logger.warning("backing_off_before_retry", wait_seconds=wait_time)
+                        await asyncio.sleep(wait_time)
+                    continue
+            
+            # Reset error count on successful connection check
+            if consecutive_errors > 0:
+                logger.info("recovered_from_connection_errors", previous_error_count=consecutive_errors)
+                consecutive_errors = 0
             
             logger.debug("polling_cycle_start", chats=len(self.monitored_groups))
             
