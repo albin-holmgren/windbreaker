@@ -184,27 +184,10 @@ class TelegramUserMonitor:
         logger.info("startup_time_set", wait_seconds=3, message="Skipping messages for 3 seconds to avoid burst")
         await asyncio.sleep(3)
         
-        # Set up message handler (also use as backup for real-time events)
-        @self.client.on(events.NewMessage())
-        async def handle_new_message(event):
-            logger.info("realtime_message_received",
-                       chat_id=event.chat_id,
-                       message_id=event.message.id if event.message else None)
-            await self._process_message(event)
+        # Note: Real-time event handler removed - using polling-only for stability
         
         self.running = True
-        logger.info("telegram_monitor_started", groups=len(self.monitored_groups))
-        
-        # Verify handler is registered
-        logger.info("handler_registered", handlers_count=len(self.client._event_builders))
-        
-        # Force Telegram to sync updates
-        logger.info("syncing_updates_with_telegram")
-        try:
-            await self.client.catch_up()
-            logger.info("updates_synced")
-        except Exception as e:
-            logger.warning("catch_up_failed", error=str(e))
+        logger.info("telegram_monitor_started", groups=len(self.monitored_groups), mode="polling_only")
         
         # Test: Try to read last message from first monitored group to verify access
         if self.monitored_groups:
