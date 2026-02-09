@@ -225,25 +225,28 @@ class TelegramUserMonitor:
     async def _health_check(self) -> None:
         """Periodic health check to verify updates are being received."""
         last_count = 0
+        check_count = 0
         while self.running:
             await asyncio.sleep(30)  # Check every 30 seconds
             if not self.running:
                 break
             
+            check_count += 1
             # Log current stats
             current_count = self.messages_received
             new_messages = current_count - last_count
             last_count = current_count
             
-            logger.info("health_check",
-                       messages_received=current_count,
-                       new_in_last_30s=new_messages,
-                       potential_signals=self.potential_signals,
-                       is_connected=self.client.is_connected() if self.client else False,
-                       is_authorized=await self.client.is_user_authorized() if self.client else False)
+            # Only log health check every 2 minutes (4th check) to reduce noise
+            if check_count % 4 == 0:
+                logger.info("health_check",
+                           messages_received=current_count,
+                           new_in_last_2min=new_messages,
+                           potential_signals=self.potential_signals,
+                           is_connected=self.client.is_connected() if self.client else False)
             
-            if new_messages == 0:
-                logger.warning("no_messages_received_in_30s", 
+            if new_messages == 0 and check_count % 4 == 0:
+                logger.warning("no_messages_received_in_2min", 
                               hint="Check if Telegram session is valid and groups are active")
     
     async def _poll_groups(self) -> None:
@@ -276,23 +279,25 @@ class TelegramUserMonitor:
             
             # Check if client is still connected, reconnect if needed
             if not self.client.is_connected():
-                logger.warning("telegram_not_connected", attempt_reconnect=True)
+                # Only log reconnection attempt every 5 failures to reduce spam
+                if consecutive_errors % 5 == 0:
+                    logger.warning("telegram_not_connected", attempt_reconnect=True, consecutive_errors=consecutive_errors)
                 try:
                     await self.client.connect()
-                    if await self.client.is_user_authorized():
-                        logger.info("telegram_reconnected_successfully")
-                        consecutive_errors = 0
-                    else:
-                        logger.error("telegram_reconnect_not_authorized")
-                        consecutive_errors += 1
-                        continue
+                    # Don't call is_user_authorized() - it triggers more connections
+                    # Just try to poll and handle auth errors there
+                    logger.info("telegram_reconnected_successfully")
+                    consecutive_errors = 0
                 except Exception as e:
-                    logger.error("telegram_reconnect_failed", error=str(e))
                     consecutive_errors += 1
+                    # Only log error every 5 attempts to reduce spam
+                    if consecutive_errors % 5 == 0:
+                        logger.error("telegram_reconnect_failed", error=str(e), consecutive_errors=consecutive_errors)
                     # Exponential backoff for reconnection failures
                     if consecutive_errors > 5:
                         wait_time = min(consecutive_errors * 5, 60)
-                        logger.warning("backing_off_before_retry", wait_seconds=wait_time)
+                        if consecutive_errors % 5 == 0:
+                            logger.warning("backing_off_before_retry", wait_seconds=wait_time)
                         await asyncio.sleep(wait_time)
                     continue
             
