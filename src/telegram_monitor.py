@@ -178,6 +178,9 @@ class TelegramUserMonitor:
         # Set up message handler (also use as backup for real-time events)
         @self.client.on(events.NewMessage())
         async def handle_new_message(event):
+            logger.info("realtime_message_received",
+                       chat_id=event.chat_id,
+                       message_id=event.message.id if event.message else None)
             await self._process_message(event)
         
         self.running = True
@@ -275,15 +278,23 @@ class TelegramUserMonitor:
             if not self.running:
                 break
             
+            logger.debug("polling_cycle_start", chats=len(self.monitored_groups))
+            
             for chat_id in list(self.monitored_groups):
                 try:
                     # Fetch new messages since last seen
                     last_id = last_message_ids.get(chat_id, 0)
                     
+                    logger.debug("polling_chat", chat_id=chat_id, last_id=last_id)
+                    
                     new_messages = []
                     async for message in self.client.iter_messages(chat_id, min_id=last_id, limit=10):
                         if message.id > last_id:
                             new_messages.append(message)
+                            logger.debug("found_new_message", 
+                                       chat_id=chat_id, 
+                                       message_id=message.id,
+                                       text_preview=message.text[:50] if message.text else None)
                     
                     if new_messages:
                         # Update last seen ID
@@ -303,9 +314,11 @@ class TelegramUserMonitor:
                                    chat_id=chat_id, 
                                    count=len(new_messages),
                                    latest_id=last_message_ids[chat_id])
+                    else:
+                        logger.debug("no_new_messages", chat_id=chat_id, last_id=last_id)
                         
                 except Exception as e:
-                    logger.debug("poll_error", chat_id=chat_id, error=str(e))
+                    logger.warning("poll_error", chat_id=chat_id, error=str(e))
     
     async def _discover_groups(self) -> None:
         """Discover all groups and channels the user is in."""
