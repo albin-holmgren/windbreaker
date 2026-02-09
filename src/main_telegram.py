@@ -174,14 +174,15 @@ class TelegramAITrader:
         """Handle incoming Telegram message with potential signal."""
         now = datetime.utcnow()
         
-        logger.debug("processing_telegram_message",
+        logger.info("processing_telegram_message",  # Changed to INFO for visibility
                    chat=chat_name,
                    text_preview=text[:50],
-                   extracted_address=address[:8] + "...")
+                   extracted_address=address[:8] + "...",
+                   chat_id=chat_id)
         
         # Quick regex validation
         if len(address) < 32 or len(address) > 44:
-            logger.debug("invalid_address_length", address=address[:10])
+            logger.warning("invalid_address_length", address=address[:10], length=len(address))  # Changed to WARNING
             # Log even invalid messages for completeness
             if self.chat_logger:
                 self.chat_logger.log_message(
@@ -196,13 +197,35 @@ class TelegramAITrader:
             return
         
         # Parse with AI for confirmation and fresh launch detection
-        token_address, classification, confidence = await self.ai_parser.extract_token_fast(text, chat_id or chat_name)
+        # Add timeout to prevent hanging
+        try:
+            token_address, classification, confidence = await asyncio.wait_for(
+                self.ai_parser.extract_token_fast(text, chat_id or chat_name),
+                timeout=5.0  # 5 second max for AI + fallback
+            )
+            logger.info("ai_parse_result", 
+                       has_token=bool(token_address),
+                       classification=classification,
+                       confidence=confidence,
+                       token_preview=token_address[:8] if token_address else None)
+        except asyncio.TimeoutError:
+            logger.warning("ai_parser_timeout_using_fallback", extracted_address=address[:8])
+            # Use the regex-extracted address directly
+            token_address = address
+            classification = "unknown"
+            confidence = "low"
+        except Exception as e:
+            logger.error("ai_parser_error_using_fallback", error=str(e), extracted_address=address[:8])
+            # Use the regex-extracted address directly
+            token_address = address
+            classification = "unknown"
+            confidence = "low"
         
         # Determine bot action
         bot_action = "none"
         if not token_address:
             bot_action = "no_token_extracted"
-            logger.debug("ai_no_token_extracted")
+            logger.warning("ai_no_token_extracted")  # Changed to WARNING
         elif classification == "old":
             bot_action = "skipped_old"
             logger.info("skipping_old_call_message",
@@ -217,7 +240,11 @@ class TelegramAITrader:
                        confidence=confidence,
                        message_preview=text[:60])
         else:
-            bot_action = "unknown_classification"
+            bot_action = f"classification_{classification}"
+            logger.info("token_with_classification",
+                       token=token_address[:8],
+                       classification=classification,
+                       confidence=confidence)
         
         # Log confidence level for debugging
         if confidence == "high":
@@ -243,14 +270,31 @@ class TelegramAITrader:
         
         # Skip if AI classified this as an OLD call (not a fresh launch)
         if classification == "old" or not token_address:
+            logger.info("skipping_signal",
+                       reason="old_or_no_token",
+                       classification=classification,
+                       has_token=bool(token_address))
             return
         
+        logger.info("adding_signal_to_manager",
+                   token=token_address[:8],
+                   chat=chat_name,
+                   classification=classification)
+        
         # Add to signal manager (will trigger trade if new)
-        await self.signal_manager.add_signal(
-            token_address=token_address,
-            source_chat=chat_name,
-            original_message=text
-        )
+        try:
+            result = await self.signal_manager.add_signal(
+                token_address=token_address,
+                source_chat=chat_name,
+                original_message=text
+            )
+            logger.info("signal_add_result",
+                       token=token_address[:8],
+                       is_new_signal=result)
+        except Exception as e:
+            logger.error("signal_add_failed",
+                      token=token_address[:8],
+                      error=str(e))
     
     async def _on_signal(self, signal) -> None:
         """Handle new trading signal."""

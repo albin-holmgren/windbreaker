@@ -394,6 +394,8 @@ class TelegramUserMonitor:
                     chat_id = event.chat_id
                     message_id = event.message.id
                     await self.on_message(text, addresses[0], chat_name, chat_id, message_id)
+            else:
+                logger.debug("no_address_in_message", chat=chat_name, text_preview=text[:80])
             
         except Exception as e:
             logger.error("message_processing_error", error=str(e))

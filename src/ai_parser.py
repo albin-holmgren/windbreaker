@@ -338,21 +338,40 @@ class AIGatewayParser:
         First tries AI with context, falls back to regex pattern matching if timeout/error.
         Returns (address, classification, confidence) where confidence is "high", "medium", or "low".
         """
+        logger.info("extract_token_fast_start", chat_id=chat_id, text_len=len(message_text))
+        
         # Try AI with context first (if chat_id provided)
         if chat_id != 0:
-            address, classification, confidence = await self.extract_token_with_context(message_text, chat_id)
-            if address:
-                return address, classification, confidence
+            logger.debug("trying_ai_extraction", chat_id=chat_id)
+            try:
+                address, classification, confidence = await self.extract_token_with_context(message_text, chat_id)
+                if address:
+                    logger.info("ai_extraction_success", token=address[:8], classification=classification)
+                    return address, classification, confidence
+                else:
+                    logger.debug("ai_extraction_no_token", classification=classification)
+            except Exception as e:
+                logger.warning("ai_extraction_failed", error=str(e))
         else:
             # No chat context available
-            address, classification = await self.extract_token(message_text)
-            if address:
-                return address, classification, "medium"
+            logger.debug("trying_ai_extraction_no_context")
+            try:
+                address, classification = await self.extract_token(message_text)
+                if address:
+                    logger.info("ai_extraction_success_no_context", token=address[:8], classification=classification)
+                    return address, classification, "medium"
+                else:
+                    logger.debug("ai_extraction_no_token_no_context", classification=classification)
+            except Exception as e:
+                logger.warning("ai_extraction_failed_no_context", error=str(e))
         
         # Fallback: regex extraction - classify as unknown since we can't analyze message
+        logger.info("falling_back_to_regex_extraction")
         import re
         pattern = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
         matches = pattern.findall(message_text)
+        
+        logger.info("regex_extraction_result", matches_count=len(matches), matches=[m[:8] for m in matches[:5]])
         
         if matches:
             # Return first match that's likely a token (not a wallet)
@@ -363,8 +382,10 @@ class AIGatewayParser:
                     logger.info("token_extracted_fallback", token=match[:8] + "...", classification="unknown")
                     return match, "unknown", "low"
             # If no short ones, return the first
+            logger.info("token_extracted_fallback_first_match", token=matches[0][:8] + "...", classification="unknown")
             return matches[0], "unknown", "low"
         
+        logger.info("no_token_found_in_message")
         return None, "unknown", "low"
     
     def get_stats(self) -> dict:
