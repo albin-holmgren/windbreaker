@@ -163,9 +163,18 @@ class TelegramUserMonitor:
         if use_string_session or isinstance(session, StringSession):
             # StringSession: connect and validate
             await self.client.connect()
+            
+            # Debug: log session info (safely - only length and partial)
+            session_str = str(session.save())
+            logger.info("session_string_debug", 
+                       length=len(session_str),
+                       prefix=session_str[:20] + "..." if len(session_str) > 20 else session_str,
+                       suffix="..." + session_str[-20:] if len(session_str) > 40 else "")
+            
             if not await self.client.is_user_authorized():
-                logger.error("telegram_session_string_not_authorized")
+                logger.error("telegram_session_string_not_authorized", session_length=len(session_str))
                 raise ValueError("TELEGRAM_SESSION_STRING is invalid or expired - regenerate it")
+            logger.info("telegram_session_authorized_ok")
         else:
             # File-based session: start normally
             await self.client.start(phone=self.phone)
