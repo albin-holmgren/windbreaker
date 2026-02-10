@@ -264,11 +264,14 @@ class TieredPositionManager:
                                old_balance=old_balance,
                                new_balance=human_balance)
             else:
-                # No balance found - token might have been sold externally
-                if position.total_tokens > 0:
-                    logger.warning("token_balance_zero_in_wallet",
-                                token=position.token_address[:8],
-                                previous_balance=position.total_tokens)
+                # Zero balance on-chain — token was sold externally or never purchased
+                logger.warning("phantom_position_detected",
+                            token=position.token_address[:8],
+                            previous_balance=position.total_tokens,
+                            message="Zero on-chain balance, removing phantom position")
+                position.fully_exited = True
+                position.total_sold_percent = 100
+                position.total_tokens = 0
         except Exception as e:
             logger.debug("balance_update_failed", token=position.token_address[:8], error=str(e))
     
