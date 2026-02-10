@@ -74,6 +74,8 @@ class TieredPositionManager:
         check_interval_sec: float = 5.0,
         tier3_trailing_stop_percent: float = 0.45,
         tier3_activation_multiplier: float = 2.0,
+        stop_loss_percent: float = 0.50,
+        rug_mcap_threshold_usd: float = 5000.0,
     ):
         self.rpc = rpc_client
         self.wallet = wallet_keypair
@@ -81,6 +83,8 @@ class TieredPositionManager:
         self.check_interval = check_interval_sec
         self.tier3_trailing_stop = tier3_trailing_stop_percent
         self.tier3_activation = tier3_activation_multiplier
+        self.stop_loss_percent = stop_loss_percent  # Sell 100% if price drops 50% from entry
+        self.rug_mcap_threshold = rug_mcap_threshold_usd  # Sell if mcap drops below this
         
         self.session: Optional[aiohttp.ClientSession] = None
         
@@ -91,10 +95,15 @@ class TieredPositionManager:
         self._price_cache: Dict[str, tuple[float, datetime]] = {}
         self._cache_ttl = timedelta(seconds=10)
         
+        # Market cap cache
+        self._mcap_cache: Dict[str, tuple[float, float]] = {}  # token -> (mcap, timestamp)
+        
         # Stats
         self.tier1_executed = 0
         self.tier2_executed = 0
         self.tier3_executed = 0
+        self.stop_loss_executed = 0
+        self.rug_exits = 0
         self.checks_performed = 0
     
     async def start(self) -> None:
@@ -177,6 +186,54 @@ class TieredPositionManager:
                 # Calculate P&L
                 price_ratio = current_price / position.entry_price if position.entry_price > 0 else 1.0
                 position.pnl_percent = (price_ratio - 1.0) * 100
+                
+                # === DOWNSIDE PROTECTION (before tier checks) ===
+                
+                # Stop-loss: sell 100% if price dropped too far from entry
+                if price_ratio < (1.0 - self.stop_loss_percent):
+                    logger.warning("stop_loss_triggered",
+                                 token=token_address[:8],
+                                 price_ratio=f"{price_ratio:.2f}x",
+                                 stop_loss=f"{self.stop_loss_percent*100:.0f}%",
+                                 pnl=f"{position.pnl_percent:.1f}%")
+                    sell_pct = 100 - int(position.total_sold_percent)
+                    if sell_pct > 0:
+                        success = await self._execute_sell(position, sell_pct, "stop_loss")
+                        if success:
+                            position.fully_exited = True
+                            position.total_sold_percent = 100
+                            self.stop_loss_executed += 1
+                            logger.info("stop_loss_executed",
+                                       token=token_address[:8],
+                                       sold_percent=sell_pct)
+                    continue
+                
+                # Rug detection: check market cap via DexScreener
+                mcap = await self._get_market_cap(token_address)
+                if mcap > 0 and mcap < self.rug_mcap_threshold:
+                    logger.warning("rug_detected_low_mcap",
+                                 token=token_address[:8],
+                                 market_cap=f"${mcap:,.0f}",
+                                 threshold=f"${self.rug_mcap_threshold:,.0f}")
+                    sell_pct = 100 - int(position.total_sold_percent)
+                    if sell_pct > 0:
+                        success = await self._execute_sell(position, sell_pct, "rug_exit")
+                        if success:
+                            position.fully_exited = True
+                            position.total_sold_percent = 100
+                            self.rug_exits += 1
+                            logger.info("rug_exit_executed",
+                                       token=token_address[:8],
+                                       market_cap=f"${mcap:,.0f}")
+                        else:
+                            logger.warning("rug_exit_sell_failed_abandoning",
+                                         token=token_address[:8],
+                                         market_cap=f"${mcap:,.0f}")
+                            position.fully_exited = True
+                            self.rug_exits += 1
+                    continue
+                
+                # === UPSIDE TIERS ===
                 
                 # Check tiers
                 await self._check_tier1(position, current_price)
@@ -635,6 +692,40 @@ class TieredPositionManager:
             logger.debug("pumpfun_price_exception", token=token_address[:8], error=str(e))
             return None
     
+    async def _get_market_cap(self, token_address: str) -> float:
+        """Get market cap in USD using DexScreener API."""
+        import time
+        
+        # Check cache (valid for 30 seconds)
+        if token_address in self._mcap_cache:
+            cached_cap, cached_time = self._mcap_cache[token_address]
+            if time.time() - cached_time < 30:
+                return cached_cap
+        
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        market_cap = 0
+                        for pair in pairs:
+                            mc = pair.get("marketCap") or pair.get("fdv") or 0
+                            if mc > market_cap:
+                                market_cap = mc
+                        
+                        self._mcap_cache[token_address] = (market_cap, time.time())
+                        logger.debug("mcap_fetched",
+                                   token=token_address[:8],
+                                   market_cap=f"${market_cap:,.0f}")
+                        return market_cap
+            
+            return 0
+        except Exception as e:
+            logger.debug("mcap_fetch_error", token=token_address[:8], error=str(e))
+            return 0
+    
     def get_position(self, token_address: str) -> Optional[TieredPosition]:
         """Get position by token address."""
         return self.positions.get(token_address)
@@ -654,6 +745,8 @@ class TieredPositionManager:
             "tier1_executed": self.tier1_executed,
             "tier2_executed": self.tier2_executed,
             "tier3_executed": self.tier3_executed,
+            "stop_loss_executed": self.stop_loss_executed,
+            "rug_exits": self.rug_exits,
             "avg_pnl": f"{total_pnl / max(len(self.positions), 1):.1f}%",
             "checks_performed": self.checks_performed
         }

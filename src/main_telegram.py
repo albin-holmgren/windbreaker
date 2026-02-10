@@ -146,7 +146,9 @@ class TelegramAITrader:
             wallet_keypair=self.wallet.keypair,
             check_interval_sec=self.config.position_check_interval_sec,
             tier3_trailing_stop_percent=self.config.tier3_trailing_stop,
-            tier3_activation_multiplier=self.config.tier1_multiplier  # Activate trailing after 2x
+            tier3_activation_multiplier=self.config.tier1_multiplier,  # Activate trailing after 2x
+            stop_loss_percent=0.50,  # Sell 100% if price drops 50% from entry
+            rug_mcap_threshold_usd=5000.0,  # Sell if market cap drops below $5k
         )
         await self.position_manager.start()
         logger.info("tiered_position_manager_initialized",
