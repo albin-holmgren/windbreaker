@@ -180,21 +180,8 @@ class TelegramAITrader:
                    extracted_address=address[:8] + "...",
                    chat_id=chat_id)
         
-        # Quick regex validation
-        if len(address) < 32 or len(address) > 44:
-            logger.warning("invalid_address_length", address=address[:10], length=len(address))  # Changed to WARNING
-            # Log even invalid messages for completeness
-            if self.chat_logger:
-                self.chat_logger.log_message(
-                    timestamp=now,
-                    chat_id=chat_id or hash(chat_name) % 10000000000,  # Use hash if no ID
-                    chat_name=chat_name,
-                    message_id=message_id,
-                    text=text,
-                    has_address=False,
-                    bot_action="invalid_address"
-                )
-            return
+        # Quick note: address may be empty - AI will extract from text
+        has_address_hint = len(address) >= 32 and len(address) <= 44
         
         # Parse with AI for confirmation and fresh launch detection
         # Add timeout to prevent hanging
