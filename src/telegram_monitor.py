@@ -422,32 +422,17 @@ class TelegramUserMonitor:
                        text_len=len(text),
                        text_preview=text[:80])
             
-            # Check if message contains potential crypto signal
-            has_address = bool(SOLANA_ADDRESS_PATTERN.search(text))
-            has_keywords = any(kw.lower() in text.lower() for kw in CRYPTO_KEYWORDS)
+            self.potential_signals += 1
             
-            # Send to AI if: has address OR has crypto keywords (let AI decide)
-            if has_address or has_keywords:
-                self.potential_signals += 1
-                
-                logger.info("potential_signal_detected",
-                           chat=chat_name,
-                           has_address=has_address,
-                           has_keywords=has_keywords,
-                           text_preview=text[:100])
-                
-                # Extract all potential addresses (empty list if none)
-                addresses = SOLANA_ADDRESS_PATTERN.findall(text)
-                
-                # Send first address found (or empty string if none - AI may extract from context/links)
-                token_address = addresses[0] if addresses else ""
-                
-                if self.on_message:
-                    chat_id = event.chat_id
-                    message_id = event.message.id
-                    await self.on_message(text, token_address, chat_name, chat_id, message_id)
-            else:
-                logger.debug("no_signal_indicators", chat=chat_name, text_preview=text[:60])
+            logger.info("sending_to_ai_for_analysis",
+                       chat=chat_name,
+                       text_len=len(text))
+            
+            # Send ALL messages to AI - let AI decide if it's a buy signal
+            if self.on_message:
+                chat_id = event.chat_id
+                message_id = event.message.id
+                await self.on_message(text, "", chat_name, chat_id, message_id)
             
         except Exception as e:
             logger.error("message_processing_error", error=str(e))
