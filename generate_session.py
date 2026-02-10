@@ -43,6 +43,23 @@ async def main():
         await client.sign_in(password=password)
         print("✓ Signed in with 2FA!")
     
+    # CRITICAL: Verify session is actually authorized before outputting
+    print("\nStep 3: Verifying session authorization...")
+    if not await client.is_user_authorized():
+        print("✗ ERROR: Session is NOT authorized! Something went wrong.")
+        print("  Try again or check your Telegram account.")
+        await client.disconnect()
+        return
+    
+    # Try to get user info to fully verify
+    try:
+        me = await client.get_me()
+        print(f"✓ Verified! Logged in as: {me.first_name} (@{me.username or 'no_username'})")
+    except Exception as e:
+        print(f"✗ ERROR: Could not verify user info: {e}")
+        await client.disconnect()
+        return
+    
     # Save session
     session_string = client.session.save()
     
@@ -51,8 +68,9 @@ async def main():
     print("=" * 60)
     print(f"\nTELEGRAM_SESSION_STRING={session_string}\n")
     print("=" * 60)
+    print("\n✓ Session verified and ready to use!")
     print("\nInstructions:")
-    print("1. Copy the line above (starting with 1AQA...)")
+    print("1. Copy the line above (starting with 1BJWap...)")
     print("2. Go to Railway → Your Project → Variables")
     print("3. Replace the old TELEGRAM_SESSION_STRING value")
     print("4. Click 'Redeploy' to restart the bot")

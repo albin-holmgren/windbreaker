@@ -426,8 +426,8 @@ class TelegramUserMonitor:
             has_address = bool(SOLANA_ADDRESS_PATTERN.search(text))
             has_keywords = any(kw.lower() in text.lower() for kw in CRYPTO_KEYWORDS)
             
-            # Trigger on address alone OR address+keywords (relaxed filter)
-            if has_address:
+            # Send to AI if: has address OR has crypto keywords (let AI decide)
+            if has_address or has_keywords:
                 self.potential_signals += 1
                 
                 logger.info("potential_signal_detected",
@@ -436,16 +436,18 @@ class TelegramUserMonitor:
                            has_keywords=has_keywords,
                            text_preview=text[:100])
                 
-                # Extract all potential addresses
+                # Extract all potential addresses (empty list if none)
                 addresses = SOLANA_ADDRESS_PATTERN.findall(text)
                 
-                if self.on_message and addresses:
-                    # Send to handler with first address
+                # Send first address found (or empty string if none - AI may extract from context/links)
+                token_address = addresses[0] if addresses else ""
+                
+                if self.on_message:
                     chat_id = event.chat_id
                     message_id = event.message.id
-                    await self.on_message(text, addresses[0], chat_name, chat_id, message_id)
+                    await self.on_message(text, token_address, chat_name, chat_id, message_id)
             else:
-                logger.debug("no_address_in_message", chat=chat_name, text_preview=text[:80])
+                logger.debug("no_signal_indicators", chat=chat_name, text_preview=text[:60])
             
         except Exception as e:
             logger.error("message_processing_error", error=str(e))
