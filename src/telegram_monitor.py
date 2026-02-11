@@ -188,10 +188,8 @@ class TelegramUserMonitor:
         # Discover all groups/channels
         await self._discover_groups()
         
-        # Set startup time AFTER discovery (skip any burst from initial connection)
-        self.startup_time = datetime.now()
-        logger.info("startup_time_set", wait_seconds=3, message="Skipping messages for 3 seconds to avoid burst")
-        await asyncio.sleep(3)
+        # Note: startup_time filter removed - polling baseline last_id prevents old messages
+        # No need for artificial delay
         
         # Note: Real-time event handler removed - using polling-only for stability
         
@@ -260,7 +258,7 @@ class TelegramUserMonitor:
     
     async def _poll_groups(self) -> None:
         """Poll groups periodically to fetch new messages."""
-        POLL_INTERVAL = 10  # seconds between polling cycles (6 req/min total, well under limits)
+        POLL_INTERVAL = 3  # seconds between polling cycles - fast for crypto signals
         
         logger.info("polling_started", interval_sec=POLL_INTERVAL, chats=len(self.monitored_groups))
         
@@ -340,10 +338,13 @@ class TelegramUserMonitor:
                         # Process messages (oldest first)
                         for message in reversed(new_messages):
                             # Create a fake event structure for _process_message
+                            client_ref = self.client
                             class FakeEvent:
                                 def __init__(self, msg, chat):
                                     self.message = msg
                                     self.chat_id = chat
+                                async def get_chat(self):
+                                    return await client_ref.get_entity(self.chat_id)
                             
                             await self._process_message(FakeEvent(message, chat_id))
                         
@@ -395,14 +396,10 @@ class TelegramUserMonitor:
             if not event.message or not event.message.text:
                 return
             
-            # Skip messages from before startup (safety check)
-            if event.message.date and self.startup_time:
-                from datetime import timezone
-                msg_time = event.message.date.replace(tzinfo=timezone.utc) if not event.message.date.tzinfo else event.message.date
-                startup = self.startup_time.replace(tzinfo=timezone.utc) if not self.startup_time.tzinfo else self.startup_time
-                if msg_time < startup:
-                    logger.debug("skipping_old_message", msg_time=str(msg_time), startup=str(startup))
-                    return
+            # NOTE: startup_time filter REMOVED - the polling baseline last_id
+            # already ensures we only process messages newer than startup.
+            # The old filter was silently dropping valid messages due to
+            # timezone mismatch between datetime.now() and Telegram's UTC dates.
             
             self.messages_received += 1
             
