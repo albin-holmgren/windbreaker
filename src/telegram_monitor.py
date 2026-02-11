@@ -326,10 +326,15 @@ class TelegramUserMonitor:
                     async for message in self.client.iter_messages(chat_id, min_id=last_id, limit=10):
                         if message.id > last_id:
                             new_messages.append(message)
+                            text_preview = None
+                            if message.text:
+                                text_preview = message.text[:50]
+                            elif message.caption:
+                                text_preview = f"[CAPTION] {message.caption[:40]}"
                             logger.debug("found_new_message", 
                                        chat_id=chat_id, 
                                        message_id=message.id,
-                                       text_preview=message.text[:50] if message.text else None)
+                                       text_preview=text_preview)
                     
                     if new_messages:
                         # Update last seen ID
@@ -392,18 +397,26 @@ class TelegramUserMonitor:
                            sample_monitored=list(self.monitored_groups)[:3])
                 return
             
-            # Skip if no message text
-            if not event.message or not event.message.text:
+            # Skip if no message text or caption
+            text = None
+            if event.message.text:
+                text = event.message.text
+            elif event.message.caption:
+                text = event.message.caption
+                logger.info("using_caption_text", chat_id=event.chat_id, caption_len=len(text))
+            
+            if not text:
                 return
             
-            # NOTE: startup_time filter REMOVED - the polling baseline last_id
-            # already ensures we only process messages newer than startup.
-            # The old filter was silently dropping valid messages due to
-            # timezone mismatch between datetime.now() and Telegram's UTC dates.
+            # Also check for URLs in entities (some CAs are posted as links)
+            if event.message.entities:
+                for entity in event.message.entities:
+                    if hasattr(entity, 'url') and entity.url:
+                        text += " " + entity.url
+                        logger.info("found_entity_url", url_preview=entity.url[:30])
             
             self.messages_received += 1
             
-            text = event.message.text
             chat_name = "unknown"
             
             try:
