@@ -329,8 +329,8 @@ class TelegramUserMonitor:
                             text_preview = None
                             if message.text:
                                 text_preview = message.text[:50]
-                            elif message.caption:
-                                text_preview = f"[CAPTION] {message.caption[:40]}"
+                            elif getattr(message, 'message', None):
+                                text_preview = f"[MSG] {message.message[:40]}"
                             logger.debug("found_new_message", 
                                        chat_id=chat_id, 
                                        message_id=message.id,
@@ -397,13 +397,13 @@ class TelegramUserMonitor:
                            sample_monitored=list(self.monitored_groups)[:3])
                 return
             
-            # Skip if no message text or caption
+            # Skip if no message text
             text = None
-            if event.message.text:
+            if getattr(event.message, 'text', None):
                 text = event.message.text
-            elif event.message.caption:
-                text = event.message.caption
-                logger.info("using_caption_text", chat_id=event.chat_id, caption_len=len(text))
+            elif getattr(event.message, 'message', None):
+                text = event.message.message
+                logger.info("using_message_attr", chat_id=event.chat_id, msg_len=len(text))
             
             if not text:
                 return
